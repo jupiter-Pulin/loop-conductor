@@ -1,0 +1,447 @@
+<!doctype html>
+<html lang="zh-Hans">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Loop Conductor — Technical Spec</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <style>
+    :root {
+      --bg: #0d0d0d;
+      --fg: #e8e8e8;
+      --muted: #888;
+      --border: #242424;
+      --border-strong: #3a3a3a;
+      --accent: #6ea8fe;
+      --code-bg: #161616;
+      --stripe: #141414;
+      --panel: #121212;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, "PingFang TC", "Noto Sans TC", sans-serif;
+      font-size: 15px;
+      line-height: 1.65;
+      color: var(--fg);
+      background: var(--bg);
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: 220px minmax(0, 1fr);
+      max-width: 1180px;
+      margin: 0 auto;
+      gap: 56px;
+      padding: 0 32px;
+    }
+    aside {
+      position: sticky;
+      top: 0;
+      align-self: start;
+      max-height: 100vh;
+      overflow-y: auto;
+      padding: 48px 0;
+      font-size: 13px;
+    }
+    aside .brand {
+      font-weight: 600;
+      font-size: 11px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 16px;
+    }
+    aside ol { list-style: none; padding: 0; margin: 0; counter-reset: toc; }
+    aside li { counter-increment: toc; }
+    aside a {
+      display: block;
+      padding: 5px 0;
+      color: var(--muted);
+      text-decoration: none;
+      transition: color .15s;
+    }
+    aside a:hover { color: var(--fg); }
+    aside a::before { content: counter(toc) ". "; color: var(--border); }
+    main { padding: 48px 0 120px; min-width: 0; }
+    header.doc {
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 28px;
+      margin-bottom: 48px;
+    }
+    header.doc h1 {
+      font-size: 28px;
+      margin: 0 0 14px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+    header.doc .meta {
+      display: flex;
+      gap: 20px;
+      flex-wrap: wrap;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    header.doc .meta b { color: var(--fg); font-weight: 500; margin-right: 4px; }
+    section { margin-bottom: 56px; scroll-margin-top: 24px; }
+    section h2 {
+      font-size: 19px;
+      font-weight: 600;
+      margin: 0 0 20px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--border);
+    }
+    section h3 { font-size: 15px; font-weight: 600; margin: 28px 0 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; font-size: 12px; }
+    p, li { color: var(--fg); }
+    ul, ol { padding-left: 22px; }
+    code {
+      font-family: ui-monospace, "SF Mono", Consolas, monospace;
+      font-size: 0.88em;
+      background: var(--code-bg);
+      padding: 1px 6px;
+      border-radius: 3px;
+    }
+    pre {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 14px 16px;
+      overflow-x: auto;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+    pre code { background: none; padding: 0; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; margin: 8px 0; }
+    th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+    th {
+      font-weight: 600;
+      color: var(--muted);
+      font-size: 11px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      border-bottom: 1px solid var(--border-strong);
+    }
+    tbody tr:hover { background: var(--stripe); }
+    .kv th { width: 120px; color: var(--muted); border-bottom: 1px solid var(--border); text-transform: none; letter-spacing: 0; font-size: 13px; font-weight: 500; }
+    .mermaid {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 24px;
+      text-align: center;
+      margin: 12px 0;
+    }
+    .badge {
+      display: inline-block;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      background: var(--panel);
+    }
+    .badge.ok   { color: #4ade80; border-color: #14532d; background: #0d1f14; }
+    .badge.warn { color: #fbbf24; border-color: #5a3a0a; background: #1f1608; }
+    .badge.risk { color: #f87171; border-color: #5a1414; background: #1f0a0a; }
+    .callout {
+      border-left: 3px solid var(--accent);
+      background: rgba(110, 168, 254, 0.08);
+      padding: 10px 14px;
+      margin: 16px 0;
+      border-radius: 0 4px 4px 0;
+      font-size: 14px;
+    }
+    /* Inline annotation: greppable in-place questions / review notes.
+       Convention: place a HTML comment <!- - ?Q[Qn]: ... @owner - -> right
+       before a <details class="inline-q"> block. Use this anchored lookup
+       so explanatory prose does not match:
+           grep -nE '^[[:space:]]*<!--[[:space:]]*\?Q\[' <spec>.html
+       Resolve → move into §7 Open Questions table or delete. */
+    details.inline-q {
+      border: 1px dashed #f0ad4e;
+      background: rgba(240, 173, 78, 0.06);
+      padding: 8px 12px;
+      margin: 12px 0;
+      border-radius: 4px;
+      font-size: 14px;
+    }
+    details.inline-q summary {
+      cursor: pointer;
+      font-weight: 600;
+      color: #f0ad4e;
+      list-style: none;
+      user-select: none;
+    }
+    details.inline-q summary::before { content: "❓ "; }
+    details.inline-q[open] summary::after { content: " (click to collapse)"; color: var(--muted); font-weight: 400; font-size: 12px; }
+    details.inline-q p { margin: 8px 0 0; }
+    details.inline-q .owner { color: var(--muted); font-size: 12px; }
+    @media (max-width: 880px) {
+      .layout { grid-template-columns: 1fr; gap: 0; padding: 0 20px; }
+      aside { position: static; max-height: none; padding: 24px 0 8px; border-bottom: 1px solid var(--border); }
+      main { padding-top: 24px; }
+    }
+    @media print {
+      :root {
+        --bg: #fff; --fg: #000; --muted: #555;
+        --border: #ddd; --border-strong: #000;
+        --code-bg: #f4f4f2; --stripe: #f7f7f5; --panel: #fff;
+      }
+      aside { display: none; }
+      .layout { grid-template-columns: 1fr; padding: 0; max-width: none; }
+      body { font-size: 12px; }
+      section { page-break-inside: avoid; }
+      .mermaid { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <aside>
+    <div class="brand">Tech Spec</div>
+    <ol>
+      <li><a href="#summary">Requirement Summary</a></li>
+      <li><a href="#code-analysis">Existing Code</a></li>
+      <li><a href="#solution">Technical Solution</a></li>
+      <li><a href="#risks">Risks & Dependencies</a></li>
+      <li><a href="#breakdown">Work Breakdown</a></li>
+      <li><a href="#testing">Testing Strategy</a></li>
+      <li><a href="#open-questions">Open Questions</a></li>
+    </ol>
+  </aside>
+
+  <main>
+    <header class="doc">
+      <h1>Loop Conductor — Agent Loop 最小框架</h1>
+      <div class="meta">
+        <span><b>Feature</b> loop-conductor</span>
+        <span><b>Owner</b> @pulin</span>
+        <span><b>Updated</b> 2026-06-11</span>
+        <span class="badge ok">Approved</span>
+      </div>
+    </header>
+
+    <section id="summary">
+      <h2>1. Requirement Summary</h2>
+      <table class="kv">
+        <tbody>
+          <tr><th>Problem</th><td>Agent loop 蓝图（maker 内环 review → verifier 冷验收 → 1/2/3 重试阶梯 → 人类闸门）已在设计讨论中敲定，但仍是伪代码。需要一个可跑的最小系统框架，把状态机、调度、agent 交接全部落地。</td></tr>
+          <tr><th>Goals</th><td>① 文件状态机为唯一事实源（<code>state/queue/*.md</code>，人类本地可读可改）；② conductor 为确定性、可重入、幂等的脚本——非 agent；③ bugfix 档全链路手动触发可跑通（最小验收路径）；④ feature 档含本地 spec 审批闸门；⑤ agent 全部 headless spawn，互相只传案卷（dossier）不对话。</td></tr>
+          <tr><th>Non-Goals</th><td>不做 dashboard / 可视化；不做 GitHub、webhook 集成（接口预留）；不做 triage-agent（demo 阶段任务由 <code>conductor new</code> 人工创建）；不展开各 agent 内部 prompt / plugin 体系（仅占位文件，后续按 plugin 级单独做 harness engineering）。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="code-analysis">
+      <h2>2. Existing Code Analysis</h2>
+      <p>项目从零开始，实现骨架已按本 spec 落地：<code>conductor/</code>（状态机 + lib + stages）、<code>tests/</code>（单测 + fake-claude 整合测试）、<code>target/</code>（demo 目标仓库）、<code>agents/</code>（prompt 占位）。无历史包袱。本节列依赖的外部能力：</p>
+      <table>
+        <thead><tr><th>能力</th><th>角色</th><th>复用方式</th></tr></thead>
+        <tbody>
+          <tr><td><code>claude</code> CLI</td><td>所有 agent 的运行时</td><td><code>-p --output-format json</code> 冷启动；<code>-r &lt;session_id&gt;</code> 续会话；<code>--tools</code> 限定工具集（硬限制）+ <code>--allowedTools</code> 自动放行（免审批）</td></tr>
+          <tr><td><code>git worktree</code></td><td>任务级隔离</td><td>每任务一个 worktree + 分支，跨轮持久</td></tr>
+          <tr><td>Node.js ≥ 20</td><td>conductor 运行时</td><td>纯标准库 ESM 多模块，<b>零 npm 依赖</b>（package.json 仅 scripts，无安装步骤）</td></tr>
+          <tr><td>sd0x-dev-flow plugin</td><td>maker 内环参照</td><td>只复用形态（hook 强制 review + findings 落盘 + 轮次计数），不复用代码；后续 maker plugin 以它为底</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="solution">
+      <h2>3. Technical Solution</h2>
+
+      <h3>3.1 Architecture</h3>
+      <div class="callout"><b>选型：Node 纯标准库（零 npm 依赖），而非 bash+jq。</b>理由：① claude CLI 输出是 JSON，Node 原生解析，bash 需引入 jq 且错误处理脆弱；② 状态文件 frontmatter 的读写、stage handler 的幂等判断是结构化逻辑，Node 可拆成纯函数做单元测试；③ 零依赖下 Node 与 bash 的部署成本相同。bash 仅存在于 git/claude 的子进程调用里。</div>
+      <div class="mermaid">
+flowchart LR
+    Trig[手动 / cron / GH Actions<br/>三种触发同一入口] --> Run[conductor run]
+    Run --> Lock{state/.lock<br/>原子 mkdir}
+    Lock -->|获锁| Drain[drain 循环：遍历 queue/*.md<br/>按 stage 分发 handler]
+    Lock -->|占用| Exit[直接退出]
+    Drain -->|spawn / resume| CC[claude headless]
+    CC --> WT[(worktrees/&lt;id&gt;<br/>任务隔离检出)]
+    CC --> DS[(dossier/&lt;id&gt;<br/>案卷：spec/findings/verdict)]
+    Drain --> ST[(state/queue/*.md<br/>唯一事实源)]
+      </div>
+      <p>状态机全貌。两个人类闸门（spec 审批、最终 merge）都是<b>异步状态转移</b>，conductor 读到状态变化才推进，绝不阻塞等待：</p>
+      <div class="mermaid">
+stateDiagram-v2
+    [*] --> NEEDS_SPEC : feature 档
+    [*] --> READY : bugfix 档
+    NEEDS_SPEC --> AWAIT_SPEC_APPROVAL : plan-agent 产出 spec 草稿
+    AWAIT_SPEC_APPROVAL --> READY : approve → 冻结 spec
+    AWAIT_SPEC_APPROVAL --> NEEDS_SPEC : reject + notes
+    READY --> VERIFY : maker 完成 且 green gate 过
+    READY --> FAILED_BOX : green gate 不过
+    VERIFY --> AWAIT_HUMAN_MERGE : verdict pass（终点）
+    VERIFY --> FIXING : verdict fail 且 miss &lt; 3
+    VERIFY --> FAILED_BOX : miss ≥ 3
+    FIXING --> VERIFY : 修复后 green gate 过
+    FIXING --> FAILED_BOX : green gate 不过 / 预算超限
+    AWAIT_HUMAN_MERGE --> [*] : conductor merge 归档
+    FAILED_BOX --> READY : conductor retry（人工）
+      </div>
+
+      <h3>3.2 Data Model</h3>
+      <p>目录结构（<code>worktrees/</code>、<code>state/.lock</code> 进 <code>.gitignore</code>）：</p>
+<pre><code>will-workflow/
+├── conductor/               # conductor.mjs（CLI 入口+drain）、lib/（state claude lock git）
+│                            # stages/（每 stage 一个 handler，签名 (task, cfg) => void）
+├── conductor.config.json    # target 路径、testCommand、budgetUsd、maxTurns、各角色 model
+├── agents/                  # plan / maker / verifier 的 prompt 占位
+├── state/                   # queue/（活跃，唯一事实源）done/（归档）failed/（收件箱）.lock
+├── specs/                   # feature 档 spec 草稿（审批后冻结副本进 dossier）
+├── dossier/&lt;id&gt;/            # 案卷（见下表）
+├── worktrees/&lt;id&gt;/          # target 的任务隔离检出，跨轮持久（gitignore）
+└── target/                  # demo 目标仓库（独立 git repo，预埋 bug）</code></pre>
+      <p>任务文件 = YAML frontmatter（机器读）+ Markdown 正文（人读）。bugfix 档的 spec 就是正文里的「验收标准」段：</p>
+<pre><code>---
+id: task-20260611-001
+kind: bugfix                # bugfix | feature
+stage: READY                # 状态机驱动；全部字段为扁平标量，自写极简解析器
+miss_count: 0
+maker_session_id: null      # miss==1 时 claude -r 用
+spent_usd: 0                # 预算闸：累加各 spawn JSON 的 total_cost_usd
+approval: null              # 审批闸门：approved | rejected
+---
+正文（人读）：## 标题与证据；## 验收标准（bugfix 档此段即 spec，READY 时抽取为 dossier/spec.md）；## reject_notes（reject 时追加喂回 plan-agent）</code></pre>
+      <p>案卷 <code>dossier/&lt;id&gt;/</code> 是 agent 间唯一通信媒介，verifier 永远只读 <code>spec.md</code>，不感知档位差异：</p>
+      <table>
+        <thead><tr><th>文件</th><th>写入者</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><td><code>spec.md</code></td><td>conductor（冻结时复制）</td><td>verifier 与 maker 的契约面</td></tr>
+          <tr><td><code>&lt;role&gt;-r&lt;n&gt;.json</code></td><td>conductor</td><td>spawn 记录：原始 CLI JSON（session_id、cost）+ started/done 双标记，所有角色统一留档</td></tr>
+          <tr><td><code>review-findings.md</code></td><td>maker 内嵌 reviewer（hook 落盘）</td><td>内环 review 原始记录，不经 maker 转述</td></tr>
+          <tr><td><code>verify-r&lt;n&gt;.md</code> / <code>verify-r&lt;n&gt;.verdict.json</code></td><td>conductor（解析 verifier 终输出后落盘）</td><td>叙事 + 机器可读裁决 <code>{"verdict":"pass|fail","reasons":[]}</code>；轮次 <code>n = miss_count + 1</code>（首验 r1）</td></tr>
+          <tr><td><code>timeline.md</code></td><td>conductor 追加</td><td>事件日志，人类排查用</td></tr>
+        </tbody>
+      </table>
+
+      <h3>3.3 CLI Interface</h3>
+      <table>
+        <thead><tr><th>命令</th><th>作用</th></tr></thead>
+        <tbody>
+          <tr><td><code>conductor run</code></td><td>一次 drain：循环推进所有任务直到无状态变化（全局步数上限 20/次 run；耗尽记日志，下次 run 续推）。cron / GH Actions 的唯一入口</td></tr>
+          <tr><td><code>conductor new --kind bugfix|feature --title "…"</code></td><td>从模板生成任务文件（bugfix 初始 READY，feature 初始 NEEDS_SPEC）</td></tr>
+          <tr><td><code>conductor approve|reject &lt;id&gt; [--notes "…"]</code></td><td>人类闸门：写 <code>approval</code> 字段 + reject_notes。仅是状态文件的安全包装，手编文件等效</td></tr>
+          <tr><td><code>conductor status</code></td><td>打印任务表（id / kind / stage / miss / spent）</td></tr>
+          <tr><td><code>conductor merge &lt;id&gt;</code></td><td>终点闸门：人在 worktree 看完 diff 后执行 → merge 分支、归档至 done/、清 worktree</td></tr>
+          <tr><td><code>conductor retry &lt;id&gt;</code></td><td>FAILED_BOX → READY，重置 miss，保留案卷</td></tr>
+        </tbody>
+      </table>
+      <p>claude CLI 调用约定（封装在 <code>lib/claude.mjs</code> 单点）：</p>
+      <table>
+        <thead><tr><th>角色</th><th>调用</th><th>关键约束</th></tr></thead>
+        <tbody>
+          <tr><td>plan</td><td><code>claude -p … -C target/ --tools Read,Grep,Glob --output-format json</code></td><td>工具集硬限制只读；spec 草稿从 JSON <code>result</code> 捕获、由 conductor 写入 specs/&lt;id&gt;.md——只读 agent 自身不落盘</td></tr>
+          <tr><td>maker 首轮</td><td><code>claude -p … -C worktrees/&lt;id&gt; --output-format json</code></td><td><code>--permission-mode acceptEdits</code>；session_id 落盘 frontmatter</td></tr>
+          <tr><td>maker 续（miss==1）</td><td><code>claude -r $session_id -p "findings 见 dossier/verify-r1.md" --output-format json</code></td><td>resume 失败则自动降级为冷启动路径</td></tr>
+          <tr><td>maker 冷（miss==2）</td><td><code>claude -p …(spec+全部案卷) -C worktrees/&lt;id&gt; --output-format json</code></td><td>全新 session，赌冷启动红利</td></tr>
+          <tr><td>verifier</td><td><code>claude -p … -C worktrees/&lt;id&gt; --tools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*)" --output-format json</code></td><td>工具集硬限制只读，<b>不跑测试</b>——行为验证由 green gate 承担，静态不够再放开；<b>不读 maker 叙事</b>；verdict JSON 从终输出捕获、conductor 落盘并只认该文件</td></tr>
+        </tbody>
+      </table>
+
+      <h3>3.4 Core Logic</h3>
+      <p>Stage handler 一览（每个 handler 必须先查「动作是否已发生」再行动）：</p>
+      <table>
+        <thead><tr><th>Stage</th><th>动作 → 转移</th><th>幂等保证</th></tr></thead>
+        <tbody>
+          <tr><td>NEEDS_SPEC</td><td>spawn plan-agent（带 reject_notes）→ conductor 写 specs/&lt;id&gt;.md、重置 approval=null → AWAIT_SPEC_APPROVAL</td><td>spec 草稿已存在 → 不重 spawn，直接转 AWAIT_SPEC_APPROVAL（崩溃恢复）</td></tr>
+          <tr><td>AWAIT_SPEC_APPROVAL</td><td>approved → 复制 spec 进 dossier（冻结）→ READY；rejected → 收 notes 进任务正文、归档旧草稿 → NEEDS_SPEC；否则不动</td><td>纯读字段，天然幂等；归档旧草稿保证 NEEDS_SPEC 的「草稿已存在」检查不误判</td></tr>
+          <tr><td>READY</td><td>ensure_worktree → spawn maker → conductor 亲自跑 testCommand（green gate）→ 绿 VERIFY / 不绿 FAILED_BOX</td><td>双标记：有 started 无 done → 判定上次崩溃，转 FAILED_BOX（原因=crashed），人工 <code>retry</code> 恢复——不留滞留任务</td></tr>
+          <tr><td>VERIFY</td><td>attempt = miss+1；spawn verifier → conductor 落盘 verify-r&lt;attempt&gt;.verdict.json → pass AWAIT_HUMAN_MERGE / fail 则 miss++，&lt;3 进 FIXING，≥3 进 FAILED_BOX</td><td>verify-r&lt;attempt&gt;.verdict.json 已存在 → 直接消费不重验</td></tr>
+          <tr><td>FIXING</td><td>miss==1 resume 原 maker / miss==2 冷 maker → green gate → VERIFY</td><td>同 READY 双标记（轮次号入文件名）；崩溃同样转 FAILED_BOX</td></tr>
+          <tr><td>AWAIT_HUMAN_MERGE / FAILED_BOX</td><td>终态，只响应人工 merge / retry 命令</td><td>—</td></tr>
+        </tbody>
+      </table>
+      <p>四条全局机制：</p>
+      <ol>
+        <li><b>先产物后状态</b>：所有 handler 先把产物落盘（spec、verdict、案卷），最后一步才改 frontmatter 的 stage。崩溃最坏导致重复读产物，不会丢转移。</li>
+        <li><b>并发锁</b>：<code>mkdir state/.lock</code>（POSIX 原子）+ 内写 pid/时间戳；mtime 超 30 分钟打印 stale 告警，demo 阶段人工删除。</li>
+        <li><b>green gate 不信口供</b>：maker 说什么不算，conductor 在 worktree 里亲自跑 <code>cfg.testCommand</code>，只认 exit code。</li>
+        <li><b>预算闸</b>：每次 spawn 带 <code>--max-turns</code>；JSON 输出的 <code>total_cost_usd</code> 累加进 <code>spent_usd</code>，超 <code>cfg.budgetUsd</code>（默认 5）拒绝再 spawn、直接 FAILED_BOX。</li>
+      </ol>
+      <p>Worktree 生命周期：READY 进入时 <code>git -C target worktree add ../worktrees/&lt;id&gt; -b task/&lt;id&gt;</code>；FIXING/VERIFY 各轮复用同一检出（代码状态即 maker 的外部记忆）；仅 <code>merge</code> 或人工归档时移除。</p>
+
+      <h3>3.5 UI/UX Contract</h3>
+      <p>N/A——无前端界面。人机接口就是状态文件与 CLI 本身：审批 = <code>conductor approve task-xxx</code>（或直接手编 frontmatter，文件是唯一事实源）；review 终稿 = 在 <code>worktrees/&lt;id&gt;</code> 里 <code>git diff main...task/&lt;id&gt;</code> + 读案卷。Dashboard / GitHub PR 集成是后续在状态文件之上加的投影层，不改本框架。</p>
+    </section>
+
+    <section id="risks">
+      <h2>4. Risks & Dependencies</h2>
+      <table>
+        <thead><tr><th>Risk</th><th>Severity</th><th>Mitigation</th></tr></thead>
+        <tbody>
+          <tr><td>token 花费失控（agent 自循环、重试阶梯叠加）</td><td><span class="badge risk">High</span></td><td>三层闸：per-spawn <code>--max-turns</code>、per-task <code>spent_usd</code> 预算、重试阶梯硬上限 3。全部由 conductor 代码强制，不依赖 agent 自觉</td></tr>
+          <tr><td>claude CLI JSON schema / flag 漂移</td><td><span class="badge warn">Medium</span></td><td>调用收敛在 <code>lib/claude.mjs</code> 单点；fake-claude stub 测试不依赖真 CLI（见 §6）</td></tr>
+          <tr><td>maker 谎报完成 / 改绿了别的测试</td><td><span class="badge warn">Medium</span></td><td>green gate 由 conductor 跑全量测试；verifier 冷上下文静态对照 spec</td></tr>
+          <tr><td>conductor 崩溃留 stale 标记 / 残锁</td><td><span class="badge warn">Medium</span></td><td>started/done 双标记 + 锁 mtime 检测；demo 阶段人工 <code>retry</code> 兜底，不做自动恢复</td></tr>
+          <tr><td><code>claude -r</code> 会话过期或不可恢复</td><td><span class="badge ok">Low</span></td><td>resume 失败自动降级为 miss==2 的冷启动路径，阶梯顺延</td></tr>
+          <tr><td>worktree 只是文件隔离不是沙箱：acceptEdits 的 maker 仍可经 Bash 影响本机</td><td><span class="badge warn">Medium</span></td><td><code>--tools</code> 限定工具集；target 内不放密钥；不加 <code>--add-dir</code>；后续升级 OS/容器级沙箱</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="breakdown">
+      <h2>5. Work Breakdown</h2>
+      <table>
+        <thead><tr><th>#</th><th>Task</th><th>Estimate</th><th>Depends On</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td>骨架：目录 + config + state.mjs（frontmatter 读写）+ lock.mjs</td><td>0.5d</td><td>—</td></tr>
+          <tr><td>2</td><td><code>run</code> drain 循环 + <code>new</code>/<code>status</code> 命令</td><td>0.5d</td><td>#1</td></tr>
+          <tr><td>3</td><td>READY handler：worktree + maker spawn + green gate + 双标记</td><td>1d</td><td>#2</td></tr>
+          <tr><td>4</td><td>VERIFY + FIXING handler：verdict 解析 + 1/2/3 重试阶梯 + 预算闸</td><td>1d</td><td>#3</td></tr>
+          <tr><td>5</td><td>feature 档：NEEDS_SPEC / approval 闸门 + <code>approve</code>/<code>reject</code>/<code>merge</code>/<code>retry</code></td><td>0.5d</td><td>#2</td></tr>
+          <tr><td>6</td><td>fake-claude stub + 状态机集成测试（零 token）</td><td>1d</td><td>#4</td></tr>
+          <tr><td>7</td><td>demo target 仓库（预埋 bug + 挂测试）+ 真跑 E2E + README</td><td>0.5d</td><td>#4</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="testing">
+      <h2>6. Testing Strategy</h2>
+      <table>
+        <thead><tr><th>Layer</th><th>Coverage</th></tr></thead>
+        <tbody>
+          <tr><td>Unit</td><td>state.mjs frontmatter 解析/序列化往返；stage handler 纯函数化后的转移逻辑（每个 stage × 每个分支）；锁的获取/stale 判定</td></tr>
+          <tr><td>Integration</td><td><b>fake-claude stub</b>（PATH 前置的假二进制，按调用序返回脚本化 JSON）驱动 conductor 全状态机：正常路径、verdict fail×3、崩溃重入、预算超限、并发双开——全程零 token</td></tr>
+          <tr><td>E2E（最小验收路径）</td><td>真 claude 跑 bugfix 档：<code>target/</code> 预埋 bug → <code>new --kind bugfix</code> → <code>run</code> → 经 READY/VERIFY 到 AWAIT_HUMAN_MERGE → 人在 worktree 验 diff → <code>merge</code>。通过标准：bug 修复、测试绿、案卷完整、归档正确</td></tr>
+        </tbody>
+      </table>
+      <div class="callout">fake-claude stub 是本项目的测试支点：状态机的全部分支（包括崩溃和重试）都必须能在不花一分钱的情况下回归。真 claude 只出现在 E2E。</div>
+    </section>
+
+    <section id="open-questions">
+      <h2>7. Open Questions</h2>
+      <ol>
+        <li><b>已决（2026-06-11）</b>预算默认值：<code>budgetUsd=5</code>/任务、<code>--max-turns 30</code>/spawn，E2E 后按实测校准。</li>
+        <li><b>已决（2026-06-11）</b>verifier 纯静态对照（只读），不跑测试；行为验证完全由 green gate 承担。留心眼：若实践中静态对照漏判，再放开 <code>Bash(testCommand)</code>。</li>
+        <li><b>已决（2026-06-11）</b>真实试点：<code>example-org/example-service</code>，首个任务示例（feature/调研档）：「market-api 降本涉及 okx 的 api 降本，还有什么优化点与建议」。demo E2E 通过后切 config 指向该仓库。</li>
+        <li><b>已决（2026-06-11）</b>demo 阶段 maker 不挂内环 reviewer（少一个变量，框架先通），案卷仅预留 <code>review-findings.md</code> 位；里程碑 #7 之后把 sd0x-dev-flow 挂进 maker。</li>
+      </ol>
+      <div class="callout">四项均已批准落定，无阻塞项。</div>
+    </section>
+  </main>
+</div>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'dark',
+    themeVariables: {
+      darkMode: true,
+      background: '#121212',
+      primaryColor: '#1a1a1a',
+      primaryTextColor: '#e8e8e8',
+      primaryBorderColor: '#3a3a3a',
+      lineColor: '#888',
+      secondaryColor: '#1f1f1f',
+      tertiaryColor: '#161616'
+    },
+    flowchart: { curve: 'basis' }
+  });
+</script>
+</body>
+</html>

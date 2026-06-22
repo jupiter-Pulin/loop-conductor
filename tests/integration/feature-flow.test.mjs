@@ -1,0 +1,115 @@
+// 集成：feature 档——NEEDS_SPEC（plan-agent 产出草稿）→ AWAIT_SPEC_APPROVAL 人类闸门
+// → approve 冻结 spec → READY → … → AWAIT_HUMAN_MERGE；以及 reject + notes 回炉路径。
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { makeEnv, promptOf, verifierStep } from '../helpers/env.mjs';
+import { FIXED_STATS } from '../helpers/target-fixture.mjs';
+
+// spec 草稿含两条验收标准 → 抽取 AC-001 / AC-002（verifier 需逐条裁决）。
+const SPEC_DRAFT = [
+  '# spec 草稿 v1',
+  '',
+  '## 验收标准',
+  '',
+  '- AC-001 median 偶数分支取平均',
+  '- AC-002 node --test 全绿',
+  '',
+].join('\n');
+const SPEC_DRAFT_V2 = '# spec 草稿 v2（回应 reject）\n\n## 验收标准\n\n- AC-001 同 v1，并补充边界用例说明\n';
+
+test('feature 档：plan → 闸门停住 → approve → 冻结 → 直达 AWAIT_HUMAN_MERGE', (t) => {
+  const env = makeEnv(t);
+  env.setScenario([
+    { session_id: 'sess-plan-1', cost: 0.03, result: SPEC_DRAFT },          // 0 plan-agent
+    { actions: [{ type: 'writeFile', path: 'lib/stats.mjs', content: FIXED_STATS }],
+      session_id: 'sess-m1', cost: 0.1, result: 'done' },                    // 1 maker
+    verifierStep(1, { 'AC-001': 'pass', 'AC-002': 'pass' }, { cost: 0.02 }), // 2 verifier
+  ]);
+
+  const created = env.run('new', '--kind', 'feature', '--title', 'median 统计能力');
+  const id = created.stdout.match(/task-\d{8}-\d{3}/)?.[0];
+  assert.ok(id);
+  assert.equal(env.findTask(id).runtime.stage, 'NEEDS_SPEC'); // feature 初始 NEEDS_SPEC
+
+  // 第一次 run：plan 产出草稿后停在人类闸门
+  const run1 = env.run('run');
+  assert.equal(run1.status, 0, run1.stderr);
+  const gated = env.findTask(id);
+  assert.equal(gated.runtime.stage, 'AWAIT_SPEC_APPROVAL');
+  assert.equal(gated.runtime.approval, null);
+  const draftPath = path.join(env.root, 'specs', `${id}.md`);
+  assert.equal(fs.readFileSync(draftPath, 'utf8'), SPEC_DRAFT);
+  assert.equal(env.calls().length, 1, '闸门未批，不得 spawn maker');
+  // plan-agent 只读工具集（--tools 硬限制 + --allowedTools 免审批），cwd 是 target 仓库
+  const planCall = env.calls()[0];
+  assert.equal(planCall.argv[planCall.argv.indexOf('--tools') + 1], 'Read,Grep,Glob');
+  assert.equal(planCall.argv[planCall.argv.indexOf('--allowedTools') + 1], 'Read,Grep,Glob');
+  assert.ok(planCall.argv.includes('--max-turns'), 'plan spawn 带 --max-turns');
+  assert.ok(planCall.cwd.endsWith('target'));
+  // plan spawn 也留档 <role>-r<n>.json（原始 CLI JSON）
+  const planRec = env.readJson(env.dossier(id, 'plan-r1.json'));
+  assert.ok(planRec.started && planRec.done, 'plan-r1 双标记齐全');
+  assert.equal(planRec.raw.session_id, 'sess-plan-1');
+
+  // 幂等：再 run 一次仍停在闸门、零新 spawn
+  env.run('run');
+  assert.equal(env.calls().length, 1);
+  assert.equal(env.findTask(id).runtime.stage, 'AWAIT_SPEC_APPROVAL');
+
+  // approve → 冻结 spec → 直达 AWAIT_HUMAN_MERGE
+  const ok = env.run('approve', id);
+  assert.equal(ok.status, 0, ok.stderr);
+  const run2 = env.run('run');
+  assert.equal(run2.status, 0, run2.stderr);
+  const done = env.findTask(id);
+  assert.equal(done.runtime.stage, 'AWAIT_HUMAN_MERGE');
+  // AC-003：批准稿冻结进 dossier/<id>/spec.md，且 maker/verifier prompt 用它作契约
+  assert.equal(fs.readFileSync(env.dossier(id, 'spec.md'), 'utf8'), SPEC_DRAFT, '冻结副本与批准稿一致');
+  assert.equal(env.calls().length, 3);
+  const makerPrompt = promptOf(env.calls()[1]);
+  assert.ok(makerPrompt.includes('median 偶数分支取平均'), 'maker prompt 含冻结 spec 内容');
+  assert.equal(env.findTask(id).runtime.maker_miss_count, 0);
+});
+
+test('reject + notes 回炉：plan-agent 第二稿必须看到 reject_notes', (t) => {
+  const env = makeEnv(t);
+  env.setScenario([
+    { session_id: 'sess-plan-1', cost: 0.03, result: SPEC_DRAFT },     // 0 plan v1
+    { session_id: 'sess-plan-2', cost: 0.03, result: SPEC_DRAFT_V2 },  // 1 plan v2（带 notes）
+  ]);
+
+  const created = env.run('new', '--kind', 'feature', '--title', '回炉测试');
+  const id = created.stdout.match(/task-\d{8}-\d{3}/)?.[0];
+  env.run('run'); // → AWAIT_SPEC_APPROVAL
+
+  const rejected = env.run('reject', id, '--notes', '验收标准太含糊，要可机判');
+  assert.equal(rejected.status, 0, rejected.stderr);
+  const afterReject = env.findTask(id);
+  assert.equal(afterReject.runtime.approval, 'rejected');
+  // notes 进任务目录 reject_notes.md，不入 runtime
+  const notes = fs.readFileSync(path.join(afterReject.dir, 'reject_notes.md'), 'utf8');
+  assert.match(notes, /验收标准太含糊/, 'notes 追加进任务目录 reject_notes.md');
+  assert.equal('reject_notes' in afterReject.runtime, false, 'reject notes 不入 runtime');
+
+  const run2 = env.run('run'); // AWAIT_SPEC_APPROVAL → NEEDS_SPEC → 重新 plan → 回到闸门
+  assert.equal(run2.status, 0, run2.stderr);
+  const back = env.findTask(id);
+  assert.equal(back.runtime.stage, 'AWAIT_SPEC_APPROVAL');
+  assert.equal(back.runtime.approval, null, '重新出稿后 approval 复位');
+  assert.equal(fs.readFileSync(path.join(env.root, 'specs', `${id}.md`), 'utf8'), SPEC_DRAFT_V2);
+
+  // 旧草稿归档（保证 NEEDS_SPEC 的「草稿已存在」检查不误判）
+  const archiveDir = path.join(env.root, 'specs', 'archive');
+  const archived = fs.readdirSync(archiveDir).filter((n) => n.startsWith(`${id}-rejected-`));
+  assert.equal(archived.length, 1, '被打回的旧草稿应归档到 specs/archive/');
+  assert.equal(fs.readFileSync(path.join(archiveDir, archived[0]), 'utf8'), SPEC_DRAFT, '归档内容是 v1 原稿');
+
+  const calls = env.calls();
+  assert.equal(calls.length, 2);
+  assert.ok(promptOf(calls[1]).includes('验收标准太含糊'), '第二稿 prompt 必须带 reject_notes');
+  // 两次 plan spawn 各自留档
+  assert.equal(env.readJson(env.dossier(id, 'plan-r1.json')).raw.session_id, 'sess-plan-1');
+  assert.equal(env.readJson(env.dossier(id, 'plan-r2.json')).raw.session_id, 'sess-plan-2');
+});

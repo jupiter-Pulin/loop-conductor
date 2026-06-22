@@ -1,0 +1,18 @@
+{
+  "budgetUsd": 5,
+  "maxTurns": 30,
+  "testCommand": "node --test",
+  "targetRepo": "./target",
+  "models": {
+    "plan": null,
+    "maker": null,
+    "verifier": null
+  },
+  "spawnRetries": 4,
+  "spawnBackoffMs": [
+    15000,
+    30000,
+    60000,
+    120000
+  ]
+}

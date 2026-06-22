@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="zh-Hans">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Loop Conductor — 状态仪表盘</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <style>
+    :root {
+      --bg: #0d0d0d; --fg: #e8e8e8; --muted: #888; --border: #242424;
+      --border-strong: #3a3a3a; --accent: #6ea8fe; --code-bg: #161616;
+      --stripe: #141414; --panel: #121212;
+      --ok: #4ade80; --warn: #fbbf24; --risk: #f87171;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, "PingFang SC", "Noto Sans SC", sans-serif; font-size: 15px; line-height: 1.65; color: var(--fg); background: var(--bg); }
+    .layout { display: grid; grid-template-columns: 220px minmax(0, 1fr); max-width: 1180px; margin: 0 auto; gap: 56px; padding: 0 32px; }
+    aside { position: sticky; top: 0; align-self: start; max-height: 100vh; overflow-y: auto; padding: 48px 0; font-size: 13px; }
+    aside .brand { font-weight: 600; font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); margin-bottom: 16px; }
+    aside ol { list-style: none; padding: 0; margin: 0; counter-reset: toc; }
+    aside li { counter-increment: toc; }
+    aside a { display: block; padding: 5px 0; color: var(--muted); text-decoration: none; transition: color .15s; }
+    aside a:hover { color: var(--fg); }
+    aside a::before { content: counter(toc) ". "; color: var(--border); }
+    main { padding: 48px 0 120px; min-width: 0; }
+    header.doc { border-bottom: 1px solid var(--border); padding-bottom: 28px; margin-bottom: 40px; }
+    header.doc h1 { font-size: 28px; margin: 0 0 14px; font-weight: 600; letter-spacing: -0.01em; }
+    header.doc .meta { display: flex; gap: 20px; flex-wrap: wrap; font-size: 13px; color: var(--muted); }
+    header.doc .meta b { color: var(--fg); font-weight: 500; margin-right: 4px; }
+    section { margin-bottom: 52px; scroll-margin-top: 24px; }
+    section h2 { font-size: 19px; font-weight: 600; margin: 0 0 20px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+    h3 { font-size: 12px; font-weight: 600; margin: 26px 0 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    p, li { color: var(--fg); }
+    ul, ol { padding-left: 22px; }
+    code { font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 0.86em; background: var(--code-bg); padding: 1px 6px; border-radius: 3px; }
+    pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; font-size: 13px; line-height: 1.55; }
+    pre code { background: none; padding: 0; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; margin: 8px 0; }
+    th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+    th { font-weight: 600; color: var(--muted); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; border-bottom: 1px solid var(--border-strong); }
+    tbody tr:hover { background: var(--stripe); }
+    .badge { display: inline-block; font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); background: var(--panel); white-space: nowrap; }
+    .badge.ok   { color: var(--ok); border-color: #14532d; background: #0d1f14; }
+    .badge.warn { color: var(--warn); border-color: #5a3a0a; background: #1f1608; }
+    .badge.risk { color: var(--risk); border-color: #5a1414; background: #1f0a0a; }
+    .callout { border-left: 3px solid var(--accent); background: rgba(110,168,254,0.08); padding: 12px 16px; margin: 16px 0; border-radius: 0 4px 4px 0; font-size: 14px; }
+    .callout.risk { border-left-color: var(--risk); background: rgba(248,113,113,0.08); }
+    .callout.warn { border-left-color: var(--warn); background: rgba(251,191,36,0.07); }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin: 8px 0 4px; }
+    .card { border: 1px solid var(--border); border-radius: 8px; padding: 16px 18px; background: var(--panel); }
+    .card .n { font-size: 26px; font-weight: 700; letter-spacing: -0.02em; }
+    .card .l { font-size: 12px; color: var(--muted); margin-top: 4px; }
+    .card.green .n { color: var(--ok); }
+    .card.red .n { color: var(--risk); }
+    .card.amber .n { color: var(--warn); }
+    .mermaid { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 24px; text-align: center; margin: 12px 0; }
+    .legend { display: flex; gap: 18px; flex-wrap: wrap; font-size: 12.5px; color: var(--muted); margin: 6px 0 14px; }
+    .legend span::before { content: "●"; margin-right: 6px; }
+    .dot-done::before { color: var(--ok); }
+    .dot-block::before { color: var(--risk); }
+    .dot-partial::before { color: var(--warn); }
+    .tl { list-style: none; padding: 0; margin: 0; }
+    .tl li { padding: 6px 0 6px 20px; border-left: 1px solid var(--border-strong); position: relative; font-size: 13.5px; }
+    .tl li::before { content: ""; position: absolute; left: -4px; top: 13px; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+    .tl li.ok::before { background: var(--ok); }
+    .tl li.bad::before { background: var(--risk); }
+    .tl .t { color: var(--muted); font-family: ui-monospace, monospace; font-size: 11.5px; margin-right: 8px; }
+    @media (max-width: 880px) { .layout { grid-template-columns: 1fr; gap: 0; padding: 0 20px; } aside { position: static; max-height: none; padding: 24px 0 8px; border-bottom: 1px solid var(--border); } main { padding-top: 24px; } }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <aside>
+    <div class="brand">Status Board</div>
+    <ol>
+      <li><a href="#tldr">一句话结论</a></li>
+      <li><a href="#scoreboard">计分板</a></li>
+      <li><a href="#machine">状态机现状</a></li>
+      <li><a href="#built">已建成的</a></li>
+      <li><a href="#blocker">卡点：E2E</a></li>
+      <li><a href="#verify">验收轨迹</a></li>
+      <li><a href="#next">下一步</a></li>
+    </ol>
+  </aside>
+
+  <main>
+    <header class="doc">
+      <h1>Loop Conductor — 状态仪表盘</h1>
+      <div class="meta">
+        <span><b>Feature</b> loop-conductor</span>
+        <span><b>Snapshot</b> 2026-06-13</span>
+        <span><b>代码</b> 框架完成</span>
+        <span class="badge warn">E2E 受阻</span>
+      </div>
+    </header>
+
+    <section id="tldr">
+      <h2>1. 一句话结论</h2>
+      <div class="callout">
+        <b>框架（代码 + 测试）已完成并两轮冷验收通过；但真 claude 的端到端从未跑通过一次 —— 每次 maker spawn 都死于账号侧的 <code>403 Request not allowed</code>。</b>
+        这是<b>环境问题，不是框架问题</b>：第 4 次 run 恰好证明了这一点 —— 它正确触发了瞬态重试、正确记账、被 kill 后状态幂等不脏。框架在等一个能正常调用 API 的窗口。
+      </div>
+    </section>
+
+    <section id="scoreboard">
+      <h2>2. 计分板</h2>
+      <div class="cards">
+        <div class="card green"><div class="n">44/44</div><div class="l">测试通过（0 失败）</div></div>
+        <div class="card green"><div class="n">1354</div><div class="l">conductor 代码行</div></div>
+        <div class="card green"><div class="n">958</div><div class="l">测试代码行</div></div>
+        <div class="card green"><div class="n">0</div><div class="l">npm 依赖</div></div>
+        <div class="card green"><div class="n">7/7</div><div class="l">CLI 子命令</div></div>
+        <div class="card green"><div class="n">2</div><div class="l">冷验收轮次通过</div></div>
+        <div class="card red"><div class="n">0</div><div class="l">真 claude E2E 成功</div></div>
+        <div class="card amber"><div class="n">4×403</div><div class="l">E2E 尝试均被拦</div></div>
+      </div>
+      <div class="legend">
+        <span class="dot-done">已完成并验收</span>
+        <span class="dot-partial">已完成未验收</span>
+        <span class="dot-block">受阻 / 未达成</span>
+      </div>
+    </section>
+
+    <section id="machine">
+      <h2>3. 状态机现状</h2>
+      <p>绿色 = 代码已实现且测试覆盖；红色虚线 = 真 claude 路径上从未被实际走通（因 403 在第一格 READS 就失败回退）。</p>
+      <div class="mermaid">
+stateDiagram-v2
+    direction LR
+    [*] --> NEEDS_SPEC : feature 档
+    [*] --> READY : bugfix 档
+    NEEDS_SPEC --> AWAIT_SPEC_APPROVAL : plan-agent
+    AWAIT_SPEC_APPROVAL --> READY : approve
+    AWAIT_SPEC_APPROVAL --> NEEDS_SPEC : reject+notes
+    READY --> VERIFY : maker绿+greenGate
+    READY --> FAILED_BOX : 失败/403耗尽
+    VERIFY --> AWAIT_HUMAN_MERGE : verdict pass
+    VERIFY --> FIXING : fail miss&lt;3
+    VERIFY --> FAILED_BOX : miss≥3
+    FIXING --> VERIFY : 重修
+    AWAIT_HUMAN_MERGE --> [*] : merge
+    note right of READY : 真 E2E 卡在这里\n maker spawn → 403
+      </div>
+      <h3>当前活跃任务</h3>
+      <table>
+        <thead><tr><th>任务</th><th>档</th><th>Stage</th><th>Miss</th><th>花费</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td><code>task-20260613-001</code></td><td>bugfix</td><td><span class="badge warn">READY</span></td><td>0</td><td>$0.104</td><td>第 4 次 run 被 kill 后停在此，幂等可续</td></tr>
+          <tr><td><code>task-20260612-001</code></td><td>bugfix</td><td><span class="badge risk">FAILED_BOX</span></td><td>0</td><td>$0.000</td><td>早期 403 失败，留作收件箱样本</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="built">
+      <h2>4. 已建成的（代码盘点）</h2>
+      <h3>Conductor 本体 — 1354 行</h3>
+      <table>
+        <thead><tr><th>文件</th><th>行</th><th>职责</th><th>状态</th></tr></thead>
+        <tbody>
+          <tr><td><code>conductor.mjs</code></td><td>390</td><td>CLI 入口 + drain 循环 + 7 子命令</td><td><span class="badge ok">完成</span></td></tr>
+          <tr><td><code>lib/state.mjs</code></td><td>152</td><td>frontmatter 读写 / 状态转移 / dossier 工具</td><td><span class="badge ok">完成</span></td></tr>
+          <tr><td><code>lib/claude.mjs</code></td><td>146</td><td>claude CLI 唯一封装 + <b>瞬态 403 重试/续接</b></td><td><span class="badge ok">完成</span></td></tr>
+          <tr><td><code>lib/git.mjs</code></td><td>67</td><td>worktree 生命周期 / merge / diff</td><td><span class="badge ok">完成</span></td></tr>
+          <tr><td><code>lib/lock.mjs</code></td><td>40</td><td>mkdir 原子锁 + 30 分钟 stale 检测</td><td><span class="badge ok">完成</span></td></tr>
+          <tr><td><code>stages/shared.mjs</code></td><td>217</td><td>green gate / maker spawn 双标记 / 预算累计</td><td><span class="badge ok">完成</span></td></tr>
+          <tr><td><code>stages/decisions.mjs</code></td><td>73</td><td>全部转移分支（纯函数，可单测）</td><td><span class="badge ok">完成</span></td></tr>
+          <tr><td><code>stages/{ready,verify,fixing,needs_spec,await_spec_approval}.mjs</code></td><td>269</td><td>5 个 stage handler</td><td><span class="badge ok">完成</span></td></tr>
+        </tbody>
+      </table>
+
+      <h3>核心不变量（全部由代码强制 + 测试锁定）</h3>
+      <table>
+        <thead><tr><th>不变量</th><th>实现要点</th></tr></thead>
+        <tbody>
+          <tr><td>制造与裁决分离</td><td>maker spawn / verifier 冷上下文静态对照，verdict 只认文件不认 stdout</td></tr>
+          <tr><td>green gate 不信口供</td><td>conductor 亲跑 <code>testCommand</code>，只认 exit code</td></tr>
+          <tr><td>重试阶梯 1/2/3</td><td>miss==1 续原 maker（<code>-r</code>）、==2 冷 maker、≥3 FAILED_BOX</td></tr>
+          <tr><td>三层预算闸</td><td>per-spawn <code>--max-turns 30</code> / per-task <code>$5</code> / 阶梯硬上限</td></tr>
+          <tr><td>先产物后状态</td><td>所有 handler 末步才改 stage，崩溃可幂等重入</td></tr>
+          <tr><td>外部状态为脊柱</td><td>state/*.md + dossier/ 落盘，agent 可死、案卷不丢</td></tr>
+          <tr><td><b>瞬态故障韧性（新增）</b></td><td>403/429/5xx 自动退避重试 <code>[15,30,60,120]s</code>，有进度则 <code>-r</code> 续接，重试花费照实记账</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="blocker">
+      <h2>5. 卡点：真 claude E2E</h2>
+      <div class="callout risk">
+        <b>四次点火，四次 403。</b>本地 <code>claude</code> CLI 单独预检偶尔能成功返回 <code>ok</code>，但 conductor spawn 出的 maker 子进程几乎必中 <code>403 Request not allowed</code>。这是账号 / 配额 / 风控侧的间歇性拒绝，<b>不是 conductor 的 bug</b>。
+      </div>
+      <h3>诊断收敛过程（这本身就是 loop 韧性的实战检验）</h3>
+      <ul class="tl">
+        <li class="bad"><span class="t">#1 23:47</span> maker 秒死 403（num_turns 1, $0）→ green gate 红 → FAILED_BOX。机制正确，但把瞬态错误当成了干活失败。</li>
+        <li class="bad"><span class="t">#2 23:57</span> retry 后再 403，同样秒死。坐实"间歇性"。</li>
+        <li class="bad"><span class="t">#3 00:00</span> 这次 maker 真跑了 <b>3 个回合、烧了 $0.104</b> 才被 403 打断 —— 证明失败可能发生在<b>有真实进度之后</b>，必须支持"续接"而非"从头重来"。</li>
+        <li class="ok"><span class="t">补丁</span> 给 <code>lib/claude.mjs</code> 加瞬态重试 + <code>-r</code> 续接 + 重试记账；测试 40 → 44 全绿。<b>顺手挖出一个潜伏 bug</b>：测试注入的 <code>NODE_TEST_CONTEXT</code> 泄漏进嵌套 green gate，导致它<b>恒绿吞红灯</b> —— 此前 40 个测试碰巧没踩中。</li>
+        <li class="bad"><span class="t">#4 00:24</span> 第 4 次 run：补丁生效，<code>transient retry attempt 2 (status=403)</code> 正确触发并进入退避等待 —— 但在等 15/30/60/120s 时被手动 kill。任务幂等停在 READY，状态不脏。</li>
+      </ul>
+      <div class="callout warn">
+        <b>附带账：瞬态韧性补丁本身尚未过冷验收。</b>它是为了打通 E2E 临时加的，按"制造与裁决分离"的规矩，它欠一轮独立 verifier 审查。已记在下一步清单里。
+      </div>
+    </section>
+
+    <section id="verify">
+      <h2>6. 验收轨迹（已通过的部分）</h2>
+      <table>
+        <thead><tr><th>轮次</th><th>对象</th><th>方式</th><th>结论</th></tr></thead>
+        <tbody>
+          <tr><td>VERIFY-1</td><td>首版框架实现</td><td>单冷 verifier 静态对照 spec</td><td><span class="badge ok">pass</span> · 0 blocker · 5 偏离有据</td></tr>
+          <tr><td>VERIFY-2</td><td>D1–D5 修复 + 硬约束回归</td><td>6 路并行只读 + 不符合项 2 路对抗复核</td><td><span class="badge ok">pass</span> · D5 误报被复核驳回</td></tr>
+          <tr><td>green gate</td><td>全量测试</td><td>conductor / 我亲手多次复跑</td><td><span class="badge ok">44/44</span></td></tr>
+          <tr><td>VERIFY-3</td><td><b>瞬态韧性补丁</b></td><td>—</td><td><span class="badge warn">待做</span></td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="next">
+      <h2>7. 下一步</h2>
+      <ol>
+        <li><b>解 403（前置阻塞）</b> —— 确认本地 <code>claude</code> 账号 / 订阅 / 区域配额状态；或换一个能稳定 headless 调用的凭证。在此打通前，真 E2E 无法完成。</li>
+        <li><b>重跑 E2E</b> —— <code>task-20260613-001</code> 已在 READY，一条 <code>conductor run</code> 即续；目标走到 <code>AWAIT_HUMAN_MERGE</code>，由你看 worktree diff 后 <code>merge</code>。</li>
+        <li><b>补 VERIFY-3</b> —— 对瞬态韧性补丁做一轮独立冷验收（含那个被顺手修掉的 <code>NODE_TEST_CONTEXT</code> 吞红灯 bug 的回归确认）。</li>
+        <li><b>切真实试点</b> —— E2E 通过后把 <code>conductor.config.json</code> 的 <code>targetRepo</code> 指向 <code>example-org/example-service</code>，首个任务：market-api / okx 降本调研（feature 档，走 plan → 你审批 spec）。</li>
+      </ol>
+      <div class="callout">
+        <b>怎么看这份仪表盘：</b>左侧计分板的绿色是真的 —— 框架是结实的、测试是绿的、验收是过的。但右上角那个红色的 <code>0 真 claude E2E 成功</code> 同样是真的，且它是目前唯一挡在"demo 跑通"前面的东西。两者不矛盾：我们造好了车，但还没拿到一次能上路的路条。
+      </div>
+    </section>
+  </main>
+</div>
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'dark', themeVariables: { darkMode: true, background: '#121212', primaryColor: '#1a1a1a', primaryTextColor: '#e8e8e8', primaryBorderColor: '#3a3a3a', lineColor: '#888', secondaryColor: '#1f1f1f', tertiaryColor: '#161616' }, flowchart: { curve: 'basis' } });
+</script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+- 2026-06-12T04:39:15.389Z created (kind=bugfix, stage=READY)
+- 2026-06-12T04:40:08.921Z spec frozen → dossier/spec.md
+- 2026-06-12T04:40:08.969Z maker r1 spawn (cold)
+- 2026-06-12T04:40:08.970Z maker r1 done (ok=false, cost=$0)
+- 2026-06-12T04:40:09.059Z green gate r1: exit 1
+- 2026-06-12T04:40:09.060Z stage → FAILED_BOX (green gate failed (exit 1) at maker r1)
+- 2026-06-12T04:41:10.352Z retry：1 个轮次产物移入 attempts/2026-06-12T04-41-10-351Z/（案卷保留）
+- 2026-06-12T04:41:10.352Z human retry：FAILED_BOX → READY（miss 重置，案卷保留）
+- 2026-06-12T04:41:20.385Z maker r1 spawn (cold)
+- 2026-06-12T04:41:20.386Z maker r1 done (ok=false, cost=$0)
+- 2026-06-12T04:41:20.490Z green gate r1: exit 1
+- 2026-06-12T04:41:20.491Z stage → FAILED_BOX (green gate failed (exit 1) at maker r1)

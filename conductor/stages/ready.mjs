@@ -1,0 +1,97 @@
+// READY（契约 §11）：round=1。ensureWorktree(+excludes) → checkTrackedHarness →
+// spawn maker（cold）→ conductor 亲跑 green gate → writeGreenGateResult。
+// pass → VERIFY；fail → writeRepairContext(green_gate) + makerMissNext → FIXING / FAILED_BOX。
+// 幂等：maker-r1.json 有 started 无 done → 上次崩溃，转 FAILED_BOX（crashed），retry 可恢复；
+//       有 done → 跳过 spawn，仅复跑 green gate 完成转移。
+import * as state from '../lib/state.mjs';
+import { ensureWorktree, checkTrackedHarness } from '../lib/git.mjs';
+import { markerStatus, greenGatePassed, makerMissNext } from './decisions.mjs';
+import {
+  worktreePath, runGreenGate, writeGreenGateResult, buildRepairContext, writeRepairContext,
+  runMakerRound, buildMakerColdPrompt, ensureDossierSpec, budgetExceeded, failToBox,
+  HARNESS_ARTIFACTS,
+} from './shared.mjs';
+
+export default function readyHandler(ts, cfg) {
+  const id = ts.id;
+  const round = 1;
+  const marker = state.readJsonIf(state.dossierPath(cfg, id, `maker-r${round}.json`));
+  const status = markerStatus(marker);
+
+  if (status === 'in-progress') {
+    // 有 started 无 done = 上次 run 在 spawn 中途崩溃。不滞留：收箱待人工 retry 恢复。
+    return failToBox(
+      ts, cfg,
+      `crashed: maker-r${round} 有 started 无 done（上次 conductor 中断）。\`conductor retry ${id}\` 可恢复`,
+      'crashed',
+    );
+  }
+
+  if (status === 'none') {
+    if (budgetExceeded(ts, cfg)) {
+      return failToBox(ts, cfg, `budget exceeded: $${ts.runtime.spent_usd} >= $${cfg.budgetUsd}，拒绝 spawn`, 'budget_exceeded');
+    }
+    ensureDossierSpec(ts, cfg); // bugfix 档在此从 state/queue/<id>/spec.md 冻结进 dossier
+    const wt = ensureWorktree(cfg.targetRepo, worktreePath(cfg, id), `task/${id}`, HARNESS_ARTIFACTS.patterns);
+    const conflicts = checkTrackedHarness(wt, HARNESS_ARTIFACTS.tracked);
+    if (conflicts.length > 0) {
+      return failToBox(
+        ts, cfg,
+        `已知 harness artifact 已被目标仓库追踪（${conflicts.join(', ')}），不静默删除`,
+        'tracked_harness_artifact_conflict',
+      );
+    }
+    ts.runtime.verifier_invalid_count = 0; // 新 maker 轮：重置 verifier 协议失败计数
+    const prompt = buildMakerColdPrompt(ts, cfg, round);
+    const res = runMakerRound(ts, cfg, round, { mode: 'cold', prompt, wt });
+    if (res?.retriesExhausted) {
+      // maker spawn 瞬态重试耗尽（基础设施失败，非 maker 可行动失败）：
+      // 保留旧行为，直接收箱，不跑 green gate、不进 miss 阶梯（契约 §15）。
+      return failToBox(ts, cfg, `maker spawn 瞬态重试耗尽 (r${round})`, 'spawn_transient_exhausted');
+    }
+  } else {
+    // done 标记已在：跳过 spawn，仅确保环境后复跑 green gate
+    ensureWorktree(cfg.targetRepo, worktreePath(cfg, id), `task/${id}`, HARNESS_ARTIFACTS.patterns);
+    ensureDossierSpec(ts, cfg);
+  }
+
+  const wt = worktreePath(cfg, id);
+  const startedAt = new Date().toISOString();
+  const gate = runGreenGate(ts.task.testCommand, wt);
+  const finishedAt = new Date().toISOString();
+  writeGreenGateResult(cfg, id, round, {
+    command: ts.task.testCommand,
+    exitCode: gate.exitCode,
+    stdout: gate.stdout,
+    stderr: gate.stderr,
+    startedAt,
+    finishedAt,
+  });
+  state.appendTimeline(cfg, id, `green gate r${round}: exit ${gate.exitCode}`);
+
+  if (greenGatePassed(gate.exitCode)) {
+    state.transitionState(ts, cfg, 'VERIFY', `green gate pass r${round}`, { current_round: round });
+    return { changed: true };
+  }
+
+  // green gate 失败：写 repair-context(green_gate)，按 miss 阶梯路由（不直接收箱，除非阶梯耗尽）。
+  const gg = state.readJsonIf(state.dossierPath(cfg, id, `green-gate-r${round}.json`));
+  const ctx = buildRepairContext({
+    source: 'green_gate', round, greenGate: gg, tailBytes: cfg.greenGateOutputTailBytes,
+  });
+  writeRepairContext(cfg, id, round, ctx);
+  const next = makerMissNext(ts.runtime.maker_miss_count ?? 0, cfg.maxMakerMisses);
+  if (next.stage === 'FAILED_BOX') {
+    return failToBox(
+      ts, cfg,
+      `green gate failed (exit ${gate.exitCode}) at r${round}，miss ${next.missCount} 阶梯耗尽`,
+      'maker_misses_exhausted',
+      { maker_miss_count: next.missCount }, // 递增后的 miss 一并落盘
+    );
+  }
+  state.transitionState(ts, cfg, 'FIXING', `green gate fail r${round}, miss=${next.missCount}`, {
+    maker_miss_count: next.missCount,
+    current_round: round,
+  });
+  return { changed: true };
+}
