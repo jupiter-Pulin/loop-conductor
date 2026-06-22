@@ -1,6 +1,0 @@
-{
-  "verdict": "fail",
-  "reasons": [
-    "verifier 未产出机器可读裁决（严格 JSON 解析失败）"
-  ]
-}

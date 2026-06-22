@@ -5,3 +5,15 @@ target/
 # 本地工具/会话状态，不入库
 .claude/settings.local.json
 .claude_review_state.json
+
+# 运行时任务数据，只保留目录骨架（.gitkeep）
+state/queue/*
+state/done/*
+state/failed/*
+specs/*
+dossier/*
+!state/queue/.gitkeep
+!state/done/.gitkeep
+!state/failed/.gitkeep
+!specs/.gitkeep
+!dossier/.gitkeep
