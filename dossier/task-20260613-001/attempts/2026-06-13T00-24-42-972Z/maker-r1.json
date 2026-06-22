@@ -1,0 +1,70 @@
+{
+  "role": "maker",
+  "round": 1,
+  "started": "2026-06-13T00:00:38.702Z",
+  "mode": "cold",
+  "done": "2026-06-13T00:00:46.959Z",
+  "ok": false,
+  "session_id": "233a1a7e-af08-450e-9861-8544e45b1116",
+  "cost_usd": 0.104246,
+  "raw": {
+    "type": "result",
+    "subtype": "success",
+    "is_error": true,
+    "api_error_status": 403,
+    "duration_ms": 7366,
+    "duration_api_ms": 6070,
+    "num_turns": 3,
+    "result": "Failed to authenticate. API Error: 403 Request not allowed",
+    "stop_reason": "stop_sequence",
+    "session_id": "233a1a7e-af08-450e-9861-8544e45b1116",
+    "total_cost_usd": 0.104246,
+    "usage": {
+      "input_tokens": 11546,
+      "cache_creation_input_tokens": 3016,
+      "cache_read_input_tokens": 17462,
+      "output_tokens": 305,
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 3016,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "not_available",
+      "iterations": [
+        {
+          "input_tokens": 11546,
+          "output_tokens": 305,
+          "cache_read_input_tokens": 17462,
+          "cache_creation_input_tokens": 3016,
+          "cache_creation": {
+            "ephemeral_5m_input_tokens": 0,
+            "ephemeral_1h_input_tokens": 3016
+          },
+          "type": "message"
+        }
+      ],
+      "speed": "standard"
+    },
+    "modelUsage": {
+      "claude-opus-4-8[1m]": {
+        "inputTokens": 11546,
+        "outputTokens": 305,
+        "cacheReadInputTokens": 17462,
+        "cacheCreationInputTokens": 3016,
+        "webSearchRequests": 0,
+        "costUSD": 0.104246,
+        "contextWindow": 1000000,
+        "maxOutputTokens": 64000
+      }
+    },
+    "permission_denials": [],
+    "terminal_reason": "completed",
+    "fast_mode_state": "off",
+    "uuid": "8c0a4d2b-b55f-4fae-a439-2ec9e64f9e6a"
+  },
+  "error": "claude exited 1 with unparsable output"
+}
