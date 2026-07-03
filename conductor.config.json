@@ -4,7 +4,9 @@
   "testCommand": "node --test",
   "targetRepo": "./target",
   "models": {
-    "plan": null,
+    "setup": null,
+    "spec": null,
+    "specVerifier": null,
     "maker": null,
     "verifier": null
   },

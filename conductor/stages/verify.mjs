@@ -1,24 +1,25 @@
-// VERIFY（契约 §11）：round=maker_miss_count+1。spawn verifier（纯只读，不跑测试）→
+// VERIFY（契约 §11）：round=makerRound(miss)。spawn verifier（纯只读，不跑测试）→
 // parseStrictJson + validateVerifierVerdict：
 //   invalid → 写 verify-r<n>.invalid-a<m>.json、verifierInvalidNext（留 VERIFY 重试 / 收箱），
 //             不写 verdict、不写 repair-context、不增 maker_miss_count。
-//   valid   → 写 verify-r<n>.verdict.json、verify-r<n>.md（叙事）、重置 verifier_invalid_count；
+//   valid   → 写 verify-r<n>.verdict.json、verify-r<n>.md（conductor 从 verdict 渲染的人读报告）、
+//             重置 verifier_invalid_count；
 //             verdictNext：pass→AWAIT_HUMAN_MERGE；fail→writeRepairContext(verifier)+makerMissNext→FIXING/FAILED_BOX。
 // 幂等：verify-r<n>.verdict.json 已存在 → 直接按 verdictNext 消费，不重 spawn。
 import fs from 'node:fs';
 import * as state from '../lib/state.mjs';
 import { runClaude } from '../lib/claude.mjs';
 import {
-  parseStrictJson, validateVerifierVerdict, verdictNext, verifierInvalidNext, makerMissNext,
+  parseStrictJson, validateVerifierVerdict, verdictNext, verifierInvalidNext, makerMissNext, makerRound,
 } from './decisions.mjs';
 import {
-  worktreePath, buildVerifierPrompt, buildRepairContext, writeRepairContext,
+  worktreePath, buildVerifierPrompt, buildRepairContext, writeRepairContext, renderVerifyReport,
   addCost, budgetExceeded, failToBox, startSpawnRecord, finishSpawnRecord, VERIFIER_TOOLS,
 } from './shared.mjs';
 
 export default function verifyHandler(ts, cfg) {
   const id = ts.id;
-  const round = (ts.runtime.maker_miss_count ?? 0) + 1; // 轮次与刚产出 diff 的 maker round 对齐
+  const round = makerRound(ts.runtime.maker_miss_count); // 轮次与刚产出 diff 的 maker round 对齐
   const verdictPath = state.dossierPath(cfg, id, `verify-r${round}.verdict.json`);
 
   // 幂等分支：verdict 文件已存在 → 直接消费（不重 spawn）。
@@ -81,11 +82,12 @@ export default function verifyHandler(ts, cfg) {
     return { changed: true };
   }
 
-  // ---- valid verdict：落盘 verdict + 叙事，重置 verifier_invalid_count ----
+  // ---- valid verdict：落盘 verdict + 渲染人读报告，重置 verifier_invalid_count ----
+  // 报告由 conductor 从 verdict 渲染（合法 verifier 输出被强制为纯 JSON，原文没有叙事可留）。
   state.writeJson(verdictPath, check.verdict);
   state.writeFileEnsured(
     state.dossierPath(cfg, id, `verify-r${round}.md`),
-    res.result ?? '',
+    renderVerifyReport(check.verdict, round),
   );
   ts.runtime.verifier_invalid_count = 0;
   state.saveRuntime(ts);

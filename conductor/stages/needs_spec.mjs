@@ -1,65 +1,99 @@
-// NEEDS_SPEC（契约 §11，feature 专用）：spawn plan-agent（只读、cwd=targetRepo、读 reject_notes.md）
-// → 落盘 specs/<id>.md → 清 approval=null → AWAIT_SPEC_APPROVAL。
-// 幂等：specs/<id>.md 已存在且 approval==null → 跳过 spawn，仅推进状态。预算超 → FAILED_BOX。
+// NEEDS_SPEC（feature 专用）：spawn spec-agent（只读探索 + 受限写，cwd=targetRepo，
+// hook 护栏经 --settings 注入）→ agent 直写 specs/<id>.md → conductor 契约门终审
+// （spec-doc/v1）→ SPEC_VERIFY。
+// 契约门 fail：留在 NEEDS_SPEC 原地重试（草稿归档、错误进下轮 prompt），超额收箱。
+// 幂等：specs/<id>.md 已存在且未被打回且过契约门 → 跳过 spawn；未过（崩溃残留半成品）→
+// 归档重产，绝不带病进 SPEC_VERIFY。预算超 → FAILED_BOX。
 import fs from 'node:fs';
 import path from 'node:path';
 import { runClaude } from '../lib/claude.mjs';
 import * as state from '../lib/state.mjs';
-import { needsSpecAction } from './decisions.mjs';
+import { validateSpecDoc } from '../lib/spec-contract.mjs';
+import { needsSpecAction, specContractInvalidNext } from './decisions.mjs';
 import {
-  readAgentPrompt, addCost, budgetExceeded, failToBox,
-  READONLY_TOOLS, nextRoleRound, startSpawnRecord, finishSpawnRecord,
+  addCost, archiveSpecDraft, budgetExceeded, buildSpecAgentPrompt, failToBox,
+  nextRoleRound, runSpecContractGate, SPEC_AGENT_TOOLS, specDraftPath,
+  startSpawnRecord, finishSpawnRecord, writeSpecAgentSettings,
 } from './shared.mjs';
 
 export default function needsSpecHandler(ts, cfg) {
   const id = ts.id;
-  const specPath = path.join(cfg.specsDir, `${id}.md`);
-  const action = needsSpecAction(fs.existsSync(specPath), ts.runtime.approval ?? null);
+  const specPath = specDraftPath(cfg, id);
+  let action = needsSpecAction(fs.existsSync(specPath), ts.runtime.approval ?? null);
+
+  if (action === 'skip-spawn') {
+    // 直写模式下现存草稿可能是崩溃残留的半成品：契约不过就归档重产，绝不带病进 SPEC_VERIFY。
+    let md = null;
+    try { md = fs.readFileSync(specPath, 'utf8'); } catch { /* 视为缺失 */ }
+    const leftover = validateSpecDoc(md);
+    if (!leftover.ok) {
+      const archived = archiveSpecDraft(cfg, id, 'contract-invalid-leftover');
+      state.appendTimeline(
+        cfg, id,
+        `现存 spec 草稿未过契约门（${leftover.errors.join('; ')}），归档重产` +
+        `${archived ? ` → ${path.relative(cfg.root, archived)}` : ''}`,
+      );
+      action = 'spawn';
+    }
+  }
 
   if (action === 'spawn') {
     if (budgetExceeded(ts, cfg)) {
       return failToBox(ts, cfg, `budget exceeded: $${ts.runtime.spent_usd} >= $${cfg.budgetUsd}`, 'budget_exceeded');
     }
-    // reject_notes 来自任务目录的 reject_notes.md（cmdReject 累加写入，不入 runtime）。
-    let rejectNotes = '';
-    try { rejectNotes = fs.readFileSync(path.join(ts.dir, 'reject_notes.md'), 'utf8'); } catch { /* 首稿无 */ }
-
-    const prompt = [
-      readAgentPrompt(cfg, 'plan-agent.md'),
-      `# 任务 ${id}\n\n标题：${ts.task.title ?? '(untitled)'}\nkind：${ts.task.kind}`,
-      rejectNotes.trim() ? `# 上一稿被打回，必须回应以下 reject_notes\n\n${rejectNotes}` : '',
-      '# 指令\n在当前目录（target 仓库）只读调研后，直接以最终回复输出 spec 草稿的 Markdown 全文，' +
-      '必须包含「## 验收标准」清单。不要输出 JSON 或其他包装。',
-    ].filter(Boolean).join('\n\n');
-
-    // plan-r<n>.json 案卷：spawn 记录统一留档（reject 回炉再 spawn 即 r2）。
-    const round = nextRoleRound(cfg, id, 'plan');
-    const rec = startSpawnRecord(cfg, id, 'plan', round);
+    const round = nextRoleRound(cfg, id, 'spec-agent');
+    const settings = writeSpecAgentSettings(ts, cfg, round);
+    const rec = startSpawnRecord(cfg, id, 'spec-agent', round, { mode: 'draft' });
     const res = runClaude({
       cwd: cfg.targetRepo,
-      prompt,
+      prompt: buildSpecAgentPrompt(ts, cfg, round, { mode: 'draft' }),
       maxTurns: cfg.maxTurns,
-      model: cfg.models?.plan ?? null,
-      tools: READONLY_TOOLS,        // 工具集硬限制：只读
-      allowedTools: READONLY_TOOLS, // 免审批放行同一集合
+      model: cfg.models?.spec ?? null,
+      tools: SPEC_AGENT_TOOLS,
+      allowedTools: SPEC_AGENT_TOOLS,
+      settings,
     });
     finishSpawnRecord(rec, res);
     addCost(ts, res.costUsd);
-    if (!res.ok || !res.result?.trim()) {
+    if (!res.ok) {
       state.saveRuntime(ts);
-      state.appendTimeline(cfg, id, `plan spawn failed: ${res.error ?? 'empty result'}`);
-      console.error(`[${id}] plan-agent 失败（${res.error ?? 'empty result'}），任务停留在 NEEDS_SPEC，下次 run 重试`);
+      state.appendTimeline(cfg, id, `spec-agent spawn failed: ${res.error ?? 'unknown'}`);
+      console.error(`[${id}] spec-agent 失败（${res.error ?? 'unknown'}），任务停留在 NEEDS_SPEC，下次 run 重试`);
       return { changed: false };
     }
-    // 先产物后状态：spec 落盘，再清 approval，最后才转移。
-    fs.mkdirSync(path.dirname(specPath), { recursive: true });
-    fs.writeFileSync(specPath, res.result);
+    if (res.sessionId) ts.runtime.spec_agent_session_id = res.sessionId;
+
+    // conductor 契约门（权威终审）：hook 是快反馈层，是否真跑过一律不采信，这里重新裁。
+    const check = runSpecContractGate(ts, cfg, round);
+    if (!check.ok) {
+      const next = specContractInvalidNext(ts.runtime.spec_contract_invalid_count ?? 0, cfg.maxSpecContractRetries);
+      state.appendTimeline(cfg, id, `spec-agent r${round} 交付未过契约门（第 ${next.invalidCount} 次）：${check.errors.join('; ')}`);
+      if (next.exhausted) {
+        return failToBox(
+          ts, cfg,
+          `spec 契约门失败超过上限（${cfg.maxSpecContractRetries}），收箱`,
+          next.failureType, // 'spec_contract_exhausted'
+          { spec_contract_invalid_count: next.invalidCount },
+        );
+      }
+      archiveSpecDraft(cfg, id, `contract-invalid-r${round}`); // 废稿归档，下一轮干净起步
+      ts.runtime.spec_contract_invalid_count = next.invalidCount;
+      state.saveRuntime(ts);
+      return { changed: true }; // 留在 NEEDS_SPEC，drain 再入本 handler 重 spawn（prompt 带契约错误）
+    }
+    // 先产物后状态：草稿已过门，清 approval / 复位计数，最后才转移。
+    ts.runtime.spec_contract_invalid_count = 0;
     ts.runtime.approval = null;
+    ts.runtime.current_spec_round = round;
+    ts.runtime.spec_verifier_invalid_count = 0;
     state.saveRuntime(ts);
-    state.appendTimeline(cfg, id, `plan-agent 产出 spec 草稿 (cost=$${res.costUsd}) → specs/${id}.md`);
+    state.appendTimeline(cfg, id, `spec-agent r${round} 直写 spec 草稿过契约门 (cost=$${res.costUsd}, AC×${check.acs.length}) → specs/${id}.md`);
   }
 
-  state.transitionState(ts, cfg, 'AWAIT_SPEC_APPROVAL', action === 'skip-spawn' ? 'spec 草稿已存在' : 'spec 草稿就绪');
-  console.log(`[${id}] spec 草稿待审批：specs/${id}.md → conductor approve|reject ${id}`);
+  if (action === 'skip-spawn' && !ts.runtime.current_spec_round) {
+    ts.runtime.current_spec_round = nextRoleRound(cfg, id, 'spec-agent') - 1 || 1;
+  }
+  state.transitionState(ts, cfg, 'SPEC_VERIFY', action === 'skip-spawn' ? 'spec 草稿已存在' : 'spec 草稿就绪');
+  console.log(`[${id}] spec 草稿进入 spec-verifier：specs/${id}.md`);
   return { changed: true };
 }

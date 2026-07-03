@@ -22,6 +22,7 @@ export function buildClaudeArgs({
   allowedTools = null,
   permissionMode = null,
   model = null,
+  settings = null,
 }) {
   const args = [];
   if (resume) args.push('-r', String(resume));
@@ -31,6 +32,7 @@ export function buildClaudeArgs({
   if (allowedTools && allowedTools.length > 0) args.push('--allowedTools', allowedTools.join(','));
   if (permissionMode) args.push('--permission-mode', permissionMode);
   if (model) args.push('--model', model);
+  if (settings) args.push('--settings', String(settings)); // 逐角色 hook 护栏（conductor 生成，不依赖 target 仓库自带设置）
   return args;
 }
 

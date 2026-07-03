@@ -15,25 +15,6 @@
 - 你必须先用工具确认引用的文件存在、行号范围真实存在、excerpt/summary 与实际内容一致，**确认无误后**才输出 verdict。若发现自己引用的行号/内容不匹配，重新核对再输出——不要把这种错误留给下游。
 - `overall` 只能在**每一条** AC 都是 `pass` 时为 `pass`，否则为 `fail`。
 
-输出：最终回复**必须且仅为**匹配以下 schema 的严格 JSON（不带任何其他文字、不在叙事里夹 JSON）：
+输出：最终回复**必须且仅为**匹配 `verifier-verdict/v1` 的严格 JSON（不带任何其他文字、不在叙事里夹 JSON、不使用 Markdown 围栏）。该 contract 的唯一权威校验在 `conductor/stages/decisions.mjs::validateVerifierVerdict`；`schema_version` 必须为 `1`。
 
-```json
-{
-  "schema_version": 1,
-  "round": 1,
-  "overall": "pass|fail",
-  "criteria_results": [
-    {
-      "ac_id": "AC-001",
-      "status": "pass|fail|unknown",
-      "reason": "本条裁决依据（非空）",
-      "evidence": [
-        { "type": "source", "file": "lib/x.mjs", "start_line": 8, "end_line": 8, "summary": "证据摘要" }
-      ]
-    }
-  ],
-  "non_ac_findings": []
-}
-```
-
-conductor 会把它落盘为 `dossier/<id>/verify-r<n>.verdict.json`，并且只信该文件；任何不匹配 schema 或缺/多 AC 的输出都会被判为 invalid 并要求重出（不会算作 maker 失败）。
+conductor 会把合法输出落盘为 `dossier/<id>/verify-r<n>.verdict.json`，并且只信该文件；任何不匹配 contract 或缺/多 AC 的输出都会被判为 invalid 并要求重出（不会算作 maker 失败）。
