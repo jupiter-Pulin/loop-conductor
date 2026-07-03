@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { writeFileAtomic, writeJsonAtomic } from './state.mjs';
 
 function safeName(name) {
   return String(name ?? 'repo').replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'repo';
@@ -44,7 +45,7 @@ export function hasApprovedSetupProfile(cfg) {
 export function writeApprovedSetupProfile(cfg, { markdown, sourceTaskId = null }) {
   const paths = setupProfilePaths(cfg);
   fs.mkdirSync(paths.dir, { recursive: true });
-  fs.writeFileSync(paths.approved, markdown);
+  writeFileAtomic(paths.approved, markdown);
   const meta = {
     schema_version: 1,
     profile_key: paths.key,
@@ -53,6 +54,6 @@ export function writeApprovedSetupProfile(cfg, { markdown, sourceTaskId = null }
     approved_at: new Date().toISOString(),
     source_task_id: sourceTaskId,
   };
-  fs.writeFileSync(paths.meta, `${JSON.stringify(meta, null, 2)}\n`);
+  writeJsonAtomic(paths.meta, meta);
   return { paths, meta };
 }

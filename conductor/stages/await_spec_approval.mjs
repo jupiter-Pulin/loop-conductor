@@ -9,7 +9,7 @@ import * as state from '../lib/state.mjs';
 import { approvalNext } from './decisions.mjs';
 import { archiveSpecDraft } from './shared.mjs';
 
-export default function awaitSpecApprovalHandler(ts, cfg) {
+export default async function awaitSpecApprovalHandler(ts, cfg) {
   const id = ts.id;
   const next = approvalNext(ts.runtime.approval ?? null);
   if (next === null) return { changed: false }; // 闸门未动，drain 自然停住

@@ -3,11 +3,12 @@
 // TaskState（ts）形态：{ box, dir, id, task /*task.json*/, runtime /*runtime.json*/ }。
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { runClaudeWithRetry } from '../lib/claude.mjs';
 import { ensureWorktree, commitAll, diffAgainstBase, diffNameStatusAgainstBase } from '../lib/git.mjs';
 import { readApprovedSetupProfile, setupProfilePaths } from '../lib/profile.mjs';
 import * as state from '../lib/state.mjs';
+import { addRunCost, canStartSpawn } from '../lib/scheduler.mjs';
 import { SPEC_DOC_CONTRACT, validateSpecDoc } from '../lib/spec-contract.mjs';
 import { overBudget, SPEC_VERIFIER_CONTRACT, VERIFIER_VERDICT_CONTRACT } from './decisions.mjs';
 
@@ -36,6 +37,8 @@ export const HARNESS_ARTIFACTS = {
   // ls-files 检测「是否已被目标仓库追踪」用的名字（目录名直接传）。
   tracked: ['.claude_review_state.json', '.will-workflow', '.agent'],
 };
+
+export { canStartSpawn };
 
 // ---- <role>-r<n>.json 案卷：所有角色（plan/maker/verifier）的 spawn 统一留档（spec §3.2）。
 // started 标记先落盘（崩溃可识别），done 收尾时附原始 CLI JSON（session_id、cost 等）。
@@ -78,6 +81,8 @@ export function finishSpawnRecord(rec, res) {
   rec.record.session_id = res.sessionId;
   rec.record.cost_usd = res.costUsd;
   rec.record.raw = res.raw ?? null; // 原始 CLI JSON 留档，不经转述
+  if (res.killed !== undefined) rec.record.killed = res.killed ?? null;
+  if (res.costUnknown) rec.record.cost_unknown = true;
   if (res.attempts) rec.record.attempts = res.attempts; // 瞬态重试逐次留痕
   if (!res.ok) rec.record.error = res.error ?? 'unknown';
   state.writeJson(rec.path, rec.record);
@@ -86,15 +91,46 @@ export function finishSpawnRecord(rec, res) {
 
 // ---- green gate（契约 §6）：conductor 在 worktree 里亲自跑 testCommand，只认 exit code。
 
-/** 跑 green gate。签名 (testCommand, cwd) → { exitCode, stdout, stderr }。 */
-export function runGreenGate(testCommand, cwd) {
-  const r = spawnSync(testCommand, {
-    shell: true,
-    cwd,
-    encoding: 'utf8',
-    maxBuffer: 64 * 1024 * 1024,
+/** 跑 green gate。签名 (testCommand, cwd, opts) → { exitCode, timedOut, stdout, stderr }。 */
+export function runGreenGate(testCommand, cwd, { timeoutMs = 1_800_000, killGraceMs = 10_000 } = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(testCommand, {
+      shell: true,
+      cwd,
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const stdout = [];
+    const stderr = [];
+    let timedOut = false;
+    let forceTimer = null;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      try { process.kill(-child.pid, 'SIGTERM'); } catch { /* already exited */ }
+      forceTimer = setTimeout(() => {
+        try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
+      }, killGraceMs);
+      forceTimer.unref?.();
+    }, timeoutMs);
+    timeout.unref?.();
+    child.stdout.on('data', (chunk) => stdout.push(Buffer.from(chunk)));
+    child.stderr.on('data', (chunk) => stderr.push(Buffer.from(chunk)));
+    child.on('error', (err) => {
+      clearTimeout(timeout);
+      if (forceTimer) clearTimeout(forceTimer);
+      resolve({ exitCode: -1, timedOut: false, stdout: '', stderr: String(err) });
+    });
+    child.on('close', (code) => {
+      clearTimeout(timeout);
+      if (forceTimer) clearTimeout(forceTimer);
+      resolve({
+        exitCode: timedOut ? null : code ?? -1,
+        timedOut,
+        stdout: Buffer.concat(stdout).toString('utf8'),
+        stderr: Buffer.concat(stderr).toString('utf8'),
+      });
+    });
   });
-  return { exitCode: r.status ?? -1, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
 }
 
 /** 取字符串末尾 maxBytes 字节（按 UTF-8 字节口径，repair context 的 tail 上限用）。 */
@@ -119,6 +155,7 @@ export function writeGreenGateResult(cfg, id, round, fields, tailBytes) {
     command: fields.command,
     cwd: path.join('worktrees', id),
     exit_code: fields.exitCode,
+    ...(fields.timedOut ? { timed_out: true } : {}),
     stdout_tail: tailBytesOf(fields.stdout, tail),
     stderr_tail: tailBytesOf(fields.stderr, tail),
     started_at: fields.startedAt,
@@ -486,9 +523,10 @@ export function setupDraftPath(cfg) {
 }
 
 /** 成本累计写进 ts.runtime.spent_usd（不落盘，交给 saveRuntime/transitionState）。 */
-export function addCost(ts, costUsd) {
+export function addCost(ts, costUsd, cfg = null) {
   const next = (ts.runtime.spent_usd ?? 0) + (costUsd ?? 0);
   ts.runtime.spent_usd = Math.round(next * 1e6) / 1e6;
+  if (cfg) addRunCost(cfg, costUsd);
 }
 
 export function budgetExceeded(ts, cfg) {
@@ -658,9 +696,13 @@ export function buildVerifierPrompt(ts, cfg, round, acList) {
  * 不在此 ensureWorktree / 不在此跑 green gate（handler 负责）；wt 由 handler 传入。
  * 返回 claude 调用结果（降级后为冷启动结果）。
  */
-export function runMakerRound(ts, cfg, round, { mode, prompt, coldPrompt, wt }) {
+export async function runMakerRound(ts, cfg, round, { mode, prompt, coldPrompt, wt }) {
   const id = ts.id;
-  const rec = startSpawnRecord(cfg, id, 'maker', round, { mode }); // started 先落盘：此后崩溃可被识别
+  const streamFile = state.dossierPath(cfg, id, `maker-r${round}.stream.jsonl`);
+  const rec = startSpawnRecord(cfg, id, 'maker', round, {
+    mode,
+    stream_file: path.relative(cfg.root, streamFile),
+  }); // started 先落盘：此后崩溃可被识别
   state.appendTimeline(cfg, id, `maker r${round} spawn (${mode})`);
 
   const common = {
@@ -668,6 +710,9 @@ export function runMakerRound(ts, cfg, round, { mode, prompt, coldPrompt, wt }) 
     permissionMode: 'acceptEdits',
     maxTurns: cfg.maxTurns,
     model: cfg.models?.maker ?? null,
+    streamFile,
+    inactivityTimeoutMs: cfg.inactivityTimeoutMs,
+    wallClockMs: cfg.spawnWallClockMs,
   };
   // 瞬态重试参数来自 config；每次重试在 timeline 留痕（attempt 序号 + status）
   const retryOpts = {
@@ -678,25 +723,28 @@ export function runMakerRound(ts, cfg, round, { mode, prompt, coldPrompt, wt }) 
   };
   let res;
   if (mode === 'resume') {
-    res = runClaudeWithRetry({ ...common, resume: ts.runtime.maker_session_id, prompt }, retryOpts);
+    res = await runClaudeWithRetry({ ...common, resume: ts.runtime.maker_session_id, prompt }, retryOpts);
     if (!res.ok && !res.retriesExhausted) {
       rec.record.resume_failed = true;
       rec.record.mode = 'cold-degraded';
       state.writeJson(rec.path, rec.record);
       state.appendTimeline(cfg, id, `maker r${round} resume 失败（${res.error ?? 'unknown'}）→ 降级冷启动`);
-      res = runClaudeWithRetry({ ...common, prompt: coldPrompt ?? prompt }, retryOpts);
+      res = await runClaudeWithRetry({ ...common, prompt: coldPrompt ?? prompt }, retryOpts);
     }
   } else {
-    res = runClaudeWithRetry({ ...common, prompt }, retryOpts);
+    res = await runClaudeWithRetry({ ...common, prompt }, retryOpts);
   }
   if (res.retriesExhausted) {
     state.appendTimeline(cfg, id, `maker r${round} transient retries exhausted`);
+  }
+  if (res.costUnknown) {
+    state.appendTimeline(cfg, id, `maker r${round} cost unknown; spent_usd uses lower-bound accounting`);
   }
 
   const marker = finishSpawnRecord(rec, res); // done 标记收尾 + 原始 CLI JSON 留档
 
   if (res.sessionId) ts.runtime.maker_session_id = res.sessionId;
-  addCost(ts, res.costUsd);
+  addCost(ts, res.costUsd, cfg);
   state.saveRuntime(ts); // 产物（cost/session）先落盘，stage 仍未动
   state.appendTimeline(cfg, id, `maker r${round} done (ok=${res.ok}, cost=$${res.costUsd})`);
 

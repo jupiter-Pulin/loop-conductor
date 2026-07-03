@@ -16,5 +16,12 @@
     30000,
     60000,
     120000
-  ]
+  ],
+  "maxConcurrentTasks": 3,
+  "inactivityTimeoutMs": 600000,
+  "spawnWallClockMs": 14400000,
+  "greenGateTimeoutMs": 1800000,
+  "lockHeartbeatMs": 60000,
+  "maxStepsPerTask": 20,
+  "runBudgetUsd": null
 }

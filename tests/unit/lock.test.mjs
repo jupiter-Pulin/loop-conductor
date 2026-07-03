@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { acquireLock, releaseLock, isStaleLock, lockDirPath, STALE_MS } from '../../conductor/lib/lock.mjs';
+import { acquireLock, releaseLock, isStaleLock, lockDirPath, STALE_MS, startLockHeartbeat } from '../../conductor/lib/lock.mjs';
 
 function tmpStateDir(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lock-test-'));
@@ -51,4 +51,18 @@ test('isStaleLock 对不存在的锁返回 false', () => {
 test('releaseLock 对不存在的锁不抛错', (t) => {
   const stateDir = tmpStateDir(t);
   assert.doesNotThrow(() => releaseLock(stateDir));
+});
+
+test('startLockHeartbeat：周期刷新锁目录 mtime', async (t) => {
+  const stateDir = tmpStateDir(t);
+  assert.equal(acquireLock(stateDir).acquired, true);
+  const lockDir = lockDirPath(stateDir);
+  const old = (Date.now() - STALE_MS - 60_000) / 1000;
+  fs.utimesSync(lockDir, old, old);
+  assert.equal(isStaleLock(lockDir), true);
+
+  const stop = startLockHeartbeat(stateDir, 20);
+  t.after(() => stop());
+  await new Promise((resolve) => setTimeout(resolve, 70));
+  assert.equal(isStaleLock(lockDir), false);
 });
