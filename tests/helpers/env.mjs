@@ -3,6 +3,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { initTargetRepo, initTargetRepoWithTrackedHarness } from './target-fixture.mjs';
@@ -13,10 +14,19 @@ export const CONDUCTOR = path.join(REPO_ROOT, 'conductor', 'conductor.mjs');
 export const FAKE_CLAUDE = path.join(REPO_ROOT, 'tests', 'fixtures', 'fake-claude.mjs');
 
 const AGENT_STUBS = {
-  'plan-agent.md': '# plan stub\n',
+  'setup-agent.md': '# setup stub\n',
+  'spec-agent.md': '# spec stub\n',
+  'spec-verifier-agent.md': '# spec verifier stub\n',
   'maker-agent.md': '# maker stub\n',
   'verifier-agent.md': '# verifier stub\n',
 };
+
+function setupProfileKey(targetRepo) {
+  const repo = path.resolve(targetRepo);
+  const safe = String(path.basename(repo)).replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'repo';
+  const hash = crypto.createHash('sha1').update(repo).digest('hex').slice(0, 12);
+  return `${safe}-${hash}`;
+}
 
 // bugfix spec.md 草稿默认含 median 两条验收标准 → 抽取出 AC-001 / AC-002。
 export const DEFAULT_BUGFIX_SPEC = [
@@ -31,7 +41,7 @@ export const DEFAULT_BUGFIX_SPEC = [
 
 export function makeEnv(t, { config = {}, trackedHarness = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'conductor-it-'));
-  for (const d of ['state/queue', 'state/done', 'state/failed', 'specs', 'dossier', 'worktrees', 'agents']) {
+  for (const d of ['state/queue', 'state/done', 'state/failed', 'specs', 'dossier', 'worktrees', 'agents', 'target-profiles']) {
     fs.mkdirSync(path.join(root, d), { recursive: true });
   }
   for (const [name, content] of Object.entries(AGENT_STUBS)) {
@@ -151,6 +161,22 @@ export function makeEnv(t, { config = {}, trackedHarness = false } = {}) {
         const draft = specDraft ?? bodyAc ?? DEFAULT_BUGFIX_SPEC;
         fs.writeFileSync(path.join(dir, 'spec.md'), draft);
       }
+      return dir;
+    },
+
+    writeApprovedSetupProfile(markdown = '# Setup Profile\n\n- test: node --test\n') {
+      const key = setupProfileKey(path.join(root, 'target'));
+      const dir = path.join(root, 'target-profiles', key);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'setup-profile.md'), markdown);
+      fs.writeFileSync(path.join(dir, 'setup-profile.json'), `${JSON.stringify({
+        schema_version: 1,
+        profile_key: key,
+        targetRepo: path.join(root, 'target'),
+        approved: true,
+        approved_at: '2026-06-11T00:00:00.000Z',
+        source_task_id: 'test',
+      }, null, 2)}\n`);
       return dir;
     },
 
@@ -284,5 +310,28 @@ export function verifierStep(round, acStatuses = { 'AC-001': 'pass', 'AC-002': '
     ...(session_id ? { session_id } : {}),
     cost,
     result: verdictJson(round, acStatuses),
+  };
+}
+
+export function specVerifierJson(round, overall = 'pass', over = {}) {
+  const fail = overall === 'fail';
+  return JSON.stringify({
+    schema_version: 1,
+    round,
+    overall,
+    summary: over.summary ?? (fail ? 'spec needs repair' : 'spec is reviewable'),
+    human_report: over.human_report ?? (fail ? 'Human: ACs need sharpening.' : 'Human: spec is ready for approval.'),
+    spec_agent_feedback: over.spec_agent_feedback ?? (fail ? 'Spec agent: make ACs concrete.' : 'Spec agent: no repair needed.'),
+    findings: over.findings ?? (fail
+      ? [{ severity: 'major', audience: 'both', issue: 'AC is too vague', recommendation: 'Rewrite AC as a measurable bullet.' }]
+      : []),
+  });
+}
+
+export function specVerifierStep(round, overall = 'pass', { cost = 0.02, session_id, over = {} } = {}) {
+  return {
+    ...(session_id ? { session_id } : {}),
+    cost,
+    result: specVerifierJson(round, overall, over),
   };
 }

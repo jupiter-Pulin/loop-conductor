@@ -108,3 +108,10 @@ export function diffAgainstBase(wtPath, baseBranch) {
   if (r.status === 0) return r.stdout;
   return git(['diff', 'HEAD'], wtPath).stdout ?? '';
 }
+
+/** 同上的 name-status 清单（diff 超 verifierDiffMaxBytes 时降级喂 verifier）。 */
+export function diffNameStatusAgainstBase(wtPath, baseBranch) {
+  const r = git(['diff', '--name-status', `${baseBranch}...HEAD`], wtPath);
+  if (r.status === 0) return r.stdout;
+  return git(['diff', '--name-status', 'HEAD'], wtPath).stdout ?? '';
+}

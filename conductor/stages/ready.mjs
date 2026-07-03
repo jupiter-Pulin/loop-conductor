@@ -5,7 +5,7 @@
 //       有 done → 跳过 spawn，仅复跑 green gate 完成转移。
 import * as state from '../lib/state.mjs';
 import { ensureWorktree, checkTrackedHarness } from '../lib/git.mjs';
-import { markerStatus, greenGatePassed, makerMissNext } from './decisions.mjs';
+import { markerStatus, greenGatePassed, makerMissNext, makerRound } from './decisions.mjs';
 import {
   worktreePath, runGreenGate, writeGreenGateResult, buildRepairContext, writeRepairContext,
   runMakerRound, buildMakerColdPrompt, ensureDossierSpec, budgetExceeded, failToBox,
@@ -14,7 +14,7 @@ import {
 
 export default function readyHandler(ts, cfg) {
   const id = ts.id;
-  const round = 1;
+  const round = makerRound(ts.runtime.maker_miss_count); // READY 时 miss 恒为 0 → r1
   const marker = state.readJsonIf(state.dossierPath(cfg, id, `maker-r${round}.json`));
   const status = markerStatus(marker);
 
@@ -49,6 +49,9 @@ export default function readyHandler(ts, cfg) {
       // 保留旧行为，直接收箱，不跑 green gate、不进 miss 阶梯（契约 §15）。
       return failToBox(ts, cfg, `maker spawn 瞬态重试耗尽 (r${round})`, 'spawn_transient_exhausted');
     }
+    // maker 非瞬态硬失败（ok=false，如 max-turns 打断）不在此分支：worktree 状态未知，
+    // 必须继续跑 green gate 实测（绿门是唯一事实源），红了照常计一次 maker miss。
+    // 基础设施失败可能因此被计入 miss 阶梯——接受此取舍；timeline 已记 ok=false 供人工归因。
   } else {
     // done 标记已在：跳过 spawn，仅确保环境后复跑 green gate
     ensureWorktree(cfg.targetRepo, worktreePath(cfg, id), `task/${id}`, HARNESS_ARTIFACTS.patterns);
@@ -75,10 +78,7 @@ export default function readyHandler(ts, cfg) {
   }
 
   // green gate 失败：写 repair-context(green_gate)，按 miss 阶梯路由（不直接收箱，除非阶梯耗尽）。
-  const gg = state.readJsonIf(state.dossierPath(cfg, id, `green-gate-r${round}.json`));
-  const ctx = buildRepairContext({
-    source: 'green_gate', round, greenGate: gg, tailBytes: cfg.greenGateOutputTailBytes,
-  });
+  const ctx = buildRepairContext({ source: 'green_gate', round });
   writeRepairContext(cfg, id, round, ctx);
   const next = makerMissNext(ts.runtime.maker_miss_count ?? 0, cfg.maxMakerMisses);
   if (next.stage === 'FAILED_BOX') {

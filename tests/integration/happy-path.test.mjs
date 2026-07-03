@@ -9,6 +9,7 @@ import { FIXED_STATS } from '../helpers/target-fixture.mjs';
 
 test('bugfix 快乐路径直达 AWAIT_HUMAN_MERGE，merge 后归档', (t) => {
   const env = makeEnv(t);
+  env.writeApprovedSetupProfile();
   env.setScenario([
     { // call 0: maker 首轮——真实修掉预埋 bug（green gate 是 conductor 亲自跑的）
       actions: [{ type: 'writeFile', path: 'lib/stats.mjs', content: FIXED_STATS }],
@@ -94,9 +95,9 @@ test('bugfix 快乐路径直达 AWAIT_HUMAN_MERGE，merge 后归档', (t) => {
   assert.equal(calls[1].argv[calls[1].argv.indexOf('--allowedTools') + 1], READONLY, 'verifier --allowedTools 免审批');
   assert.ok(!READONLY.includes('Write'));
   assert.ok(calls[1].argv.includes('--max-turns'), 'verifier spawn 带 --max-turns');
-  // verifier prompt 要求严格 per-AC JSON、含 AC 枚举与 worktree diff
+  // verifier prompt 引用程序级 verdict contract、含 AC 枚举与 worktree diff
   const vprompt = promptOf(calls[1]);
-  assert.ok(vprompt.includes('criteria_results'), 'verifier prompt 要求 per-AC schema');
+  assert.ok(vprompt.includes('verifier-verdict/v1'), 'verifier prompt 引用 verdict contract');
   assert.ok(vprompt.includes('AC-001') && vprompt.includes('AC-002'), 'verifier prompt 含 AC 枚举');
   assert.ok(vprompt.includes('diff'), 'verifier prompt 含 worktree diff');
 

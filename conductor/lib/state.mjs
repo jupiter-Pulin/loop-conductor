@@ -123,14 +123,17 @@ export function appendToSection(body, title, text) {
   return `${before}\n\n${text}\n${after ? `\n${after}\n` : ''}`;
 }
 
+/** AC 段的规范标题（spec-doc 契约钉死此标题，同义标题一律不认）。 */
+export const AC_SECTION_TITLE = '验收标准';
+
 /**
- * AC 枚举（conductor owns）：spec 正文 → [{ ac_id, text }]（契约 §4）。
+ * AC 枚举（无兜底版）：spec 正文 → [{ ac_id, text }]，取不到任何条目返回 []。
  * 1. 取 `## 验收标准` 段；2. 逐条列表项（^\s*-\s+，去复选框前缀）；
- * 3. 含 AC-(\d+) → 归一 AC-###；否则按位置赋 AC-00N（1 基）；
- * 4. text = 清洗后正文；5. 取不到任何条目 → 兜底单条。
+ * 3. 含 AC-(\d+) → 归一 AC-###；否则按位置赋 AC-00N（1 基）。
+ * 契约门（lib/spec-contract.mjs）与 conductor 共用此函数，保证两侧一个口径。
  */
-export function extractAcceptanceCriteria(specMd) {
-  const section = extractSection(specMd, '验收标准');
+export function enumerateAcceptanceCriteria(specMd) {
+  const section = extractSection(specMd, AC_SECTION_TITLE);
   const items = [];
   if (section != null) {
     for (const raw of section.split('\n')) {
@@ -142,9 +145,6 @@ export function extractAcceptanceCriteria(specMd) {
       items.push(text);
     }
   }
-  if (items.length === 0) {
-    return [{ ac_id: 'AC-001', text: '满足 spec.md 全部要求且 testCommand 全绿' }];
-  }
   return items.map((text, idx) => {
     const tagged = text.match(/AC-(\d+)/);
     const ac_id = tagged
@@ -152,6 +152,18 @@ export function extractAcceptanceCriteria(specMd) {
       : `AC-${String(idx + 1).padStart(3, '0')}`;
     return { ac_id, text };
   });
+}
+
+/**
+ * AC 枚举（带兜底，契约 §4）：feature 档草稿已被契约门保证非空；
+ * 兜底单条仅服务 bugfix 人写最小 spec / 历史任务。
+ */
+export function extractAcceptanceCriteria(specMd) {
+  const items = enumerateAcceptanceCriteria(specMd);
+  if (items.length === 0) {
+    return [{ ac_id: 'AC-001', text: '满足 spec.md 全部要求且 testCommand 全绿' }];
+  }
+  return items;
 }
 
 // ---- dossier 工具（案卷是 agent 间唯一通信媒介） ----

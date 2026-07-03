@@ -1,11 +1,13 @@
 // AWAIT_SPEC_APPROVAL（契约 §11）：人类闸门，纯读 runtime.approval，天然幂等。
-// approved → 冻结 specs/<id>.md → dossier/<id>/spec.md → READY；
+// approved → 冻结 specs/<id>.md → dossier/<id>/spec.md → 草稿归档（specs/archive/，
+//   冻结稿是唯一契约，消除双份平行 spec）→ READY；
 // rejected → 归档旧草稿（specs/archive/，避免 NEEDS_SPEC 的「草稿已存在」误判）→ NEEDS_SPEC；
 // null → { changed:false }（闸门未动）。
 import fs from 'node:fs';
 import path from 'node:path';
 import * as state from '../lib/state.mjs';
 import { approvalNext } from './decisions.mjs';
+import { archiveSpecDraft } from './shared.mjs';
 
 export default function awaitSpecApprovalHandler(ts, cfg) {
   const id = ts.id;
@@ -18,6 +20,11 @@ export default function awaitSpecApprovalHandler(ts, cfg) {
     if (fs.existsSync(draft)) {
       state.writeFileEnsured(frozen, fs.readFileSync(draft, 'utf8')); // 冻结副本，审批后只认 dossier
       state.appendTimeline(cfg, id, 'spec approved，冻结副本 → dossier/spec.md');
+      // 先产物后状态：冻结完成后归档草稿，specs/ 下不留双份平行 spec（下游只认冻结稿）。
+      const archived = archiveSpecDraft(cfg, id, 'approved');
+      if (archived) {
+        state.appendTimeline(cfg, id, `已批准草稿归档 → specs/archive/${path.basename(archived)}`);
+      }
     } else {
       console.error(`[${id}] 警告：specs/${id}.md 缺失，READY 阶段将回退兜底生成 spec`);
     }
@@ -31,8 +38,12 @@ export default function awaitSpecApprovalHandler(ts, cfg) {
       fs.renameSync(draft, archived);
       state.appendTimeline(cfg, id, `spec rejected，旧草稿归档 → specs/archive/${path.basename(archived)}`);
     }
-    state.appendTimeline(cfg, id, 'spec rejected，退回 plan-agent');
-    state.transitionState(ts, cfg, 'NEEDS_SPEC', 'spec rejected');
+    state.appendTimeline(cfg, id, 'spec rejected，退回 spec-agent');
+    state.transitionState(ts, cfg, 'NEEDS_SPEC', 'spec rejected', {
+      spec_miss_count: 0,
+      spec_verifier_invalid_count: 0,
+      current_spec_round: 0,
+    });
   }
   return { changed: true };
 }
