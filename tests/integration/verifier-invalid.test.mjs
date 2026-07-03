@@ -45,6 +45,13 @@ test('verifier invalid → 重试 verifier，不 spawn maker、不增 miss，随
   // 最终 verdict 落盘（合法那次）
   const verdict = env.readJson(env.dossier(id, 'verify-r1.verdict.json'));
   assert.equal(verdict.overall, 'pass');
+
+  // 同轮重 spawn 不覆盖丢失：第一次 invalid 尝试的完整留档进 superseded 数组
+  const vrec = env.readJson(env.dossier(id, 'verifier-r1.json'));
+  assert.ok(Array.isArray(vrec.superseded), 'verifier-r1.json 留 superseded 数组');
+  assert.equal(vrec.superseded.length, 1, '恰好一次被覆盖的旧尝试');
+  assert.ok(vrec.superseded[0].done, 'superseded[0] 有 done 标记（上次尝试完整收尾）');
+  assert.ok(vrec.superseded[0].raw, 'superseded[0] 留原始 CLI JSON（raw）');
 });
 
 test('verifier invalid 超过 maxVerifierInvalidRetries → FAILED_BOX(verifier_protocol_exhausted)', (t) => {

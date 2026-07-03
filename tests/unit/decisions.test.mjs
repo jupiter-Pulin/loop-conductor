@@ -2,9 +2,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  markerStatus, overBudget, greenGatePassed, approvalNext,
-  needsSpecAction, makerMissNext, verdictNext, verifierInvalidNext,
-  fixingMode, parseStrictJson, validateVerifierVerdict, MAX_MISS,
+  markerStatus, overBudget, greenGatePassed, approvalNext, setupApprovalNext,
+  needsSpecAction, makerMissNext, makerRound, verdictNext, verifierInvalidNext,
+  fixingMode, parseStrictJson, specMissNext, specVerifierInvalidNext,
+  validateSpecVerifierVerdict, validateVerifierVerdict, MAX_MISS,
 } from '../../conductor/stages/decisions.mjs';
 
 test('markerStatus：双标记四态', () => {
@@ -42,6 +43,12 @@ test('makerMissNext：miss++ 走 1/2/3 阶梯', () => {
   assert.equal(MAX_MISS, 3);
 });
 
+test('makerRound：maker 轮次恒等于 miss+1（唯一推导点）', () => {
+  assert.equal(makerRound(0), 1); // READY 时 miss=0 → r1
+  assert.equal(makerRound(1), 2);
+  assert.equal(makerRound(undefined), 1);
+});
+
 test('verdictNext(overall)：pass 终点 / fail 同 miss 阶梯', () => {
   assert.deepEqual(verdictNext('pass', 0), { stage: 'AWAIT_HUMAN_MERGE', missCount: 0 });
   assert.deepEqual(verdictNext('pass', 2), { stage: 'AWAIT_HUMAN_MERGE', missCount: 2 });
@@ -68,11 +75,31 @@ test('verifierInvalidNext：留 VERIFY 重试 / 超额收箱（边界）', () =>
   });
 });
 
+test('specMissNext：两次修复，第三次 fail 冷启动新 spec-agent', () => {
+  assert.deepEqual(specMissNext(0, 3), { stage: 'SPEC_FIXING', missCount: 1, coldRestart: false });
+  assert.deepEqual(specMissNext(1, 3), { stage: 'SPEC_FIXING', missCount: 2, coldRestart: false });
+  assert.deepEqual(specMissNext(2, 3), { stage: 'NEEDS_SPEC', missCount: 3, coldRestart: true });
+});
+
+test('specVerifierInvalidNext：留 SPEC_VERIFY 重试 / 超额收箱', () => {
+  assert.deepEqual(specVerifierInvalidNext(0, 2), { stage: 'SPEC_VERIFY', invalidCount: 1, failureType: null });
+  assert.deepEqual(specVerifierInvalidNext(1, 2), { stage: 'SPEC_VERIFY', invalidCount: 2, failureType: null });
+  assert.deepEqual(specVerifierInvalidNext(2, 2), {
+    stage: 'FAILED_BOX', invalidCount: 3, failureType: 'spec_verifier_protocol_exhausted',
+  });
+});
+
 test('approvalNext：人类闸门三分支', () => {
   assert.equal(approvalNext('approved'), 'READY');
   assert.equal(approvalNext('rejected'), 'NEEDS_SPEC');
   assert.equal(approvalNext(null), null);
   assert.equal(approvalNext('garbage'), null);
+});
+
+test('setupApprovalNext：setup 人类闸门', () => {
+  assert.equal(setupApprovalNext('approved'), 'approved');
+  assert.equal(setupApprovalNext(null), null);
+  assert.equal(setupApprovalNext('garbage'), null);
 });
 
 test('needsSpecAction：spec 已存在且未打回 → 跳过 spawn', () => {
@@ -269,4 +296,48 @@ test('validateVerifierVerdict：evidence 缺 type/file/summary 字段', () => {
   const r = validateVerifierVerdict(v, ['AC-001', 'AC-002']);
   assert.equal(r.ok, false);
   assert.ok(r.errors.some((e) => /缺 type\/file\/summary/.test(e)));
+});
+
+function goodSpecVerdict(over = {}) {
+  return {
+    schema_version: 1,
+    round: 1,
+    overall: 'pass',
+    summary: 'spec is ready',
+    human_report: 'Human can approve this spec.',
+    spec_agent_feedback: 'No repair needed.',
+    findings: [],
+    ...over,
+  };
+}
+
+test('validateSpecVerifierVerdict：合法 pass / fail', () => {
+  assert.equal(validateSpecVerifierVerdict(goodSpecVerdict()).ok, true);
+  const fail = goodSpecVerdict({
+    overall: 'fail',
+    findings: [{ severity: 'major', audience: 'both', issue: 'AC 太泛', recommendation: '拆成可验证条目' }],
+  });
+  assert.equal(validateSpecVerifierVerdict(fail).ok, true);
+});
+
+test('validateSpecVerifierVerdict：fail 必须有 findings 且报告字段非空', () => {
+  const noFindings = validateSpecVerifierVerdict(goodSpecVerdict({ overall: 'fail', findings: [] }));
+  assert.equal(noFindings.ok, false);
+  assert.ok(noFindings.errors.some((e) => /findings 至少 1 条/.test(e)));
+
+  const noReport = validateSpecVerifierVerdict(goodSpecVerdict({ human_report: ' ' }));
+  assert.equal(noReport.ok, false);
+  assert.ok(noReport.errors.some((e) => /human_report/.test(e)));
+});
+
+test('validateSpecVerifierVerdict：finding 字段枚举与文本校验', () => {
+  const r = validateSpecVerifierVerdict(goodSpecVerdict({
+    overall: 'fail',
+    findings: [{ severity: 'huge', audience: 'nobody', issue: '', recommendation: '' }],
+  }));
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some((e) => /severity/.test(e)));
+  assert.ok(r.errors.some((e) => /audience/.test(e)));
+  assert.ok(r.errors.some((e) => /issue/.test(e)));
+  assert.ok(r.errors.some((e) => /recommendation/.test(e)));
 });
