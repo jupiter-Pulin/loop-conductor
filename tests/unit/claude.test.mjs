@@ -4,7 +4,7 @@ import { buildClaudeArgs, parseClaudeJson, claudeBin } from '../../conductor/lib
 
 test('buildClaudeArgs：冷启动', () => {
   const args = buildClaudeArgs({ prompt: 'do it', maxTurns: 30 });
-  assert.deepEqual(args, ['-p', 'do it', '--output-format', 'json', '--max-turns', '30']);
+  assert.deepEqual(args, ['-p', 'do it', '--output-format', 'stream-json', '--verbose', '--max-turns', '30']);
 });
 
 test('buildClaudeArgs：resume 带 -r 前置', () => {

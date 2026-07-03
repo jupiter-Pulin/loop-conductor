@@ -9,6 +9,7 @@ import {
   taskDir, readTaskState, saveRuntime, writeNewTask,
   listTaskStates, listTaskDirNames, findLegacyTaskFiles, transitionState,
   extractAcceptanceCriteria, extractSection, appendToSection,
+  writeJson, writeFileEnsured, patrolBoxStageConsistency,
 } from '../../conductor/lib/state.mjs';
 
 function mkbox(prefix = 'state-test-') {
@@ -62,6 +63,44 @@ test('writeNewTask 不写 spec.md（无 specDraft）', (t) => {
   t.after(() => fs.rmSync(box, { recursive: true, force: true }));
   const dir = writeNewTask(box, baseTask(), baseRuntime());
   assert.ok(!fs.existsSync(path.join(dir, 'spec.md')));
+});
+
+function tmpFilesUnder(dir) {
+  const found = [];
+  const walk = (cur) => {
+    let entries = [];
+    try { entries = fs.readdirSync(cur, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const p = path.join(cur, e.name);
+      if (e.isDirectory()) walk(p);
+      if (e.name.includes('.tmp')) found.push(p);
+    }
+  };
+  walk(dir);
+  return found;
+}
+
+test('atomic writes：任务/runtime/dossier 写入后无 tmp 残留且内容完整', (t) => {
+  const root = mkbox('state-atomic-');
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const box = path.join(root, 'queue');
+  const task = baseTask();
+  const runtime = baseRuntime();
+  const dir = writeNewTask(box, task, runtime, { specDraft: '# spec\n' });
+
+  const ts = readTaskState(dir, 'queue');
+  ts.runtime.stage = 'VERIFY';
+  saveRuntime(ts);
+  writeJson(path.join(root, 'dossier', task.id, 'record.json'), { ok: true });
+  writeFileEnsured(path.join(root, 'dossier', task.id, 'note.md'), '# note\n');
+
+  assert.deepEqual(tmpFilesUnder(root), [], 'atomic tmp 文件应在 rename 后清理干净');
+  assert.equal(readTaskState(dir, 'queue').runtime.stage, 'VERIFY');
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root, 'dossier', task.id, 'record.json'), 'utf8')), { ok: true });
+
+  const source = fs.readFileSync(path.join(process.cwd(), 'conductor', 'lib', 'state.mjs'), 'utf8');
+  assert.doesNotMatch(source, /writeFileSync\(path\.join\(dir, 'task\.json'\)/, 'writeNewTask 不应直写最终 task.json');
+  assert.doesNotMatch(source, /writeFileSync\(path\.join\(dir, 'runtime\.json'\)/, 'writeNewTask 不应直写最终 runtime.json');
 });
 
 test('saveRuntime：刷新 updated_at、task.json byte-for-byte 不变', (t) => {
@@ -180,6 +219,30 @@ test('transitionState：普通转移只改 runtime；FAILED_BOX rename 目录', 
   assert.equal(moved.runtime.last_failure_type, 'crashed');
   // timeline 落在 dossier
   assert.ok(fs.existsSync(path.join(cfg.dossierDir, ts.id, 'timeline.md')));
+});
+
+test('patrolBoxStageConsistency：queue 中 FAILED_BOX/DONE 僵尸补搬到对应 box', (t) => {
+  const root = mkbox('state-patrol-');
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cfg = {
+    root,
+    queueDir: path.join(root, 'state', 'queue'),
+    failedDir: path.join(root, 'state', 'failed'),
+    doneDir: path.join(root, 'state', 'done'),
+    dossierDir: path.join(root, 'dossier'),
+  };
+  fs.mkdirSync(cfg.queueDir, { recursive: true });
+  writeNewTask(cfg.queueDir, baseTask('task-20260611-021'), { ...baseRuntime(), stage: 'FAILED_BOX' });
+  writeNewTask(cfg.queueDir, baseTask('task-20260611-022'), { ...baseRuntime(), stage: 'DONE' });
+
+  const repaired = patrolBoxStageConsistency(cfg);
+  assert.deepEqual(repaired.map((r) => [r.id, r.to]), [
+    ['task-20260611-021', 'failed'],
+    ['task-20260611-022', 'done'],
+  ]);
+  assert.ok(fs.existsSync(path.join(cfg.failedDir, 'task-20260611-021', 'runtime.json')));
+  assert.ok(fs.existsSync(path.join(cfg.doneDir, 'task-20260611-022', 'runtime.json')));
+  assert.ok(!fs.existsSync(path.join(cfg.queueDir, 'task-20260611-021')));
 });
 
 test('extractAcceptanceCriteria：AC-### 归一、复选框、位置赋号', () => {

@@ -8,10 +8,10 @@ import { markerStatus, greenGatePassed, makerMissNext, fixingMode, makerRound } 
 import {
   worktreePath, runGreenGate, writeGreenGateResult, buildRepairContext, writeRepairContext,
   runMakerRound, buildMakerColdPrompt, buildMakerRepairPrompt,
-  budgetExceeded, failToBox, HARNESS_ARTIFACTS,
+  budgetExceeded, failToBox, HARNESS_ARTIFACTS, canStartSpawn,
 } from './shared.mjs';
 
-export default function fixingHandler(ts, cfg) {
+export default async function fixingHandler(ts, cfg) {
   const id = ts.id;
   const miss = ts.runtime.maker_miss_count ?? 0;
   const round = makerRound(miss); // miss==1 → r2，miss==2 → r3
@@ -31,6 +31,7 @@ export default function fixingHandler(ts, cfg) {
     if (budgetExceeded(ts, cfg)) {
       return failToBox(ts, cfg, `budget exceeded: $${ts.runtime.spent_usd} >= $${cfg.budgetUsd}，拒绝 spawn`, 'budget_exceeded');
     }
+    if (!canStartSpawn(ts, cfg, 'maker')) return { changed: false };
     const wt = ensureWorktree(cfg.targetRepo, worktreePath(cfg, id), `task/${id}`, HARNESS_ARTIFACTS.patterns);
     const conflicts = checkTrackedHarness(wt, HARNESS_ARTIFACTS.tracked);
     if (conflicts.length > 0) {
@@ -44,7 +45,7 @@ export default function fixingHandler(ts, cfg) {
     const mode = fixingMode(miss, ts.runtime.maker_session_id);
     const coldPrompt = buildMakerColdPrompt(ts, cfg, round, { fullDossier: true });
     const prompt = mode === 'resume' ? buildMakerRepairPrompt(ts, cfg, round) : coldPrompt;
-    const res = runMakerRound(ts, cfg, round, { mode, prompt, coldPrompt, wt });
+    const res = await runMakerRound(ts, cfg, round, { mode, prompt, coldPrompt, wt });
     if (res?.retriesExhausted) {
       // maker spawn 瞬态重试耗尽（基础设施失败）：直接收箱，不跑 green gate、不进 miss 阶梯（契约 §15）。
       return failToBox(ts, cfg, `maker spawn 瞬态重试耗尽 (r${round})`, 'spawn_transient_exhausted');
@@ -58,17 +59,18 @@ export default function fixingHandler(ts, cfg) {
 
   const wt = worktreePath(cfg, id);
   const startedAt = new Date().toISOString();
-  const gate = runGreenGate(ts.task.testCommand, wt);
+  const gate = await runGreenGate(ts.task.testCommand, wt, { timeoutMs: cfg.greenGateTimeoutMs });
   const finishedAt = new Date().toISOString();
   writeGreenGateResult(cfg, id, round, {
     command: ts.task.testCommand,
     exitCode: gate.exitCode,
+    timedOut: gate.timedOut,
     stdout: gate.stdout,
     stderr: gate.stderr,
     startedAt,
     finishedAt,
   });
-  state.appendTimeline(cfg, id, `green gate r${round}: exit ${gate.exitCode}`);
+  state.appendTimeline(cfg, id, `green gate r${round}: ${gate.timedOut ? 'timed out' : `exit ${gate.exitCode}`}`);
 
   if (greenGatePassed(gate.exitCode)) {
     state.transitionState(ts, cfg, 'VERIFY', `green gate pass r${round}`, { current_round: round });
@@ -81,7 +83,7 @@ export default function fixingHandler(ts, cfg) {
   if (next.stage === 'FAILED_BOX') {
     return failToBox(
       ts, cfg,
-      `green gate failed (exit ${gate.exitCode}) at r${round}，miss ${next.missCount} 阶梯耗尽`,
+      `green gate failed (${gate.timedOut ? 'timeout' : `exit ${gate.exitCode}`}) at r${round}，miss ${next.missCount} 阶梯耗尽`,
       'maker_misses_exhausted',
       { maker_miss_count: next.missCount }, // 递增后的 miss 一并落盘
     );

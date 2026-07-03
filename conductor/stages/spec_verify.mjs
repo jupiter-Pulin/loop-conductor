@@ -9,10 +9,10 @@ import {
 } from './decisions.mjs';
 import {
   addCost, archiveSpecDraft, budgetExceeded, buildSpecVerifierPrompt, failToBox,
-  finishSpawnRecord, renderSpecVerifyReport, SPEC_TOOLS, startSpawnRecord, writeSpecRepairContext,
+  finishSpawnRecord, renderSpecVerifyReport, SPEC_TOOLS, startSpawnRecord, writeSpecRepairContext, canStartSpawn,
 } from './shared.mjs';
 
-export default function specVerifyHandler(ts, cfg) {
+export default async function specVerifyHandler(ts, cfg) {
   const id = ts.id;
   const round = ts.runtime.current_spec_round ?? 0;
   if (round < 1) {
@@ -33,18 +33,26 @@ export default function specVerifyHandler(ts, cfg) {
   if (budgetExceeded(ts, cfg)) {
     return failToBox(ts, cfg, `budget exceeded: $${ts.runtime.spent_usd} >= $${cfg.budgetUsd}，拒绝 spawn spec-verifier`, 'budget_exceeded');
   }
+  if (!canStartSpawn(ts, cfg, 'spec-verifier')) return { changed: false };
 
-  const rec = startSpawnRecord(cfg, id, 'spec-verifier', round);
-  const res = runClaude({
+  const streamFile = state.dossierPath(cfg, id, `spec-verifier-r${round}.stream.jsonl`);
+  const rec = startSpawnRecord(cfg, id, 'spec-verifier', round, {
+    stream_file: path.relative(cfg.root, streamFile),
+  });
+  const res = await runClaude({
     cwd: cfg.targetRepo,
     prompt: buildSpecVerifierPrompt(ts, cfg, round),
     maxTurns: cfg.maxTurns,
     model: cfg.models?.specVerifier ?? null,
     tools: SPEC_TOOLS,
     allowedTools: SPEC_TOOLS,
+    streamFile,
+    inactivityTimeoutMs: cfg.inactivityTimeoutMs,
+    wallClockMs: cfg.spawnWallClockMs,
   });
   finishSpawnRecord(rec, res);
-  addCost(ts, res.costUsd);
+  addCost(ts, res.costUsd, cfg);
+  if (res.costUnknown) state.appendTimeline(cfg, id, `spec-verifier r${round} cost unknown; spent_usd uses lower-bound accounting`);
   state.saveRuntime(ts);
 
   const parsed = parseStrictJson(res.result);

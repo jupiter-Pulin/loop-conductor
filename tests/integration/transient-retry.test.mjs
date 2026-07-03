@@ -90,7 +90,7 @@ test('瞬态失败带 session_id 且 num_turns>1 → 重试改 -r 续会话', (t
   assert.ok(i !== -1, '第二次调用必须是 resume');
   assert.equal(calls[1].argv[i + 1], 's-mid', '-r 必须续上次失败的 session');
   assert.ok(promptOf(calls[1]).includes('瞬态错误打断'), 'resume prompt 提示从中断处继续');
-  assert.equal(calls[1].argv[calls[1].argv.indexOf('--output-format') + 1], 'json', '保留 --output-format json');
+  assert.equal(calls[1].argv[calls[1].argv.indexOf('--output-format') + 1], 'stream-json', '保留 --output-format stream-json');
   assert.ok(calls[1].argv.includes('--max-turns'), '保留原 maxTurns');
 
   const marker = env.readJson(env.dossier(id, 'maker-r1.json'));
@@ -123,7 +123,7 @@ test('瞬态 ×5 重试耗尽 → FAILED_BOX，timeline 记 exhausted', (t) => {
   assert.match(timeline, /transient retry attempt 5 \(status=503\)/);
 });
 
-test('setSleepFn 注入：退避序列按 backoffMs 调用，不真等待', (t) => {
+test('setSleepFn 注入：退避序列按 backoffMs 调用，不真等待', async (t) => {
   const env = makeEnv(t);
   const saved = {
     CLAUDE_BIN: process.env.CLAUDE_BIN,
@@ -144,7 +144,7 @@ test('setSleepFn 注入：退避序列按 backoffMs 调用，不真等待', (t) 
   const sleeps = [];
   setSleepFn((ms) => sleeps.push(ms));
 
-  const res = runClaudeWithRetry({ prompt: 'x', cwd: env.root }, { retries: 4, backoffMs: [100, 200] });
+  const res = await runClaudeWithRetry({ prompt: 'x', cwd: env.root }, { retries: 4, backoffMs: [100, 200] });
   assert.equal(res.ok, true);
   assert.equal(res.sessionId, 's-ok');
   assert.deepEqual(sleeps, [100, 200], '注入的 sleep 收到退避序列');

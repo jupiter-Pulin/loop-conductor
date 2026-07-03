@@ -58,3 +58,27 @@ test('跨 spawn 累计：maker 花费推满预算后 verifier 被拒', (t) => {
   assert.ok(after.runtime.spent_usd >= 5, `spent_usd=${after.runtime.spent_usd} 应已累计 maker 成本`);
   assert.equal(env.calls().length, 1, '只有 maker 一次 spawn');
 });
+
+test('runBudgetUsd 达到上限后停止新 spawn，但不按 per-task budget 收箱', (t) => {
+  const env = makeEnv(t, { config: { runBudgetUsd: 0.1 } });
+  const id = 'task-20260611-304';
+  env.writeTask(id);
+  env.setScenario([
+    {
+      actions: [{ type: 'writeFile', path: 'lib/stats.mjs', content: FIXED_STATS }],
+      session_id: 'sess-m1',
+      cost: 0.1,
+      result: 'fixed',
+    },
+    // 不提供 verifier：runBudget 达上限后不得发起第二个 spawn
+  ]);
+
+  const run = env.run('run');
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stderr, /runBudgetUsd=\$0.1 已达到/);
+  const after = env.findTask(id);
+  assert.equal(after.box, 'queue');
+  assert.equal(after.runtime.stage, 'VERIFY', 'run budget 只暂停新 spawn，任务保留当前 stage');
+  assert.equal(after.runtime.last_failure_type, null);
+  assert.equal(env.calls().length, 1);
+});
