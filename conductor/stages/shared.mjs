@@ -5,12 +5,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { runClaudeWithRetry } from '../lib/claude.mjs';
-import { ensureWorktree, commitAll, diffAgainstBase, diffNameStatusAgainstBase } from '../lib/git.mjs';
+import {
+  ensureWorktree, commitAll, diffAgainstBase, diffNameStatusAgainstBase,
+  mergeBaseWith, addDetachedWorktree, removeWorktree,
+} from '../lib/git.mjs';
+import { DEFAULT_TEST_GLOBS, classifyTestFileChanges } from '../lib/test-gate.mjs';
 import { readApprovedSetupProfile, setupProfilePaths } from '../lib/profile.mjs';
 import * as state from '../lib/state.mjs';
 import { addRunCost, canStartSpawn } from '../lib/scheduler.mjs';
 import { SPEC_DOC_CONTRACT, validateSpecDoc } from '../lib/spec-contract.mjs';
-import { overBudget, SPEC_VERIFIER_CONTRACT, VERIFIER_VERDICT_CONTRACT } from './decisions.mjs';
+import { overBudget, testGateVerdict, SPEC_VERIFIER_CONTRACT, VERIFIER_VERDICT_CONTRACT } from './decisions.mjs';
 
 export function worktreePath(cfg, id) {
   return path.join(cfg.worktreesDir, id);
@@ -165,6 +169,82 @@ export function writeGreenGateResult(cfg, id, round, fields, tailBytes) {
   return record;
 }
 
+// ---- test gate（基线空转测试探针，docs/features/test-gate/tech-spec.md）----
+// green gate 之后的第二道确定性闸：基线代码 + 当前测试（改动的测试文件叠加/删除）复跑
+// testCommand。基线仍 exit 0 ⇒ 测试空转（vacuous），没钉住 spec 要求的新行为。
+// 单侧闸门：只有 vacuous 会 block；基线红/超时/探针基建失败（verdict=error）一律放行进 VERIFY。
+
+/**
+ * 跑 test gate 探针并写 dossier/test-gate-r<n>.json。cfg.testGateEnabled===false 时返回 null。
+ * 探针在独立 detached worktree（merge-base(baseBranch, HEAD)）内进行，绝不触碰任务
+ * worktree 与 target 主 checkout；结束（含异常路径）必移除探针 worktree。
+ */
+export async function runTestGateProbe(ts, cfg, round) {
+  if (cfg.testGateEnabled === false) return null;
+  const id = ts.id;
+  const wt = worktreePath(cfg, id);
+  const globs = cfg.testGateTestGlobs ?? DEFAULT_TEST_GLOBS;
+  const probeDir = path.join(cfg.worktreesDir, `${id}.test-gate`);
+  const tail = cfg.greenGateOutputTailBytes;
+  const startedAt = new Date().toISOString();
+
+  const finish = (fields) => {
+    const record = {
+      schema_version: 1,
+      round,
+      command: ts.task.testCommand,
+      base_branch: ts.task.baseBranch,
+      base_commit: fields.baseCommit ?? null,
+      overlay: { globs, copied: fields.copied ?? [], deleted: fields.deleted ?? [] },
+      exit_code: fields.exitCode ?? null,
+      ...(fields.timedOut ? { timed_out: true } : {}),
+      verdict: fields.verdict,
+      ...(fields.error ? { error: fields.error } : {}),
+      stdout_tail: tailBytesOf(fields.stdout ?? '', tail),
+      stderr_tail: tailBytesOf(fields.stderr ?? '', tail),
+      started_at: startedAt,
+      finished_at: new Date().toISOString(),
+    };
+    state.writeJson(state.dossierPath(cfg, id, `test-gate-r${round}.json`), record);
+    state.appendTimeline(cfg, id, `test gate r${round}: ${record.verdict}${
+      fields.error ? `（${fields.error}）` : `（exit ${record.exit_code}${record.timed_out ? ', timed out' : ''}）`
+    }`);
+    return record;
+  };
+
+  // 基线提交取 merge-base（baseBranch 可能已前进），取不到退回分支名。
+  const baseCommit = mergeBaseWith(wt, ts.task.baseBranch) ?? ts.task.baseBranch;
+  const { copy, remove } = classifyTestFileChanges(diffNameStatusAgainstBase(wt, ts.task.baseBranch), globs);
+
+  removeWorktree(cfg.targetRepo, probeDir); // 清掉上次崩溃可能遗留的探针 worktree（幂等）
+  const added = addDetachedWorktree(cfg.targetRepo, probeDir, baseCommit);
+  if (!added.ok) {
+    // 探针基建失败：不 block（verdict=error），留痕供人工归因。
+    return finish({ baseCommit, copied: copy, deleted: remove, verdict: 'error', error: `git worktree add failed: ${added.error}` });
+  }
+  try {
+    for (const rel of copy) {
+      const dst = path.join(probeDir, rel);
+      fs.mkdirSync(path.dirname(dst), { recursive: true });
+      fs.copyFileSync(path.join(wt, rel), dst);
+    }
+    for (const rel of remove) fs.rmSync(path.join(probeDir, rel), { force: true });
+    const gate = await runGreenGate(ts.task.testCommand, probeDir, { timeoutMs: cfg.greenGateTimeoutMs });
+    return finish({
+      baseCommit,
+      copied: copy,
+      deleted: remove,
+      exitCode: gate.exitCode,
+      timedOut: gate.timedOut,
+      stdout: gate.stdout,
+      stderr: gate.stderr,
+      verdict: testGateVerdict(gate.exitCode),
+    });
+  } finally {
+    removeWorktree(cfg.targetRepo, probeDir);
+  }
+}
+
 // ---- repair context（契约 §7）：conductor 生成的最小修复输入，绝不照抄 verifier 叙事。
 
 /**
@@ -173,6 +253,8 @@ export function writeGreenGateResult(cfg, id, round, fields, tailBytes) {
  *                      green_gate=null；overall='fail'。
  * source==='green_gate'：failed_criteria=[]；存 green_gate_ref，不复制 green-gate tail；
  *                        prompt 层再展开摘要；instruction 改为修测试版。
+ * source==='test_gate'：failed_criteria=[]；存 test_gate_ref（同 green_gate_ref 的去重策略）；
+ *                       instruction 要求补/强化在基线上会失败的测试，禁止削弱换绿。
  */
 export function buildRepairContext({ source, round, verdict }) {
   if (source === 'green_gate') {
@@ -185,6 +267,19 @@ export function buildRepairContext({ source, round, verdict }) {
       green_gate: null,
       green_gate_ref: `green-gate-r${round}.json`,
       instruction: 'Fix the failing tests so the test command exits 0. Keep unrelated code intact.',
+    };
+  }
+  if (source === 'test_gate') {
+    return {
+      schema_version: 1,
+      round,
+      source: 'test_gate',
+      overall: 'fail',
+      failed_criteria: [],
+      green_gate: null,
+      test_gate: null,
+      test_gate_ref: `test-gate-r${round}.json`,
+      instruction: 'The current tests still pass on the pre-change baseline: they do not pin the new behavior the spec requires. Add or strengthen tests so at least one fails on the baseline code and passes with your change. Never weaken or delete existing tests to get green.',
     };
   }
   // source === 'verifier'
@@ -614,20 +709,38 @@ function readLatestRepairContext(ts, cfg) {
   return state.readJsonIf(state.dossierPath(cfg, ts.id, `repair-context-r${maxN}.json`));
 }
 
-/** prompt 层展开 green_gate_ref；存储层保持去重，兼容旧 ctx.green_gate 形态。 */
+/** prompt 层展开 green_gate_ref / test_gate_ref；存储层保持去重，兼容旧 ctx.green_gate 形态。 */
 function repairContextForPrompt(ts, cfg, ctx) {
-  if (!ctx || ctx.source !== 'green_gate' || !ctx.green_gate_ref) return ctx;
-  const gg = state.readJsonIf(state.dossierPath(cfg, ts.id, ctx.green_gate_ref));
-  if (!gg) return ctx;
-  return {
-    ...ctx,
-    green_gate: {
-      command: gg.command,
-      exit_code: gg.exit_code,
-      stdout_tail: gg.stdout_tail,
-      stderr_tail: gg.stderr_tail,
-    },
-  };
+  if (!ctx) return ctx;
+  if (ctx.source === 'green_gate' && ctx.green_gate_ref) {
+    const gg = state.readJsonIf(state.dossierPath(cfg, ts.id, ctx.green_gate_ref));
+    if (!gg) return ctx;
+    return {
+      ...ctx,
+      green_gate: {
+        command: gg.command,
+        exit_code: gg.exit_code,
+        stdout_tail: gg.stdout_tail,
+        stderr_tail: gg.stderr_tail,
+      },
+    };
+  }
+  if (ctx.source === 'test_gate' && ctx.test_gate_ref) {
+    const tg = state.readJsonIf(state.dossierPath(cfg, ts.id, ctx.test_gate_ref));
+    if (!tg) return ctx;
+    return {
+      ...ctx,
+      test_gate: {
+        command: tg.command,
+        base_commit: tg.base_commit,
+        exit_code: tg.exit_code,
+        overlay: tg.overlay,
+        stdout_tail: tg.stdout_tail,
+        stderr_tail: tg.stderr_tail,
+      },
+    };
+  }
+  return ctx;
 }
 
 /**

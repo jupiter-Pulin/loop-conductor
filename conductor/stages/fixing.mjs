@@ -1,12 +1,14 @@
 // FIXING（契约 §11）：round=makerRound(miss)。fixingMode 决定 resume/cold。
 // buildMakerRepairPrompt（resume）/ buildMakerColdPrompt(fullDossier)（cold）。
-// ensureWorktree(+excludes) → checkTrackedHarness → spawn maker → green gate → 同 READY 的 pass/fail 路由。
+// ensureWorktree(+excludes) → checkTrackedHarness → spawn maker → green gate →
+// 同 READY 的 pass/fail 路由（pass 后同样过 test gate 探针）。
 // 幂等：maker-r<round>.json 双标记；崩溃残留（started 无 done）转 FAILED_BOX（crashed），retry 恢复。
 import * as state from '../lib/state.mjs';
 import { ensureWorktree, checkTrackedHarness } from '../lib/git.mjs';
 import { markerStatus, greenGatePassed, makerMissNext, fixingMode, makerRound } from './decisions.mjs';
 import {
-  worktreePath, runGreenGate, writeGreenGateResult, buildRepairContext, writeRepairContext,
+  worktreePath, runGreenGate, writeGreenGateResult, runTestGateProbe,
+  buildRepairContext, writeRepairContext,
   runMakerRound, buildMakerColdPrompt, buildMakerRepairPrompt,
   budgetExceeded, failToBox, HARNESS_ARTIFACTS, canStartSpawn,
 } from './shared.mjs';
@@ -73,6 +75,27 @@ export default async function fixingHandler(ts, cfg) {
   state.appendTimeline(cfg, id, `green gate r${round}: ${gate.timedOut ? 'timed out' : `exit ${gate.exitCode}`}`);
 
   if (greenGatePassed(gate.exitCode)) {
+    // 第二道闸：test gate（基线空转测试探针）。仅 vacuous block，走同一 miss 阶梯；
+    // falsifies / error / disabled(null) 照常进 VERIFY（单侧闸门，见 shared.mjs::runTestGateProbe）。
+    const probe = await runTestGateProbe(ts, cfg, round);
+    if (probe?.verdict === 'vacuous') {
+      const tgCtx = buildRepairContext({ source: 'test_gate', round });
+      writeRepairContext(cfg, id, round, tgCtx);
+      const tgNext = makerMissNext(ts.runtime.maker_miss_count ?? 0, cfg.maxMakerMisses);
+      if (tgNext.stage === 'FAILED_BOX') {
+        return failToBox(
+          ts, cfg,
+          `test gate vacuous at r${round}（测试在基线上仍全绿），miss ${tgNext.missCount} 阶梯耗尽`,
+          'maker_misses_exhausted',
+          { maker_miss_count: tgNext.missCount },
+        );
+      }
+      state.transitionState(ts, cfg, 'FIXING', `test gate vacuous r${round}, miss=${tgNext.missCount}`, {
+        maker_miss_count: tgNext.missCount,
+        current_round: round,
+      });
+      return { changed: true };
+    }
     state.transitionState(ts, cfg, 'VERIFY', `green gate pass r${round}`, { current_round: round });
     return { changed: true };
   }
