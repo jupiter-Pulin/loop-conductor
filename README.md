@@ -13,6 +13,7 @@
 | worktree、diff、commit、merge | `conductor/lib/git.mjs` |
 | setup profile 存储 | `conductor/lib/profile.mjs` |
 | spec 交付契约（spec-doc/v1，AC 枚举/校验） | `conductor/lib/spec-contract.mjs` |
+| test gate 纯函数（测试 glob / 变更分类） | `conductor/lib/test-gate.mjs` |
 | spec-agent hook 脚本（写白名单、Stop 契约预检） | `conductor/hooks/` |
 | 纯路由和 schema 判断 | `conductor/stages/decisions.mjs` |
 | agent 角色 prompt | `agents/*.md` |
@@ -46,6 +47,7 @@ READY
 实现/验收:
 READY -> VERIFY -> AWAIT_HUMAN_MERGE -> DONE
 READY/FIXING green-gate fail -> FIXING
+READY/FIXING test-gate vacuous（测试在基线上仍全绿）-> FIXING
 VERIFY verdict fail -> FIXING
 verifier invalid -> VERIFY
 budget/retry/crash exhausted -> FAILED_BOX
@@ -76,7 +78,7 @@ npm run conductor -- retry <id>
 | `state/queue/<id>/spec.md` | bugfix 冻结前的 spec 草稿。 |
 | `target-profiles/<repo>/` | setup profile 草稿/批准稿。 |
 | `specs/<id>.md` | feature 人审前的 spec 草稿。 |
-| `dossier/<id>/` | 唯一 agent 交接媒介：冻结 spec、spawn 记录、verdict、repair context、契约门结果（spec-check-r\<n\>.json 为 conductor 终审、.hook.json 为沙箱内预检证据）、逐轮 hook settings、timeline。 |
+| `dossier/<id>/` | 唯一 agent 交接媒介：冻结 spec、spawn 记录、verdict、repair context、契约门结果（spec-check-r\<n\>.json 为 conductor 终审、.hook.json 为沙箱内预检证据）、test gate 探针结果（test-gate-r\<n\>.json）、逐轮 hook settings、timeline。 |
 | `worktrees/<id>/` | target repo 的任务 worktree。 |
 | `target/` | demo target repo。不要在仓库根裸跑 `node --test`；用 `npm test`。 |
 
@@ -89,6 +91,7 @@ npm run conductor -- retry <id>
 | setup gate + spec repair loop | `tests/integration/setup-spec-loop.test.mjs` |
 | spec 直写交付 + 契约门（hook 护栏） | `tests/integration/spec-contract-gate.test.mjs` |
 | green gate 修复路径 | `tests/integration/green-gate.test.mjs` |
+| test gate 空转测试拦截 | `tests/integration/test-gate.test.mjs` |
 | verifier fail repair context | `tests/integration/verifier-fail.test.mjs` |
 | verifier invalid 重试 | `tests/integration/verifier-invalid.test.mjs` |
 | maker retry ladder | `tests/integration/retry-ladder.test.mjs` |

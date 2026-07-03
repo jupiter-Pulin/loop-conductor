@@ -82,6 +82,19 @@ export function checkTrackedHarness(wtPath, names) {
   return conflicts;
 }
 
+/** merge-base(baseBranch, HEAD)（test gate 探针的基线提交）。失败返回 null。 */
+export function mergeBaseWith(wtPath, baseBranch) {
+  const r = git(['merge-base', baseBranch, 'HEAD'], wtPath);
+  return r.status === 0 ? r.stdout.trim() : null;
+}
+
+/** 在 commit 上开 detached 临时 worktree（test gate 探针用）。失败不抛，返回 { ok, error }。 */
+export function addDetachedWorktree(repo, wtPath, commit) {
+  const r = git(['worktree', 'add', '--detach', wtPath, commit], repo);
+  if (r.status !== 0) return { ok: false, error: (r.stderr || r.stdout || '').trim() };
+  return { ok: true };
+}
+
 export function removeWorktree(repo, wtPath) {
   git(['worktree', 'remove', '--force', wtPath], repo);
   git(['worktree', 'prune'], repo);

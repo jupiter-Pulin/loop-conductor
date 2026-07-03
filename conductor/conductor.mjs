@@ -9,6 +9,7 @@ import { acquireLock, releaseLock, lockDirPath, STALE_MS, startLockHeartbeat } f
 import { runScheduler, initRunBudget } from './lib/scheduler.mjs';
 import { withTaskLock, TaskLockBusyError } from './lib/task-lock.mjs';
 import { currentBranch, mergeBranch, removeWorktree, deleteBranch } from './lib/git.mjs';
+import { DEFAULT_TEST_GLOBS } from './lib/test-gate.mjs';
 import { hasApprovedSetupProfile } from './lib/profile.mjs';
 import needsTargetSetupHandler from './stages/needs_target_setup.mjs';
 import awaitSetupApprovalHandler from './stages/await_setup_approval.mjs';
@@ -56,6 +57,8 @@ export function loadCfg(root = resolveRoot()) {
     maxSpecContractRetries: 2, // spec-agent 交付契约门（spec-doc/v1）失败重试上限：初始+2=3 次尝试
     maxSpecEpochs: 2,
     greenGateOutputTailBytes: 12000, // green gate stdout/stderr tail 字节上限（契约 §6）
+    testGateEnabled: true, // green pass 后的基线空转测试探针（docs/features/test-gate/tech-spec.md）
+    testGateTestGlobs: DEFAULT_TEST_GLOBS, // 测试文件识别 glob（探针 overlay 用）
     verifierDiffMaxBytes: 200000, // verifier prompt 内嵌 diff 的字节上限，超限降级为 name-status 清单
     spawnRetries: 4, // Claude 瞬态重试次数（保留现状）
     spawnBackoffMs: [15000, 30000, 60000, 120000], // 瞬态重试退避（保留现状）
@@ -465,7 +468,7 @@ function archiveRoundArtifacts(cfg, id) {
   const dir = state.dossierPath(cfg, id);
   let names = [];
   try { names = fs.readdirSync(dir); } catch { return 0; }
-  const targets = names.filter((n) => /^(maker-r\d+\.json|verifier-r\d+\.json|setup-r\d+\.json|spec-agent-r\d+\.json|spec-agent-r\d+\.settings\.json|spec-verifier-r\d+\.json|verify-r\d+\.(md|verdict\.json)|verify-r\d+\.invalid-a\d+\.json|spec-verify-r\d+\.(md|verdict\.json)|spec-verify-r\d+\.invalid-a\d+\.json|spec-check-r\d+(\.hook)?\.json|green-gate-r\d+\.json|repair-context-r\d+\.json|spec-repair-context-r\d+\.json|review-findings\.md)$/.test(n));
+  const targets = names.filter((n) => /^(maker-r\d+\.json|verifier-r\d+\.json|setup-r\d+\.json|spec-agent-r\d+\.json|spec-agent-r\d+\.settings\.json|spec-verifier-r\d+\.json|verify-r\d+\.(md|verdict\.json)|verify-r\d+\.invalid-a\d+\.json|spec-verify-r\d+\.(md|verdict\.json)|spec-verify-r\d+\.invalid-a\d+\.json|spec-check-r\d+(\.hook)?\.json|green-gate-r\d+\.json|test-gate-r\d+\.json|repair-context-r\d+\.json|spec-repair-context-r\d+\.json|review-findings\.md)$/.test(n));
   if (targets.length === 0) return 0;
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const dest = path.join(dir, 'attempts', stamp);
