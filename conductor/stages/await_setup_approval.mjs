@@ -7,7 +7,7 @@ import * as state from '../lib/state.mjs';
 import { entryStageAfterSetup } from './shared.mjs';
 import { setupApprovalNext } from './decisions.mjs';
 
-export default function awaitSetupApprovalHandler(ts, cfg) {
+export default async function awaitSetupApprovalHandler(ts, cfg) {
   const id = ts.id;
   const next = setupApprovalNext(ts.runtime.setup_approval ?? null);
   if (next === null) return { changed: false };

@@ -7,6 +7,7 @@
 //             verdictNext：pass→AWAIT_HUMAN_MERGE；fail→writeRepairContext(verifier)+makerMissNext→FIXING/FAILED_BOX。
 // 幂等：verify-r<n>.verdict.json 已存在 → 直接按 verdictNext 消费，不重 spawn。
 import fs from 'node:fs';
+import path from 'node:path';
 import * as state from '../lib/state.mjs';
 import { runClaude } from '../lib/claude.mjs';
 import {
@@ -14,10 +15,10 @@ import {
 } from './decisions.mjs';
 import {
   worktreePath, buildVerifierPrompt, buildRepairContext, writeRepairContext, renderVerifyReport,
-  addCost, budgetExceeded, failToBox, startSpawnRecord, finishSpawnRecord, VERIFIER_TOOLS,
+  addCost, budgetExceeded, failToBox, startSpawnRecord, finishSpawnRecord, VERIFIER_TOOLS, canStartSpawn,
 } from './shared.mjs';
 
-export default function verifyHandler(ts, cfg) {
+export default async function verifyHandler(ts, cfg) {
   const id = ts.id;
   const round = makerRound(ts.runtime.maker_miss_count); // 轮次与刚产出 diff 的 maker round 对齐
   const verdictPath = state.dossierPath(cfg, id, `verify-r${round}.verdict.json`);
@@ -32,6 +33,7 @@ export default function verifyHandler(ts, cfg) {
   if (budgetExceeded(ts, cfg)) {
     return failToBox(ts, cfg, `budget exceeded: $${ts.runtime.spent_usd} >= $${cfg.budgetUsd}，拒绝 spawn verifier`, 'budget_exceeded');
   }
+  if (!canStartSpawn(ts, cfg, 'verifier')) return { changed: false };
 
   // conductor 枚举 spec 的 AC（既喂 prompt 又作校验 expectedAcIds）。
   const specMd = readDossierSpecRaw(ts, cfg);
@@ -39,17 +41,24 @@ export default function verifyHandler(ts, cfg) {
   const expectedAcIds = acList.map((a) => a.ac_id);
 
   const prompt = buildVerifierPrompt(ts, cfg, round, acList);
-  const rec = startSpawnRecord(cfg, id, 'verifier', round);
-  const res = runClaude({
+  const streamFile = state.dossierPath(cfg, id, `verifier-r${round}.stream.jsonl`);
+  const rec = startSpawnRecord(cfg, id, 'verifier', round, {
+    stream_file: path.relative(cfg.root, streamFile),
+  });
+  const res = await runClaude({
     cwd: worktreePath(cfg, id),
     prompt,
     maxTurns: cfg.maxTurns,
     model: cfg.models?.verifier ?? null,
     tools: VERIFIER_TOOLS,        // 工具集硬限制
     allowedTools: VERIFIER_TOOLS, // 免审批放行同一集合
+    streamFile,
+    inactivityTimeoutMs: cfg.inactivityTimeoutMs,
+    wallClockMs: cfg.spawnWallClockMs,
   });
   finishSpawnRecord(rec, res);
-  addCost(ts, res.costUsd);
+  addCost(ts, res.costUsd, cfg);
+  if (res.costUnknown) state.appendTimeline(cfg, id, `verifier r${round} cost unknown; spent_usd uses lower-bound accounting`);
   state.saveRuntime(ts); // 成本先落盘
 
   // 严格解析 + schema 校验：绝不在叙事里打捞 JSON。

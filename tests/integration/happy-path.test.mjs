@@ -88,7 +88,8 @@ test('bugfix 快乐路径直达 AWAIT_HUMAN_MERGE，merge 后归档', (t) => {
   assert.ok(calls[0].argv.includes('acceptEdits'));
   assert.equal(calls[0].argv.includes('--tools'), false, 'maker 不做工具集硬限制');
   assert.ok(calls[0].argv.includes('--max-turns'), 'maker spawn 带 --max-turns');
-  assert.equal(calls[0].argv[calls[0].argv.indexOf('--output-format') + 1], 'json');
+  assert.equal(calls[0].argv[calls[0].argv.indexOf('--output-format') + 1], 'stream-json');
+  assert.ok(calls[0].argv.includes('--verbose'), 'stream-json spawn 带 --verbose');
   assert.equal(resumeIdOf(calls[0]), null);
   const READONLY = 'Read,Grep,Glob,Bash(git diff:*),Bash(git log:*)';
   assert.equal(calls[1].argv[calls[1].argv.indexOf('--tools') + 1], READONLY, 'verifier --tools 硬限制');

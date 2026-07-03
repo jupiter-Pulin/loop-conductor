@@ -2,9 +2,34 @@
 // 加上 dossier 工具与 spec 正文解析。零依赖，纯 JSON + Markdown 段抽取。
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 // 合法任务目录名：task-YYYYMMDD-NNN（8 位日期 + 3 位序号）。
 const TASK_DIR_RE = /^task-\d{8}-\d{3}$/;
+
+// ---- 原子落盘：同目录 tmp 写完后 rename，保证读者永远只看到旧完整文件或新完整文件。 ----
+
+function atomicTmpPath(target) {
+  const dir = path.dirname(target);
+  const base = path.basename(target);
+  return path.join(dir, `.${base}.${process.pid}.${Date.now()}.${crypto.randomBytes(6).toString('hex')}.tmp`);
+}
+
+export function writeFileAtomic(p, content) {
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  const tmp = atomicTmpPath(p);
+  try {
+    fs.writeFileSync(tmp, content);
+    fs.renameSync(tmp, p);
+  } catch (err) {
+    fs.rmSync(tmp, { force: true });
+    throw err;
+  }
+}
+
+export function writeJsonAtomic(p, obj) {
+  writeFileAtomic(p, `${JSON.stringify(obj, null, 2)}\n`);
+}
 
 // ---- 任务目录布局：state/<box>/<id>/{task.json,runtime.json,spec.md} ----
 
@@ -39,8 +64,7 @@ export function readTaskState(dir, box) {
 export function saveRuntime(ts) {
   ts.runtime.updated_at = new Date().toISOString();
   const p = path.join(ts.dir, 'runtime.json');
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(p, `${JSON.stringify(ts.runtime, null, 2)}\n`);
+  writeJsonAtomic(p, ts.runtime);
 }
 
 /**
@@ -50,10 +74,10 @@ export function saveRuntime(ts) {
 export function writeNewTask(boxDir, task, runtime, { specDraft } = {}) {
   const dir = taskDir(boxDir, task.id);
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, 'task.json'), `${JSON.stringify(task, null, 2)}\n`);
-  fs.writeFileSync(path.join(dir, 'runtime.json'), `${JSON.stringify(runtime, null, 2)}\n`);
+  writeJsonAtomic(path.join(dir, 'task.json'), task);
+  writeJsonAtomic(path.join(dir, 'runtime.json'), runtime);
   if (specDraft != null) {
-    fs.writeFileSync(path.join(dir, 'spec.md'), specDraft);
+    writeFileAtomic(path.join(dir, 'spec.md'), specDraft);
   }
   return dir;
 }
@@ -177,20 +201,19 @@ export function readJsonIf(p) {
 }
 
 export function writeJson(p, obj) {
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(p, `${JSON.stringify(obj, null, 2)}\n`);
+  writeJsonAtomic(p, obj);
 }
 
 export function writeFileEnsured(p, content) {
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(p, content);
+  writeFileAtomic(p, content);
 }
 
 /** 事件日志，人类排查用。conductor 追加，永不改写历史；状态决策绝不解析它。 */
 export function appendTimeline(cfg, id, msg) {
   const p = dossierPath(cfg, id, 'timeline.md');
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.appendFileSync(p, `- ${new Date().toISOString()} ${msg}\n`);
+  let existing = '';
+  try { existing = fs.readFileSync(p, 'utf8'); } catch { /* timeline 可不存在 */ }
+  writeFileAtomic(p, `${existing}- ${new Date().toISOString()} ${msg}\n`);
 }
 
 // ---- 状态转移（先产物后状态的「最后一步」） ----
@@ -202,14 +225,42 @@ export function appendTimeline(cfg, id, msg) {
 export function transitionState(ts, cfg, nextStage, note, extra = {}) {
   Object.assign(ts.runtime, extra, { stage: nextStage });
   saveRuntime(ts);
-  if (nextStage === 'FAILED_BOX' && ts.box !== 'failed') {
-    const dest = taskDir(cfg.failedDir, ts.id);
+  const archiveDir = nextStage === 'FAILED_BOX' ? cfg.failedDir : nextStage === 'DONE' ? cfg.doneDir : null;
+  const archiveBox = nextStage === 'FAILED_BOX' ? 'failed' : nextStage === 'DONE' ? 'done' : null;
+  if (archiveDir && ts.box !== archiveBox) {
+    const dest = taskDir(archiveDir, ts.id);
     if (dest !== ts.dir) {
-      fs.mkdirSync(cfg.failedDir, { recursive: true });
+      fs.mkdirSync(archiveDir, { recursive: true });
       fs.renameSync(ts.dir, dest);
       ts.dir = dest;
-      ts.box = 'failed';
+      ts.box = archiveBox;
     }
   }
   appendTimeline(cfg, ts.id, `stage → ${nextStage}${note ? ` (${note})` : ''}`);
+}
+
+/**
+ * run 启动时修复「runtime.stage 已经写入终态/收箱，但目录还留在 queue」的崩溃残留。
+ * 只补搬 FAILED_BOX / DONE；目标已存在时不覆盖，保留人工处理空间。
+ */
+export function patrolBoxStageConsistency(cfg) {
+  const repaired = [];
+  for (const ts of listTaskStates(cfg.queueDir, 'queue')) {
+    if (ts.error) continue;
+    const stage = ts.runtime.stage;
+    const destDir = stage === 'FAILED_BOX' ? cfg.failedDir : stage === 'DONE' ? cfg.doneDir : null;
+    const destBox = stage === 'FAILED_BOX' ? 'failed' : stage === 'DONE' ? 'done' : null;
+    if (!destDir) continue;
+    const dest = taskDir(destDir, ts.id);
+    if (fs.existsSync(dest)) {
+      console.error(`[${ts.id}] box/stage 巡检：目标 ${path.relative(cfg.root, dest)} 已存在，跳过自动补搬`);
+      appendTimeline(cfg, ts.id, `box/stage 巡检：目标 ${destBox} 已存在，跳过自动补搬`);
+      continue;
+    }
+    fs.mkdirSync(destDir, { recursive: true });
+    fs.renameSync(ts.dir, dest);
+    repaired.push({ id: ts.id, stage, from: 'queue', to: destBox });
+    appendTimeline(cfg, ts.id, `box/stage 巡检：queue/${ts.id} → ${destBox}/${ts.id}`);
+  }
+  return repaired;
 }

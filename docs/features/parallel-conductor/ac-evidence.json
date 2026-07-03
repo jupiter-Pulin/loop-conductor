@@ -1,0 +1,150 @@
+{
+  "schemaVersion": 1,
+  "stage": "maker-self-check",
+  "gate": "verified",
+  "ac": [
+    {
+      "id": "AC-001",
+      "status": "pass",
+      "proof": [{ "type": "command", "ref": "npm test; tests/unit/state.test.mjs" }],
+      "files": ["conductor/lib/state.mjs", "conductor/lib/profile.mjs", "tests/unit/state.test.mjs"],
+      "notes": "Atomic write paths and no tmp residue verified."
+    },
+    {
+      "id": "AC-002",
+      "status": "pass",
+      "proof": [{ "type": "command", "ref": "npm test; tests/integration/crash-patrol.test.mjs" }],
+      "files": ["conductor/lib/state.mjs", "conductor/conductor.mjs", "tests/integration/crash-patrol.test.mjs"],
+      "notes": "FAILED_BOX and DONE queue zombies are repaired on run startup."
+    },
+    {
+      "id": "AC-003",
+      "status": "pass",
+      "proof": [{ "type": "command", "ref": "npm test; tests/integration/lock.test.mjs" }],
+      "files": ["conductor/lib/lock.mjs", "conductor/conductor.mjs", "tests/integration/lock.test.mjs"],
+      "notes": "Dead pid locks self-heal; live pid locks still block."
+    },
+    {
+      "id": "AC-004",
+      "status": "pass",
+      "proof": [{ "type": "command", "ref": "npm test; tests/unit/lock.test.mjs" }],
+      "files": ["conductor/lib/lock.mjs", "conductor/conductor.mjs", "tests/unit/lock.test.mjs"],
+      "notes": "Lock heartbeat refreshes mtime."
+    },
+    {
+      "id": "AC-005",
+      "status": "pass",
+      "proof": [{ "type": "command", "ref": "npm test; happy-path/liveness stream record assertions" }],
+      "files": ["conductor/lib/claude.mjs", "conductor/stages/shared.mjs", "tests/fixtures/fake-claude.mjs"],
+      "notes": "Each spawn writes stream JSONL and compatible spawn records."
+    },
+    {
+      "id": "AC-006",
+      "status": "pass",
+      "proof": [{ "type": "command", "ref": "npm test; tests/integration/liveness-kill.test.mjs" }],
+      "files": ["conductor/lib/claude.mjs", "conductor/stages/shared.mjs", "tests/integration/liveness-kill.test.mjs"],
+      "notes": "Inactivity kill is transient and can resume from partial session progress."
+    },
+    {
+      "id": "AC-007",
+      "status": "pass",
+      "proof": [{ "type": "command", "ref": "npm test; tests/integration/liveness-kill.test.mjs" }],
+      "files": ["conductor/lib/claude.mjs", "tests/integration/liveness-kill.test.mjs"],
+      "notes": "Wall-clock kill recorded as wall_clock."
+    },
+    {
+      "id": "AC-008",
+      "status": "pass",
+      "proof": [{ "type": "command", "ref": "npm test; tests/integration/liveness-kill.test.mjs" }],
+      "files": ["conductor/lib/claude.mjs", "tests/fixtures/fake-claude.mjs", "tests/integration/liveness-kill.test.mjs"],
+      "notes": "Slow alive output completes without killed flag."
+    },
+    {
+      "id": "AC-009",
+      "status": "pass",
+      "proof": [{ "type": "command", "ref": "npm test; tests/integration/green-gate-timeout.test.mjs" }],
+      "files": ["conductor/stages/shared.mjs", "conductor/stages/ready.mjs", "conductor/stages/fixing.mjs", "tests/integration/green-gate-timeout.test.mjs"],
+      "notes": "Green gate timeout routes as gate fail, not spawn transient."
+    },
+    {
+      "id": "AC-010",
+      "status": "pass",
+      "proof": [{ "type": "command", "ref": "npm test; tests/integration/parallel-scheduling.test.mjs" }],
+      "files": ["conductor/lib/scheduler.mjs", "conductor/conductor.mjs", "tests/integration/parallel-scheduling.test.mjs"],
+      "notes": "Parallel and serial maxConcurrentTasks behavior verified."
+    },
+    {
+      "id": "AC-011",
+      "status": "pass",
+      "proof": [{ "type": "command", "ref": "npm test; tests/unit/scheduler.test.mjs" }],
+      "files": ["conductor/lib/scheduler.mjs", "conductor/lib/task-lock.mjs", "tests/unit/scheduler.test.mjs"],
+      "notes": "Single task chain does not overlap adjacent steps."
+    },
+    {
+      "id": "AC-012",
+      "status": "pass",
+      "proof": [{ "type": "command", "ref": "npm test; tests/integration/drain-cap.test.mjs" }],
+      "files": ["conductor/lib/scheduler.mjs", "conductor/conductor.mjs", "tests/integration/drain-cap.test.mjs"],
+      "notes": "maxStepsPerTask cap and maxDrainSteps deprecation verified."
+    },
+    {
+      "id": "AC-013",
+      "status": "pass",
+      "proof": [{ "type": "command", "ref": "npm test; tests/integration/cli-task-lock-spy.test.mjs" }],
+      "files": ["conductor/lib/task-lock.mjs", "conductor/conductor.mjs", "tests/integration/cli-task-lock-spy.test.mjs"],
+      "notes": "CLI retry fails while task is actively being advanced."
+    },
+    {
+      "id": "AC-014",
+      "status": "pass",
+      "proof": [{ "type": "command", "ref": "npm test; tests/integration/setup-race.test.mjs" }],
+      "files": ["conductor/stages/needs_target_setup.mjs", "tests/integration/setup-race.test.mjs"],
+      "notes": "Concurrent setup tasks produce one setup-agent spawn."
+    },
+    {
+      "id": "AC-015",
+      "status": "pass",
+      "proof": [{ "type": "command", "ref": "npm test; tests/integration/liveness-kill.test.mjs; tests/integration/budget.test.mjs" }],
+      "files": ["conductor/lib/claude.mjs", "conductor/stages/shared.mjs", "tests/integration/liveness-kill.test.mjs"],
+      "notes": "Killed/no-result spawn records cost_unknown and lower-bound cost; per-task budget regressions pass."
+    },
+    {
+      "id": "AC-016",
+      "status": "pass",
+      "proof": [{ "type": "command", "ref": "npm test; tests/integration/budget.test.mjs" }],
+      "files": ["conductor/lib/scheduler.mjs", "conductor/stages/shared.mjs", "tests/integration/budget.test.mjs"],
+      "notes": "runBudgetUsd stops new spawn and leaves task in current stage."
+    },
+    {
+      "id": "AC-017",
+      "status": "pass",
+      "proof": [{ "type": "command", "ref": "npm test; tests/integration/cli-task-lock-spy.test.mjs" }],
+      "files": ["conductor/conductor.mjs", "tests/integration/cli-task-lock-spy.test.mjs"],
+      "notes": "spy reports active role/round while run is active."
+    },
+    {
+      "id": "AC-018",
+      "status": "pass",
+      "proof": [{ "type": "command", "ref": "npm test (130 tests passing)" }],
+      "files": ["tests/integration", "tests/unit"],
+      "notes": "Full existing and new test suite passes."
+    }
+  ],
+  "validation": {
+    "commands": [
+      {
+        "command": "npm test",
+        "status": "passed",
+        "exitCode": 0,
+        "artifact": "terminal output: 130 tests passing"
+      },
+      {
+        "command": "node --test tests/unit/state.test.mjs tests/unit/lock.test.mjs tests/unit/task-lock.test.mjs tests/unit/scheduler.test.mjs tests/integration/crash-patrol.test.mjs tests/integration/liveness-kill.test.mjs tests/integration/green-gate-timeout.test.mjs tests/integration/parallel-scheduling.test.mjs tests/integration/setup-race.test.mjs tests/integration/budget.test.mjs tests/integration/cli-task-lock-spy.test.mjs",
+        "status": "passed",
+        "exitCode": 0,
+        "artifact": "targeted validation output"
+      }
+    ]
+  },
+  "blockers": []
+}
