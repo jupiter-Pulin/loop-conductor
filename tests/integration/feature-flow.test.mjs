@@ -1,10 +1,10 @@
-// 集成：feature 档——NEEDS_SPEC（plan-agent 产出草稿）→ AWAIT_SPEC_APPROVAL 人类闸门
+// 集成：feature 档——NEEDS_SPEC（spec-agent 产出草稿）→ SPEC_VERIFY → AWAIT_SPEC_APPROVAL 人类闸门
 // → approve 冻结 spec → READY → … → AWAIT_HUMAN_MERGE；以及 reject + notes 回炉路径。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { makeEnv, promptOf, verifierStep } from '../helpers/env.mjs';
+import { makeEnv, promptOf, specVerifierStep, verifierStep } from '../helpers/env.mjs';
 import { FIXED_STATS } from '../helpers/target-fixture.mjs';
 
 // spec 草稿含两条验收标准 → 抽取 AC-001 / AC-002（verifier 需逐条裁决）。
@@ -19,21 +19,25 @@ const SPEC_DRAFT = [
 ].join('\n');
 const SPEC_DRAFT_V2 = '# spec 草稿 v2（回应 reject）\n\n## 验收标准\n\n- AC-001 同 v1，并补充边界用例说明\n';
 
-test('feature 档：plan → 闸门停住 → approve → 冻结 → 直达 AWAIT_HUMAN_MERGE', (t) => {
+test('feature 档：spec-agent → spec-verifier → 闸门停住 → approve → 直达 AWAIT_HUMAN_MERGE', (t) => {
   const env = makeEnv(t);
-  env.setScenario([
-    { session_id: 'sess-plan-1', cost: 0.03, result: SPEC_DRAFT },          // 0 plan-agent
-    { actions: [{ type: 'writeFile', path: 'lib/stats.mjs', content: FIXED_STATS }],
-      session_id: 'sess-m1', cost: 0.1, result: 'done' },                    // 1 maker
-    verifierStep(1, { 'AC-001': 'pass', 'AC-002': 'pass' }, { cost: 0.02 }), // 2 verifier
-  ]);
-
+  env.writeApprovedSetupProfile();
   const created = env.run('new', '--kind', 'feature', '--title', 'median 统计能力');
   const id = created.stdout.match(/task-\d{8}-\d{3}/)?.[0];
   assert.ok(id);
   assert.equal(env.findTask(id).runtime.stage, 'NEEDS_SPEC'); // feature 初始 NEEDS_SPEC
+  const specAbs = path.join(env.root, 'specs', `${id}.md`);
+  env.setScenario([
+    { // 0 spec-agent：直写唯一交付文件（specs/<id>.md），最终回复只是确认
+      actions: [{ type: 'writeFile', path: specAbs, content: SPEC_DRAFT }],
+      session_id: 'sess-spec-1', cost: 0.03, result: 'spec written' },
+    specVerifierStep(1, 'pass', { cost: 0.02, session_id: 'sess-sv-1' }),   // 1 spec-verifier
+    { actions: [{ type: 'writeFile', path: 'lib/stats.mjs', content: FIXED_STATS }],
+      session_id: 'sess-m1', cost: 0.1, result: 'done' },                    // 2 maker
+    verifierStep(1, { 'AC-001': 'pass', 'AC-002': 'pass' }, { cost: 0.02 }), // 3 verifier
+  ]);
 
-  // 第一次 run：plan 产出草稿后停在人类闸门
+  // 第一次 run：spec-agent 产出草稿，经 spec-verifier pass 后停在人类闸门
   const run1 = env.run('run');
   assert.equal(run1.status, 0, run1.stderr);
   const gated = env.findTask(id);
@@ -41,21 +45,27 @@ test('feature 档：plan → 闸门停住 → approve → 冻结 → 直达 AWAI
   assert.equal(gated.runtime.approval, null);
   const draftPath = path.join(env.root, 'specs', `${id}.md`);
   assert.equal(fs.readFileSync(draftPath, 'utf8'), SPEC_DRAFT);
-  assert.equal(env.calls().length, 1, '闸门未批，不得 spawn maker');
-  // plan-agent 只读工具集（--tools 硬限制 + --allowedTools 免审批），cwd 是 target 仓库
-  const planCall = env.calls()[0];
-  assert.equal(planCall.argv[planCall.argv.indexOf('--tools') + 1], 'Read,Grep,Glob');
-  assert.equal(planCall.argv[planCall.argv.indexOf('--allowedTools') + 1], 'Read,Grep,Glob');
-  assert.ok(planCall.argv.includes('--max-turns'), 'plan spawn 带 --max-turns');
-  assert.ok(planCall.cwd.endsWith('target'));
-  // plan spawn 也留档 <role>-r<n>.json（原始 CLI JSON）
-  const planRec = env.readJson(env.dossier(id, 'plan-r1.json'));
-  assert.ok(planRec.started && planRec.done, 'plan-r1 双标记齐全');
-  assert.equal(planRec.raw.session_id, 'sess-plan-1');
+  assert.equal(env.calls().length, 2, '闸门未批，不得 spawn maker');
+  // spec-agent：只读探索 + 受限写（写白名单由 hook 强制），--settings 注入护栏；cwd 是 target 仓库
+  const specCall = env.calls()[0];
+  assert.equal(specCall.argv[specCall.argv.indexOf('--tools') + 1], 'Read,Grep,Glob,Write,Edit');
+  assert.equal(specCall.argv[specCall.argv.indexOf('--allowedTools') + 1], 'Read,Grep,Glob,Write,Edit');
+  assert.ok(specCall.argv.includes('--settings'), 'spec-agent spawn 带 --settings hook 护栏');
+  assert.ok(specCall.argv.includes('--max-turns'), 'spec spawn 带 --max-turns');
+  assert.ok(specCall.cwd.endsWith('target'));
+  // spec-verifier 仍是纯只读工具集
+  const svCall = env.calls()[1];
+  assert.equal(svCall.argv[svCall.argv.indexOf('--tools') + 1], 'Read,Grep,Glob');
+  const specRec = env.readJson(env.dossier(id, 'spec-agent-r1.json'));
+  assert.ok(specRec.started && specRec.done, 'spec-agent-r1 双标记齐全');
+  assert.equal(specRec.raw.session_id, 'sess-spec-1');
+  const specVerifyRec = env.readJson(env.dossier(id, 'spec-verifier-r1.json'));
+  assert.ok(specVerifyRec.started && specVerifyRec.done, 'spec-verifier-r1 双标记齐全');
+  assert.equal(specVerifyRec.raw.session_id, 'sess-sv-1');
 
   // 幂等：再 run 一次仍停在闸门、零新 spawn
   env.run('run');
-  assert.equal(env.calls().length, 1);
+  assert.equal(env.calls().length, 2);
   assert.equal(env.findTask(id).runtime.stage, 'AWAIT_SPEC_APPROVAL');
 
   // approve → 冻结 spec → 直达 AWAIT_HUMAN_MERGE
@@ -67,21 +77,33 @@ test('feature 档：plan → 闸门停住 → approve → 冻结 → 直达 AWAI
   assert.equal(done.runtime.stage, 'AWAIT_HUMAN_MERGE');
   // AC-003：批准稿冻结进 dossier/<id>/spec.md，且 maker/verifier prompt 用它作契约
   assert.equal(fs.readFileSync(env.dossier(id, 'spec.md'), 'utf8'), SPEC_DRAFT, '冻结副本与批准稿一致');
-  assert.equal(env.calls().length, 3);
-  const makerPrompt = promptOf(env.calls()[1]);
+  assert.equal(env.calls().length, 4);
+  const makerPrompt = promptOf(env.calls()[2]);
   assert.ok(makerPrompt.includes('median 偶数分支取平均'), 'maker prompt 含冻结 spec 内容');
   assert.equal(env.findTask(id).runtime.maker_miss_count, 0);
+
+  // C1：approve 冻结后草稿归档，specs/ 下不留双份平行 spec（冻结稿是唯一契约）
+  assert.ok(!fs.existsSync(draftPath), 'approve 后 specs/<id>.md 草稿不再存在');
+  const archiveDir = path.join(env.root, 'specs', 'archive');
+  const archivedDrafts = fs.readdirSync(archiveDir).filter((n) => n.startsWith(`${id}-approved-`));
+  assert.equal(archivedDrafts.length, 1, '被批准的草稿应归档到 specs/archive/');
+  assert.equal(fs.readFileSync(path.join(archiveDir, archivedDrafts[0]), 'utf8'), SPEC_DRAFT, '归档内容等于原草稿');
 });
 
-test('reject + notes 回炉：plan-agent 第二稿必须看到 reject_notes', (t) => {
+test('reject + notes 回炉：spec-agent 第二稿必须看到 reject_notes', (t) => {
   const env = makeEnv(t);
-  env.setScenario([
-    { session_id: 'sess-plan-1', cost: 0.03, result: SPEC_DRAFT },     // 0 plan v1
-    { session_id: 'sess-plan-2', cost: 0.03, result: SPEC_DRAFT_V2 },  // 1 plan v2（带 notes）
-  ]);
-
+  env.writeApprovedSetupProfile();
   const created = env.run('new', '--kind', 'feature', '--title', '回炉测试');
   const id = created.stdout.match(/task-\d{8}-\d{3}/)?.[0];
+  const specAbs = path.join(env.root, 'specs', `${id}.md`);
+  env.setScenario([
+    { actions: [{ type: 'writeFile', path: specAbs, content: SPEC_DRAFT }],
+      session_id: 'sess-spec-1', cost: 0.03, result: 'v1 written' },      // 0 spec v1
+    specVerifierStep(1, 'pass'),                                          // 1 spec-verifier v1
+    { actions: [{ type: 'writeFile', path: specAbs, content: SPEC_DRAFT_V2 }],
+      session_id: 'sess-spec-2', cost: 0.03, result: 'v2 written' },      // 2 spec v2（带 notes）
+    specVerifierStep(2, 'pass'),                                          // 3 spec-verifier v2
+  ]);
   env.run('run'); // → AWAIT_SPEC_APPROVAL
 
   const rejected = env.run('reject', id, '--notes', '验收标准太含糊，要可机判');
@@ -93,7 +115,7 @@ test('reject + notes 回炉：plan-agent 第二稿必须看到 reject_notes', (t
   assert.match(notes, /验收标准太含糊/, 'notes 追加进任务目录 reject_notes.md');
   assert.equal('reject_notes' in afterReject.runtime, false, 'reject notes 不入 runtime');
 
-  const run2 = env.run('run'); // AWAIT_SPEC_APPROVAL → NEEDS_SPEC → 重新 plan → 回到闸门
+  const run2 = env.run('run'); // AWAIT_SPEC_APPROVAL → NEEDS_SPEC → 重新 spec-agent/spec-verifier → 回到闸门
   assert.equal(run2.status, 0, run2.stderr);
   const back = env.findTask(id);
   assert.equal(back.runtime.stage, 'AWAIT_SPEC_APPROVAL');
@@ -107,9 +129,9 @@ test('reject + notes 回炉：plan-agent 第二稿必须看到 reject_notes', (t
   assert.equal(fs.readFileSync(path.join(archiveDir, archived[0]), 'utf8'), SPEC_DRAFT, '归档内容是 v1 原稿');
 
   const calls = env.calls();
-  assert.equal(calls.length, 2);
-  assert.ok(promptOf(calls[1]).includes('验收标准太含糊'), '第二稿 prompt 必须带 reject_notes');
-  // 两次 plan spawn 各自留档
-  assert.equal(env.readJson(env.dossier(id, 'plan-r1.json')).raw.session_id, 'sess-plan-1');
-  assert.equal(env.readJson(env.dossier(id, 'plan-r2.json')).raw.session_id, 'sess-plan-2');
+  assert.equal(calls.length, 4);
+  assert.ok(promptOf(calls[2]).includes('验收标准太含糊'), '第二稿 prompt 必须带 reject_notes');
+  // 两次 spec-agent spawn 各自留档
+  assert.equal(env.readJson(env.dossier(id, 'spec-agent-r1.json')).raw.session_id, 'sess-spec-1');
+  assert.equal(env.readJson(env.dossier(id, 'spec-agent-r2.json')).raw.session_id, 'sess-spec-2');
 });

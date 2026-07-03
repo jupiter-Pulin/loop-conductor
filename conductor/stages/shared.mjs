@@ -5,9 +5,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { runClaudeWithRetry } from '../lib/claude.mjs';
-import { ensureWorktree, commitAll, diffAgainstBase } from '../lib/git.mjs';
+import { ensureWorktree, commitAll, diffAgainstBase, diffNameStatusAgainstBase } from '../lib/git.mjs';
+import { readApprovedSetupProfile, setupProfilePaths } from '../lib/profile.mjs';
 import * as state from '../lib/state.mjs';
-import { overBudget } from './decisions.mjs';
+import { SPEC_DOC_CONTRACT, validateSpecDoc } from '../lib/spec-contract.mjs';
+import { overBudget, SPEC_VERIFIER_CONTRACT, VERIFIER_VERDICT_CONTRACT } from './decisions.mjs';
 
 export function worktreePath(cfg, id) {
   return path.join(cfg.worktreesDir, id);
@@ -15,6 +17,13 @@ export function worktreePath(cfg, id) {
 
 /** plan 的只读工具集（--tools 硬限制 + --allowedTools 免审批，spec §3.3）。 */
 export const READONLY_TOOLS = ['Read', 'Grep', 'Glob'];
+
+/** setup/spec-verifier 均是只读探索/审查。 */
+export const SPEC_TOOLS = READONLY_TOOLS;
+
+/** spec-agent：只读探索 + 受限写（直写唯一交付物 specs/<id>.md，
+ *  路径白名单由 PreToolUse hook 强制，见 writeSpecAgentSettings）。 */
+export const SPEC_AGENT_TOOLS = [...READONLY_TOOLS, 'Write', 'Edit'];
 
 /** verifier 工具集：纯只读 + Bash 仅 git diff / git log 形式，不放行测试/写（契约 §10）。
  *  同一集合既作 --tools（硬限制）又作 --allowedTools（免审批放行）。 */
@@ -44,10 +53,20 @@ export function nextRoleRound(cfg, id, role) {
   return max + 1;
 }
 
-/** 写 started 标记。返回 { path, record } 供 finishSpawnRecord 收尾。 */
+/**
+ * 写 started 标记。返回 { path, record } 供 finishSpawnRecord 收尾。
+ * 同轮重 spawn（如 verifier/spec-verifier 协议失败后重试）不覆盖丢失上一次留档：
+ * 旧记录（剥离其自身 superseded 字段，避免嵌套）追加进新记录的 superseded 数组。
+ * 不影响 markerStatus（它只看 started/done/abandoned）。
+ */
 export function startSpawnRecord(cfg, id, role, round, extra = {}) {
   const p = state.dossierPath(cfg, id, `${role}-r${round}.json`);
   const record = { role, round, started: new Date().toISOString(), ...extra };
+  const prev = state.readJsonIf(p);
+  if (prev) {
+    const { superseded: prevChain, ...prevRest } = prev;
+    record.superseded = [...(prevChain ?? []), prevRest];
+  }
   state.writeJson(p, record);
   return { path: p, record };
 }
@@ -115,24 +134,19 @@ export function writeGreenGateResult(cfg, id, round, fields, tailBytes) {
  * 纯函数：按来源构造 repair-context 对象（契约 §7）。
  * source==='verifier'：failed_criteria = verdict.criteria_results 里 status∈{fail,unknown} 的项；
  *                      green_gate=null；overall='fail'。
- * source==='green_gate'：failed_criteria=[]；green_gate=紧凑摘要 {command,exit_code,stdout_tail,stderr_tail}
- *                        （tail 受 tailBytes 约束）；instruction 改为修测试版。
+ * source==='green_gate'：failed_criteria=[]；存 green_gate_ref，不复制 green-gate tail；
+ *                        prompt 层再展开摘要；instruction 改为修测试版。
  */
-export function buildRepairContext({ source, round, verdict, greenGate, tailBytes }) {
+export function buildRepairContext({ source, round, verdict }) {
   if (source === 'green_gate') {
-    const gg = greenGate ?? {};
     return {
       schema_version: 1,
       round,
       source: 'green_gate',
       overall: 'fail',
       failed_criteria: [],
-      green_gate: {
-        command: gg.command,
-        exit_code: gg.exit_code,
-        stdout_tail: tailBytesOf(gg.stdout_tail, tailBytes),
-        stderr_tail: tailBytesOf(gg.stderr_tail, tailBytes),
-      },
+      green_gate: null,
+      green_gate_ref: `green-gate-r${round}.json`,
       instruction: 'Fix the failing tests so the test command exits 0. Keep unrelated code intact.',
     };
   }
@@ -161,6 +175,314 @@ export function writeRepairContext(cfg, id, round, ctx) {
 
 export function readAgentPrompt(cfg, name) {
   try { return fs.readFileSync(path.join(cfg.agentsDir, name), 'utf8'); } catch { return ''; }
+}
+
+export function entryStageAfterSetup(ts) {
+  return ts.task.kind === 'feature' ? 'NEEDS_SPEC' : 'READY';
+}
+
+export function readSetupProfileMarkdown(cfg) {
+  return readApprovedSetupProfile(cfg)?.markdown ?? '';
+}
+
+export function readFeasibilityContext(ts, cfg) {
+  for (const p of [
+    state.dossierPath(cfg, ts.id, 'feasibility-study.md'),
+    path.join(ts.dir, 'feasibility-study.md'),
+  ]) {
+    try { return fs.readFileSync(p, 'utf8'); } catch { /* optional */ }
+  }
+  return '';
+}
+
+/** 注入 spec-agent prompt 的打回意见上限：只保留最近 N 条，防长寿任务 prompt 无限膨胀。 */
+const REJECT_NOTES_LIMIT = 10;
+
+/**
+ * 读任务目录 reject_notes.md（人类打回意见，cmdReject 只追加不清理）。
+ * 为防 prompt 无限膨胀，超过 REJECT_NOTES_LIMIT 条 `- ` 列表行时只保留最近 N 条，
+ * 并在开头加一行截断说明（完整历史仍在任务目录原文件里）；未超限时原样返回。
+ */
+export function readRejectNotes(ts) {
+  let raw;
+  try { raw = fs.readFileSync(path.join(ts.dir, 'reject_notes.md'), 'utf8'); } catch { return ''; }
+  const notes = raw.split('\n').filter((l) => l.startsWith('- '));
+  if (notes.length <= REJECT_NOTES_LIMIT) return raw; // 未超限：原样返回，不动格式
+  return [
+    `（仅保留最近 ${REJECT_NOTES_LIMIT} 条打回意见，完整历史见任务目录 reject_notes.md）`,
+    ...notes.slice(-REJECT_NOTES_LIMIT),
+  ].join('\n');
+}
+
+/** spec-agent 唯一交付文件（feature 人审前草稿）的绝对路径。 */
+export function specDraftPath(cfg, id) {
+  return path.join(cfg.specsDir, `${id}.md`);
+}
+
+function readSpecDraft(ts, cfg) {
+  try { return fs.readFileSync(specDraftPath(cfg, ts.id), 'utf8'); } catch { return ''; }
+}
+
+// ---- spec 交付契约（spec-doc/v1）：hook 护栏 + conductor 终审共用 validateSpecDoc ----
+
+/**
+ * 生成 spec-agent 逐轮 settings 文件（hook 护栏），落盘 dossier 留档，返回路径。
+ * PreToolUse：写路径白名单（只放行 specs/<id>.md）；Stop：契约预检（同一份裁判代码），
+ * 检查结果写 spec-check-r<n>.hook.json（沙箱内证据）。显式 --settings 注入，
+ * 不依赖 target 仓库自带的 .claude/settings.json（不可信、不可控）。
+ */
+export function writeSpecAgentSettings(ts, cfg, round) {
+  const q = (s) => JSON.stringify(s); // 路径含空格时 shell 安全
+  const specPath = specDraftPath(cfg, ts.id);
+  const guard = path.join(cfg.root, 'conductor', 'hooks', 'spec-write-guard.mjs');
+  const check = path.join(cfg.root, 'conductor', 'hooks', 'check-spec.mjs');
+  const hookReport = state.dossierPath(cfg, ts.id, `spec-check-r${round}.hook.json`);
+  const settings = {
+    hooks: {
+      PreToolUse: [{
+        matcher: 'Write|Edit|MultiEdit|NotebookEdit',
+        hooks: [{ type: 'command', command: `${q(process.execPath)} ${q(guard)} --allow ${q(specPath)}` }],
+      }],
+      Stop: [{
+        hooks: [{ type: 'command', command: `${q(process.execPath)} ${q(check)} --spec ${q(specPath)} --report ${q(hookReport)}` }],
+      }],
+    },
+  };
+  const p = state.dossierPath(cfg, ts.id, `spec-agent-r${round}.settings.json`);
+  state.writeJson(p, settings);
+  return p;
+}
+
+/**
+ * conductor 契约门（权威终审）：读 spec-agent 直写的 specs/<id>.md，跑 validateSpecDoc，
+ * 结果落盘 spec-check-r<n>.json（source=conductor）。返回 { ok, errors, acs }。
+ * Stop hook 只是快反馈层——是否真跑过、跑的结果如何，conductor 一律不采信，这里重新裁。
+ */
+export function runSpecContractGate(ts, cfg, round) {
+  let md = null;
+  try { md = fs.readFileSync(specDraftPath(cfg, ts.id), 'utf8'); } catch { /* 未写入也是契约失败 */ }
+  const check = validateSpecDoc(md);
+  state.writeJson(state.dossierPath(cfg, ts.id, `spec-check-r${round}.json`), {
+    schema_version: 1,
+    contract: SPEC_DOC_CONTRACT.id,
+    round,
+    source: 'conductor',
+    ok: check.ok,
+    errors: check.errors,
+    acs: check.acs,
+  });
+  return check;
+}
+
+/** 最近一次 conductor 契约门失败记录（喂给下一轮 spec-agent prompt），无则 null。 */
+export function readLatestSpecContractErrors(ts, cfg) {
+  const dir = state.dossierPath(cfg, ts.id);
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch { return null; }
+  let maxN = 0;
+  for (const n of names) {
+    const m = n.match(/^spec-check-r(\d+)\.json$/);
+    if (m) maxN = Math.max(maxN, Number(m[1]));
+  }
+  if (maxN === 0) return null;
+  const rec = state.readJsonIf(state.dossierPath(cfg, ts.id, `spec-check-r${maxN}.json`));
+  if (!rec || rec.ok !== false) return null;
+  return { round: rec.round, errors: rec.errors };
+}
+
+function readSpecReviewHistory(ts, cfg, limit = 4) {
+  let names = [];
+  try { names = fs.readdirSync(state.dossierPath(cfg, ts.id)); } catch { return ''; }
+  const reports = names
+    .filter((n) => /^spec-verify-r\d+\.md$/.test(n))
+    .sort((a, b) => Number(a.match(/r(\d+)/)?.[1] ?? 0) - Number(b.match(/r(\d+)/)?.[1] ?? 0))
+    .slice(-limit)
+    .map((n) => {
+      const body = fs.readFileSync(state.dossierPath(cfg, ts.id, n), 'utf8');
+      return `## ${n}\n\n${body}`;
+    });
+  return reports.join('\n\n');
+}
+
+function readLatestSpecRepairContext(ts, cfg) {
+  const dir = state.dossierPath(cfg, ts.id);
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch { return null; }
+  let maxN = 0;
+  for (const n of names) {
+    const m = n.match(/^spec-repair-context-r(\d+)\.json$/);
+    if (m) maxN = Math.max(maxN, Number(m[1]));
+  }
+  if (maxN === 0) return null;
+  return state.readJsonIf(state.dossierPath(cfg, ts.id, `spec-repair-context-r${maxN}.json`));
+}
+
+export function buildSetupPrompt(ts, cfg) {
+  return [
+    readAgentPrompt(cfg, 'setup-agent.md'),
+    `# Target repo\n${cfg.targetRepo}`,
+    `# Task that triggered setup\n${ts.id}: ${ts.task.title ?? '(untitled)'} (${ts.task.kind})`,
+    `# Configured test command\n${ts.task.testCommand}`,
+    '# 指令\n只读探索当前 target 仓库，输出 repo 级 setup profile Markdown 全文。不要输出 JSON 或包装。',
+  ].filter(Boolean).join('\n\n');
+}
+
+export function buildSpecAgentPrompt(ts, cfg, round, { mode = 'draft' } = {}) {
+  const setup = readSetupProfileMarkdown(cfg) || '(no approved setup profile found)';
+  const feasibility = readFeasibilityContext(ts, cfg) || '(no feasibility-study context yet; placeholder for future feasibility-study agent)';
+  const rejectNotes = readRejectNotes(ts);
+  const history = readSpecReviewHistory(ts, cfg);
+  const ctx = readLatestSpecRepairContext(ts, cfg);
+  const contractFail = readLatestSpecContractErrors(ts, cfg);
+  const specPath = specDraftPath(cfg, ts.id);
+  const parts = [
+    readAgentPrompt(cfg, 'spec-agent.md'),
+    `# 任务 ${ts.id}（spec-agent r${round}, mode=${mode}, epoch=${ts.runtime.spec_epoch ?? 1})`,
+    `标题：${ts.task.title ?? '(untitled)'}\nkind：${ts.task.kind}`,
+    `# Approved setup profile\n\n${setup}`,
+    `# Feasibility context\n\n${feasibility}`,
+  ];
+  if (rejectNotes.trim()) parts.push(`# Human reject notes\n\n${rejectNotes}`);
+  if (ctx) {
+    parts.push(`# Spec repair context\n\n\`\`\`json\n${JSON.stringify(ctx, null, 2)}\n\`\`\``);
+  }
+  if (contractFail) {
+    parts.push(
+      `# Spec 契约门失败反馈（r${contractFail.round}，上一轮交付未过 ${SPEC_DOC_CONTRACT.id}，必须全部修复）\n\n` +
+      `\`\`\`json\n${JSON.stringify(contractFail, null, 2)}\n\`\`\``,
+    );
+  }
+  if (history.trim()) parts.push(`# Prior spec-verifier reports\n\n${history}`);
+  if (mode === 'repair') {
+    parts.push(`# Current spec draft\n\n${readSpecDraft(ts, cfg)}`);
+  }
+  parts.push(
+    `# 交付方式（${SPEC_DOC_CONTRACT.id}）\n` +
+    `用 Write 工具把完整 spec Markdown 写入唯一交付文件（绝对路径）：${specPath}\n` +
+    `spec 必须包含标题逐字为「## ${SPEC_DOC_CONTRACT.acSectionTitle}」的段落（不接受同义标题），` +
+    '每条验收标准写成 `- AC-xxx: 可验证描述` 列表项，编号不得重复。' +
+    ' Stop hook 会用与 conductor 终审同一份脚本校验该文件，不合格会被要求当场修复；' +
+    'conductor 收货时会再次终审，不采信口头汇报。最终回复只需一句话确认，不要粘贴 spec 全文。',
+  );
+  parts.push(
+    '# 指令\n把完整 spec 写入上面的交付文件。' +
+    ' 如果这是修复轮，只修 spec-verifier / 契约门指出的缺陷；如果这是冷启动重写，吸收历史报告但不要照抄失败稿。',
+  );
+  return parts.filter(Boolean).join('\n\n');
+}
+
+export function buildSpecVerifierPrompt(ts, cfg, round) {
+  const setup = readSetupProfileMarkdown(cfg) || '(no approved setup profile found)';
+  const feasibility = readFeasibilityContext(ts, cfg) || '(no feasibility-study context yet; placeholder for future feasibility-study agent)';
+  const spec = readSpecDraft(ts, cfg);
+  const history = readSpecReviewHistory(ts, cfg);
+  return [
+    readAgentPrompt(cfg, 'spec-verifier-agent.md'),
+    `# 任务 ${ts.id} spec 审查（spec round ${round}）`,
+    `# Approved setup profile\n\n${setup}`,
+    `# Feasibility context\n\n${feasibility}`,
+    history.trim() ? `# Prior spec-verifier reports\n\n${history}` : '',
+    `# Spec draft under review\n\n${spec}`,
+    `# Verdict contract\n${SPEC_VERIFIER_CONTRACT.id} ` +
+    `(schema_version=${SPEC_VERIFIER_CONTRACT.schemaVersion})；最终回复必须是严格 JSON，不要 Markdown 围栏。`,
+    '# JSON 字段\n必须包含 schema_version、round、overall、summary、human_report、spec_agent_feedback、findings。' +
+    ' findings 每项含 severity(blocker|major|minor)、audience(human|spec-agent|both)、issue、recommendation。',
+  ].filter(Boolean).join('\n\n');
+}
+
+export function writeSpecRepairContext(cfg, id, round, verdict) {
+  const ctx = {
+    schema_version: 1,
+    round,
+    source: 'spec_verifier',
+    overall: 'fail',
+    human_report: verdict.human_report,
+    spec_agent_feedback: verdict.spec_agent_feedback,
+    findings: verdict.findings,
+    instruction: 'Repair the spec draft only. Preserve useful accepted content and address every blocker/major finding.',
+  };
+  state.writeJson(state.dossierPath(cfg, id, `spec-repair-context-r${round}.json`), ctx);
+  return ctx;
+}
+
+export function renderSpecVerifyReport(verdict) {
+  const findings = (verdict.findings ?? [])
+    .map((f, i) => `${i + 1}. [${f.severity}/${f.audience}] ${f.issue}\n   Recommendation: ${f.recommendation}`)
+    .join('\n');
+  return [
+    `# Spec Verify Report r${verdict.round}`,
+    '',
+    `Overall: ${verdict.overall}`,
+    '',
+    '## Summary',
+    '',
+    verdict.summary,
+    '',
+    '## Human Report',
+    '',
+    verdict.human_report,
+    '',
+    '## Spec Agent Feedback',
+    '',
+    verdict.spec_agent_feedback,
+    '',
+    '## Findings',
+    '',
+    findings || '(none)',
+    '',
+  ].join('\n');
+}
+
+/**
+ * 渲染 verifier verdict 的人读报告（verify-r<n>.md）。round 用 conductor 自己推导的
+ * 轮次（makerRound），不信 verdict.round。逐条 AC（含 pass）都渲染 status/reason 与
+ * evidence，便于人工核对；报告纯供人读，绝不回喂任何 agent prompt。
+ */
+export function renderVerifyReport(verdict, round) {
+  const criteria = (verdict.criteria_results ?? [])
+    .map((c) => {
+      const lines = [
+        `### ${c.ac_id}: ${c.status}`,
+        '',
+        `Reason: ${c.reason}`,
+      ];
+      const evidence = (c.evidence ?? [])
+        .map((ev) => `- ${ev.file}:${ev.start_line}-${ev.end_line} (${ev.type}) ${ev.summary}`)
+        .join('\n');
+      if (evidence) lines.push('', 'Evidence:', '', evidence);
+      return lines.join('\n');
+    })
+    .join('\n\n');
+  const findings = (verdict.non_ac_findings ?? [])
+    .map((f, i) => `${i + 1}. ${typeof f === 'string' ? f : JSON.stringify(f)}`)
+    .join('\n');
+  return [
+    `# Verify Report r${round}`,
+    '',
+    `Overall: ${verdict.overall}`,
+    '',
+    '## Criteria',
+    '',
+    criteria || '(none)',
+    '',
+    '## Non-AC Findings',
+    '',
+    findings || '(none)',
+    '',
+  ].join('\n');
+}
+
+export function archiveSpecDraft(cfg, id, label = 'archived') {
+  const draft = path.join(cfg.specsDir, `${id}.md`);
+  if (!fs.existsSync(draft)) return null;
+  const archived = path.join(cfg.specsDir, 'archive', `${id}-${label}-${Date.now()}.md`);
+  fs.mkdirSync(path.dirname(archived), { recursive: true });
+  fs.renameSync(draft, archived);
+  return archived;
+}
+
+export function setupDraftPath(cfg) {
+  return setupProfilePaths(cfg).draft;
 }
 
 /** 成本累计写进 ts.runtime.spent_usd（不落盘，交给 saveRuntime/transitionState）。 */
@@ -216,7 +538,7 @@ function readDossierSpec(ts, cfg) {
 
 // ---- prompt builders（契约 §7 §10） ----
 
-/** maker 冷启动 prompt；fullDossier=true 时附最新 repair-context（仍不含 verify-r<n>.md 叙事）。 */
+/** maker 冷启动 prompt；fullDossier=true 时附最新 repair-context（仍不含 verify-r<n>.md 人读报告）。 */
 export function buildMakerColdPrompt(ts, cfg, round, { fullDossier = false } = {}) {
   const parts = [];
   parts.push(readAgentPrompt(cfg, 'maker-agent.md'));
@@ -226,9 +548,10 @@ export function buildMakerColdPrompt(ts, cfg, round, { fullDossier = false } = {
     // 冷启动修复（miss 阶梯后段）：嵌入最新 repair-context JSON（结构化），绝不嵌叙事。
     const ctx = readLatestRepairContext(ts, cfg);
     if (ctx) {
+      const promptCtx = repairContextForPrompt(ts, cfg, ctx);
       parts.push(
         '# 修复上下文（repair-context，唯一修复依据；只动失败/未知 AC，保持已通过项不变）\n\n' +
-        `\`\`\`json\n${JSON.stringify(ctx, null, 2)}\n\`\`\``,
+        `\`\`\`json\n${JSON.stringify(promptCtx, null, 2)}\n\`\`\``,
       );
     }
   }
@@ -253,9 +576,25 @@ function readLatestRepairContext(ts, cfg) {
   return state.readJsonIf(state.dossierPath(cfg, ts.id, `repair-context-r${maxN}.json`));
 }
 
+/** prompt 层展开 green_gate_ref；存储层保持去重，兼容旧 ctx.green_gate 形态。 */
+function repairContextForPrompt(ts, cfg, ctx) {
+  if (!ctx || ctx.source !== 'green_gate' || !ctx.green_gate_ref) return ctx;
+  const gg = state.readJsonIf(state.dossierPath(cfg, ts.id, ctx.green_gate_ref));
+  if (!gg) return ctx;
+  return {
+    ...ctx,
+    green_gate: {
+      command: gg.command,
+      exit_code: gg.exit_code,
+      stdout_tail: gg.stdout_tail,
+      stderr_tail: gg.stderr_tail,
+    },
+  };
+}
+
 /**
  * maker repair prompt（FIXING，resume）：spec + 最新 repair-context JSON（直接内嵌）。
- * 绝不含 verify-r<n>.md 叙事。
+ * 绝不含 verify-r<n>.md 人读报告。
  */
 export function buildMakerRepairPrompt(ts, cfg, round) {
   const ctx = readLatestRepairContext(ts, cfg);
@@ -264,9 +603,10 @@ export function buildMakerRepairPrompt(ts, cfg, round) {
   parts.push(`# 任务 ${ts.id} 修复（第 ${round} 轮）`);
   parts.push(`# Spec（dossier/${ts.id}/spec.md，唯一契约）\n\n${readDossierSpec(ts, cfg)}`);
   if (ctx) {
+    const promptCtx = repairContextForPrompt(ts, cfg, ctx);
     parts.push(
       '# 修复上下文（repair-context，唯一修复依据；只动失败/未知 AC 或修绿测试，保持已通过项不变）\n\n' +
-      `\`\`\`json\n${JSON.stringify(ctx, null, 2)}\n\`\`\``,
+      `\`\`\`json\n${JSON.stringify(promptCtx, null, 2)}\n\`\`\``,
     );
   }
   parts.push(
@@ -277,8 +617,10 @@ export function buildMakerRepairPrompt(ts, cfg, round) {
 }
 
 /**
- * verifier prompt（契约 §10）：嵌 spec + worktree diff + AC 枚举 + 严格 schema 指令。
+ * verifier prompt（契约 §10）：嵌 spec + worktree diff + AC 枚举 + contract id。
  * acList = [{ ac_id, text }]（conductor 枚举 spec 得到）。不喂 maker self-report。
+ * diff 超 cfg.verifierDiffMaxBytes 时降级：只嵌 name-status 变更清单 + 按文件自查指令
+ * （verifier 工具集本就有 Bash(git diff:*)），防大 diff 撑爆 verifier 上下文。
  */
 export function buildVerifierPrompt(ts, cfg, round, acList) {
   const id = ts.id;
@@ -286,40 +628,25 @@ export function buildVerifierPrompt(ts, cfg, round, acList) {
   const base = ts.task.baseBranch;
   const diff = diffAgainstBase(wt, base);
   const acEnum = acList.map((a) => `${a.ac_id}: ${a.text}`).join('\n');
+  const diffBytes = Buffer.byteLength(diff, 'utf8');
+  const diffSection = diffBytes <= cfg.verifierDiffMaxBytes
+    ? `# Worktree diff（git diff ${base}...HEAD）\n\n\`\`\`diff\n${diff}\n\`\`\``
+    : `# Worktree diff（未内嵌：diff 共 ${diffBytes} 字节，超过上限 ${cfg.verifierDiffMaxBytes} 字节，降级为变更文件清单）\n\n` +
+      `变更文件清单（git diff --name-status ${base}...HEAD）：\n\n\`\`\`\n${diffNameStatusAgainstBase(wt, base)}\`\`\`\n\n` +
+      `请对清单中每个文件用 \`git diff ${base}...HEAD -- <file>\` 只读自查其改动，再逐条裁决验收标准。`;
   return [
     readAgentPrompt(cfg, 'verifier-agent.md'),
     `# 任务 ${id} 验收（第 ${round} 轮）`,
     `# Spec（唯一契约）\n\n${readDossierSpec(ts, cfg)}`,
     `# 验收标准枚举（必须逐条裁决，ac_id 必须与此处完全一致，无缺无多）\n\n${acEnum}`,
-    `# Worktree diff（git diff ${base}...HEAD）\n\n\`\`\`diff\n${diff}\n\`\`\``,
+    diffSection,
+    `# Verdict contract\n${VERIFIER_VERDICT_CONTRACT.id} ` +
+    `(schema_version=${VERIFIER_VERDICT_CONTRACT.schemaVersion})；唯一程序级校验在 ` +
+    '`conductor/stages/decisions.mjs::validateVerifierVerdict`，本 prompt 不复制 schema。',
     '# 指令\n只做静态对照：diff 是否满足上面每一条验收标准。可用 Read/Grep/Glob 与 `git diff` / `git log`' +
     ' 进一步只读检查；不许跑测试，不许改文件。\n' +
-    '你的最终回复必须是且仅是严格 JSON（不带任何其他文字、不要 Markdown 围栏外的内容），形如：\n' +
-    '```json\n' +
-    JSON.stringify(
-      {
-        schema_version: 1,
-        round,
-        overall: 'pass|fail',
-        criteria_results: [
-          {
-            ac_id: 'AC-001',
-            status: 'pass|fail|unknown',
-            reason: '本条裁决的依据（非空）',
-            evidence: [
-              { type: 'source', file: 'path/to/file', start_line: 1, end_line: 1, summary: '该处证据摘要' },
-            ],
-          },
-        ],
-        non_ac_findings: [],
-      },
-      null,
-      2,
-    ) +
-    '\n```\n' +
-    '规则：每条 AC 有且仅有一个条目；overall=pass 当且仅当每条都是 pass；pass/fail 至少 1 条 evidence，' +
-    'unknown 可空 evidence 但 reason 必须非空；evidence 行号从 1 开始且 end_line>=start_line。\n' +
-    `conductor 会把它落盘为 dossier/${id}/verify-r${round}.verdict.json，并且只信该文件。`,
+    '最终回复必须是且仅是符合 verdict contract 的严格 JSON；不要输出解释文字、不要 Markdown 围栏。\n' +
+    `conductor 会把合法 verdict 落盘为 dossier/${id}/verify-r${round}.verdict.json，并且只信该文件。`,
   ].filter(Boolean).join('\n\n');
 }
 

@@ -1,20 +1,29 @@
 #!/usr/bin/env node
 // conductor.mjs — CLI 入口 + drain 循环。确定性、可重入、幂等：conductor 是脚本，不是 agent。
-// 子命令：run / new / approve / reject / status / merge / retry（spec §3.3）。
+// 子命令：run / new / approve-setup / approve / reject / status / merge / retry。
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as state from './lib/state.mjs';
 import { acquireLock, releaseLock, lockDirPath, STALE_MS } from './lib/lock.mjs';
 import { currentBranch, mergeBranch, removeWorktree, deleteBranch } from './lib/git.mjs';
+import { hasApprovedSetupProfile } from './lib/profile.mjs';
+import needsTargetSetupHandler from './stages/needs_target_setup.mjs';
+import awaitSetupApprovalHandler from './stages/await_setup_approval.mjs';
 import needsSpecHandler from './stages/needs_spec.mjs';
+import specVerifyHandler from './stages/spec_verify.mjs';
+import specFixingHandler from './stages/spec_fixing.mjs';
 import awaitSpecApprovalHandler from './stages/await_spec_approval.mjs';
 import readyHandler from './stages/ready.mjs';
 import verifyHandler from './stages/verify.mjs';
 import fixingHandler from './stages/fixing.mjs';
 
 const STAGE_HANDLERS = {
+  NEEDS_TARGET_SETUP: needsTargetSetupHandler,
+  AWAIT_SETUP_APPROVAL: awaitSetupApprovalHandler,
   NEEDS_SPEC: needsSpecHandler,
+  SPEC_VERIFY: specVerifyHandler,
+  SPEC_FIXING: specFixingHandler,
   AWAIT_SPEC_APPROVAL: awaitSpecApprovalHandler,
   READY: readyHandler,
   VERIFY: verifyHandler,
@@ -41,10 +50,15 @@ export function loadCfg(root = resolveRoot()) {
     baseBranch: null, // null = new 时读 currentBranch(targetRepo) 兜底 'main'
     maxMakerMisses: 3, // maker 可行动失败阶梯上限（契约 §3）
     maxVerifierInvalidRetries: 2, // verifier 协议失败重试上限（契约 §3）
+    maxSpecMisses: 3, // spec-verifier fail：两次修复，第三次冷启动新 spec-agent
+    maxSpecVerifierInvalidRetries: 2,
+    maxSpecContractRetries: 2, // spec-agent 交付契约门（spec-doc/v1）失败重试上限：初始+2=3 次尝试
+    maxSpecEpochs: 2,
     greenGateOutputTailBytes: 12000, // green gate stdout/stderr tail 字节上限（契约 §6）
+    verifierDiffMaxBytes: 200000, // verifier prompt 内嵌 diff 的字节上限，超限降级为 name-status 清单
     spawnRetries: 4, // Claude 瞬态重试次数（保留现状）
     spawnBackoffMs: [15000, 30000, 60000, 120000], // 瞬态重试退避（保留现状）
-    models: { plan: null, maker: null, verifier: null },
+    models: { setup: null, spec: null, specVerifier: null, maker: null, verifier: null },
   };
   let user = {};
   try {
@@ -62,12 +76,13 @@ export function loadCfg(root = resolveRoot()) {
     specsDir: path.join(root, 'specs'),
     dossierDir: path.join(root, 'dossier'),
     worktreesDir: path.join(root, 'worktrees'),
+    targetProfilesDir: path.join(root, 'target-profiles'),
     agentsDir: path.join(root, 'agents'),
   };
 }
 
 function ensureDirs(cfg) {
-  for (const d of [cfg.queueDir, cfg.doneDir, cfg.failedDir, cfg.specsDir, cfg.dossierDir, cfg.worktreesDir]) {
+  for (const d of [cfg.queueDir, cfg.doneDir, cfg.failedDir, cfg.specsDir, cfg.dossierDir, cfg.worktreesDir, cfg.targetProfilesDir]) {
     fs.mkdirSync(d, { recursive: true });
   }
 }
@@ -187,7 +202,8 @@ function cmdNew(cfg, opts) {
   }
   const title = opts.title ?? '(untitled)';
   const id = nextId(cfg);
-  const stage = kind === 'feature' ? 'NEEDS_SPEC' : 'READY';
+  const naturalStage = kind === 'feature' ? 'NEEDS_SPEC' : 'READY';
+  const stage = hasApprovedSetupProfile(cfg) ? naturalStage : 'NEEDS_TARGET_SETUP';
 
   // task.json 不可变快照（契约 §1）：baseBranch = config.baseBranch ?? currentBranch ?? 'main'。
   let baseBranch = cfg.baseBranch;
@@ -211,10 +227,17 @@ function cmdNew(cfg, opts) {
     stage,
     maker_miss_count: 0,
     verifier_invalid_count: 0,
+    spec_miss_count: 0,
+    spec_verifier_invalid_count: 0,
+    spec_contract_invalid_count: 0,
+    spec_epoch: 1,
     spent_usd: 0,
     approval: null,
+    setup_approval: null,
     maker_session_id: null,
+    spec_agent_session_id: null,
     current_round: 0,
+    current_spec_round: 0,
     last_failure_type: null,
     updated_at: new Date().toISOString(),
   };
@@ -228,7 +251,10 @@ function cmdNew(cfg, opts) {
   if (kind === 'bugfix') {
     console.log('提醒：编辑该目录的 spec.md「## 验收标准」段（它就是 bugfix 档的 spec），然后 conductor run');
   } else {
-    console.log('feature 档：conductor run 会先让 plan-agent 产出 spec 草稿，再等你 approve/reject');
+    console.log('feature 档：conductor run 会先让 spec-agent 产出草稿，经 spec-verifier 后等你 approve/reject');
+  }
+  if (stage === 'NEEDS_TARGET_SETUP') {
+    console.log('当前 target repo 没有 approved setup profile：conductor run 会先进入 setup-agent + approve-setup 闸门');
   }
   console.log(`id: ${id}`);
 }
@@ -248,6 +274,19 @@ function cmdApprove(cfg, id) {
   console.log(`${id} approval=approved。下次 conductor run 时冻结 spec 并进入 READY`);
 }
 
+function cmdApproveSetup(cfg, id) {
+  const ts = findTask(cfg, id);
+  if (!ts) { console.error(`找不到任务 ${id}`); process.exitCode = 1; return; }
+  if (ts.error) { console.error(`${id} 任务目录损坏：${ts.error}`); process.exitCode = 1; return; }
+  if (ts.runtime.stage !== 'AWAIT_SETUP_APPROVAL') {
+    console.error(`警告：${id} 当前 stage=${ts.runtime.stage}（非 AWAIT_SETUP_APPROVAL），仍写入 setup_approval=approved`);
+  }
+  ts.runtime.setup_approval = 'approved';
+  state.saveRuntime(ts);
+  state.appendTimeline(cfg, id, 'human approve setup profile');
+  console.log(`${id} setup_approval=approved。下次 conductor run 时冻结 setup profile 并进入任务流程`);
+}
+
 function cmdReject(cfg, id, notes) {
   const ts = findTask(cfg, id);
   if (!ts) { console.error(`找不到任务 ${id}`); process.exitCode = 1; return; }
@@ -257,13 +296,13 @@ function cmdReject(cfg, id, notes) {
   }
   ts.runtime.approval = 'rejected';
   if (notes) {
-    // 打回意见累加到任务目录的 reject_notes.md（喂给 plan-agent），不入 runtime。
+    // 打回意见累加到任务目录的 reject_notes.md（喂给 spec-agent），不入 runtime。
     const p = path.join(ts.dir, 'reject_notes.md');
     fs.appendFileSync(p, `- ${new Date().toISOString().slice(0, 10)}: ${notes}\n`);
   }
   state.saveRuntime(ts);
   state.appendTimeline(cfg, id, `human reject${notes ? `: ${notes}` : ''}`);
-  console.log(`${id} approval=rejected。下次 conductor run 时退回 plan-agent 重写 spec`);
+  console.log(`${id} approval=rejected。下次 conductor run 时退回 spec-agent 重写 spec`);
 }
 
 // ---- status ----
@@ -342,7 +381,7 @@ function archiveRoundArtifacts(cfg, id) {
   const dir = state.dossierPath(cfg, id);
   let names = [];
   try { names = fs.readdirSync(dir); } catch { return 0; }
-  const targets = names.filter((n) => /^(maker-r\d+\.json|verifier-r\d+\.json|verify-r\d+\.(md|verdict\.json)|verify-r\d+\.invalid-a\d+\.json|green-gate-r\d+\.json|repair-context-r\d+\.json|review-findings\.md)$/.test(n));
+  const targets = names.filter((n) => /^(maker-r\d+\.json|verifier-r\d+\.json|setup-r\d+\.json|spec-agent-r\d+\.json|spec-agent-r\d+\.settings\.json|spec-verifier-r\d+\.json|verify-r\d+\.(md|verdict\.json)|verify-r\d+\.invalid-a\d+\.json|spec-verify-r\d+\.(md|verdict\.json)|spec-verify-r\d+\.invalid-a\d+\.json|spec-check-r\d+(\.hook)?\.json|green-gate-r\d+\.json|repair-context-r\d+\.json|spec-repair-context-r\d+\.json|review-findings\.md)$/.test(n));
   if (targets.length === 0) return 0;
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const dest = path.join(dir, 'attempts', stamp);
@@ -365,9 +404,12 @@ function cmdRetry(cfg, id) {
   if (ts.box === 'failed') {
     // reset runtime（契约 §12）。
     Object.assign(ts.runtime, {
-      stage: 'READY',
+      stage: ts.task.kind === 'feature' && !fs.existsSync(state.dossierPath(cfg, id, 'spec.md')) ? 'NEEDS_SPEC' : 'READY',
       maker_miss_count: 0,
       verifier_invalid_count: 0,
+      spec_miss_count: 0,
+      spec_verifier_invalid_count: 0,
+      spec_contract_invalid_count: 0,
       maker_session_id: null,
       last_failure_type: null,
     });
@@ -377,8 +419,8 @@ function cmdRetry(cfg, id) {
     fs.renameSync(ts.dir, dest);
     ts.dir = dest;
     ts.box = 'queue';
-    state.appendTimeline(cfg, id, 'human retry：FAILED_BOX → READY（miss/inval 重置，案卷保留）');
-    console.log(`${id} 已重回 queue（stage=READY, miss=0, inval=0）`);
+    state.appendTimeline(cfg, id, `human retry：FAILED_BOX → ${ts.runtime.stage}（miss/inval 重置，案卷保留）`);
+    console.log(`${id} 已重回 queue（stage=${ts.runtime.stage}, miss=0, inval=0）`);
     if ((ts.runtime.spent_usd ?? 0) >= cfg.budgetUsd) {
       console.error(
         `警告：spent_usd=$${ts.runtime.spent_usd} 仍 >= budgetUsd=$${cfg.budgetUsd}，` +
@@ -410,8 +452,9 @@ function parseArgs(argv) {
 
 const USAGE = `用法：conductor <command>
   run                                  drain 一轮：推进所有任务直到无状态变化
-  new --kind bugfix|feature --title "…" 新建任务（bugfix 初始 READY，feature 初始 NEEDS_SPEC）
+  new --kind bugfix|feature --title "…" 新建任务（无 setup profile 时先 NEEDS_TARGET_SETUP）
   approve <id>                         批准 spec（AWAIT_SPEC_APPROVAL 闸门）
+  approve-setup <id>                   批准 target repo setup profile（AWAIT_SETUP_APPROVAL 闸门）
   reject <id> [--notes "…"]            打回 spec，notes 追加进任务目录 reject_notes.md
   status                               打印任务表（queue / failed / done）
   merge <id>                           人工终点闸门：合入分支、归档、清 worktree
@@ -425,6 +468,7 @@ export function main(argv = process.argv.slice(2)) {
     case 'run': cmdRun(cfg); break;
     case 'new': cmdNew(cfg, opts); break;
     case 'approve': cmdApprove(cfg, opts._[0]); break;
+    case 'approve-setup': cmdApproveSetup(cfg, opts._[0]); break;
     case 'reject': cmdReject(cfg, opts._[0], opts.notes); break;
     case 'status': cmdStatus(cfg); break;
     case 'merge': cmdMerge(cfg, opts._[0]); break;

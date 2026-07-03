@@ -1,10 +1,10 @@
-// FIXING（契约 §11）：round=maker_miss_count+1。fixingMode 决定 resume/cold。
+// FIXING（契约 §11）：round=makerRound(miss)。fixingMode 决定 resume/cold。
 // buildMakerRepairPrompt（resume）/ buildMakerColdPrompt(fullDossier)（cold）。
 // ensureWorktree(+excludes) → checkTrackedHarness → spawn maker → green gate → 同 READY 的 pass/fail 路由。
 // 幂等：maker-r<round>.json 双标记；崩溃残留（started 无 done）转 FAILED_BOX（crashed），retry 恢复。
 import * as state from '../lib/state.mjs';
 import { ensureWorktree, checkTrackedHarness } from '../lib/git.mjs';
-import { markerStatus, greenGatePassed, makerMissNext, fixingMode } from './decisions.mjs';
+import { markerStatus, greenGatePassed, makerMissNext, fixingMode, makerRound } from './decisions.mjs';
 import {
   worktreePath, runGreenGate, writeGreenGateResult, buildRepairContext, writeRepairContext,
   runMakerRound, buildMakerColdPrompt, buildMakerRepairPrompt,
@@ -14,7 +14,7 @@ import {
 export default function fixingHandler(ts, cfg) {
   const id = ts.id;
   const miss = ts.runtime.maker_miss_count ?? 0;
-  const round = miss + 1; // miss==1 → r2，miss==2 → r3
+  const round = makerRound(miss); // miss==1 → r2，miss==2 → r3
   const marker = state.readJsonIf(state.dossierPath(cfg, id, `maker-r${round}.json`));
   const status = markerStatus(marker);
 
@@ -49,6 +49,9 @@ export default function fixingHandler(ts, cfg) {
       // maker spawn 瞬态重试耗尽（基础设施失败）：直接收箱，不跑 green gate、不进 miss 阶梯（契约 §15）。
       return failToBox(ts, cfg, `maker spawn 瞬态重试耗尽 (r${round})`, 'spawn_transient_exhausted');
     }
+    // maker 非瞬态硬失败（ok=false，如 max-turns 打断）不在此分支：worktree 状态未知，
+    // 必须继续跑 green gate 实测（绿门是唯一事实源），红了照常计一次 maker miss。
+    // 基础设施失败可能因此被计入 miss 阶梯——接受此取舍；timeline 已记 ok=false 供人工归因。
   } else {
     ensureWorktree(cfg.targetRepo, worktreePath(cfg, id), `task/${id}`, HARNESS_ARTIFACTS.patterns);
   }
@@ -72,10 +75,7 @@ export default function fixingHandler(ts, cfg) {
     return { changed: true };
   }
 
-  const gg = state.readJsonIf(state.dossierPath(cfg, id, `green-gate-r${round}.json`));
-  const ctx = buildRepairContext({
-    source: 'green_gate', round, greenGate: gg, tailBytes: cfg.greenGateOutputTailBytes,
-  });
+  const ctx = buildRepairContext({ source: 'green_gate', round });
   writeRepairContext(cfg, id, round, ctx);
   const next = makerMissNext(ts.runtime.maker_miss_count ?? 0, cfg.maxMakerMisses);
   if (next.stage === 'FAILED_BOX') {

@@ -2,7 +2,11 @@
 // 不做任何 IO；handler 只是「读盘 → 调这里 → 落盘」。
 
 export const STAGES = [
+  'NEEDS_TARGET_SETUP',
+  'AWAIT_SETUP_APPROVAL',
   'NEEDS_SPEC',
+  'SPEC_VERIFY',
+  'SPEC_FIXING',
   'AWAIT_SPEC_APPROVAL',
   'READY',
   'VERIFY',
@@ -13,7 +17,31 @@ export const STAGES = [
 
 export const MAX_MISS = 3;
 
-/** spawn 双标记判定：none | in-progress（上次崩溃）| done。 */
+/** verifier verdict 的程序级契约：prompt/agent 只引用它，真正裁判仍是 validateVerifierVerdict。 */
+export const VERIFIER_VERDICT_CONTRACT = Object.freeze({
+  id: 'verifier-verdict/v1',
+  schemaVersion: 1,
+  overallValues: Object.freeze(['pass', 'fail']),
+  criterionStatuses: Object.freeze(['pass', 'fail', 'unknown']),
+});
+
+/** spec-verifier 的程序级契约：包含机器路由字段 + 人类/spec-agent 可读报告字段。 */
+export const SPEC_VERIFIER_CONTRACT = Object.freeze({
+  id: 'spec-verifier-verdict/v1',
+  schemaVersion: 1,
+  overallValues: Object.freeze(['pass', 'fail']),
+  severities: Object.freeze(['blocker', 'major', 'minor']),
+  audiences: Object.freeze(['human', 'spec-agent', 'both']),
+});
+
+/**
+ * spawn 双标记判定：none | in-progress（上次崩溃）| done。
+ * 崩溃收箱语义只对 maker 生效：maker 是唯一改 worktree 的角色，孤儿标记（有 started 无 done）
+ * 意味着 worktree 可能停在半改状态，必须 FAILED_BOX(crashed) 等人工 retry（见 ready/fixing）。
+ * 只读角色（setup/spec/spec-verifier/verifier）的崩溃残留有两种自然结局：同轮重 spawn 被覆盖
+ * （经 startSpawnRecord 的 superseded 数组留档）、或跳号留下孤儿记录（spec-agent 走 nextRoleRound）；
+ * 它们不改 worktree，重跑无害，所以不收箱。
+ */
 export function markerStatus(marker) {
   if (!marker || typeof marker !== 'object') return 'none';
   if (marker.abandoned) return 'none'; // 人工 retry 清理后的标记
@@ -30,6 +58,15 @@ export function overBudget(spentUsd, budgetUsd) {
 /** green gate 只认 exit code，不信 agent 口供。 */
 export function greenGatePassed(exitCode) {
   return exitCode === 0;
+}
+
+/**
+ * maker 轮次的唯一推导点。不变量：maker 轮次恒等于 miss+1（READY 时 miss=0 → r1，
+ * FIXING 时 miss==1 → r2、miss==2 → r3）。`runtime.current_round` 仅为记录性字段，
+ * 供人排查 timeline 时对照，绝不作路由依据。
+ */
+export function makerRound(missCount) {
+  return (missCount ?? 0) + 1;
 }
 
 /**
@@ -61,6 +98,12 @@ export function verifierInvalidNext(invalidCount, maxInvalid) {
   return { stage: 'VERIFY', invalidCount: c, failureType: null };
 }
 
+/** setup profile 人类闸门。null = 闸门未动，停住。 */
+export function setupApprovalNext(approval) {
+  if (approval === 'approved') return 'approved';
+  return null;
+}
+
 /** AWAIT_SPEC_APPROVAL：纯读字段。null = 闸门未动，停住。 */
 export function approvalNext(approval) {
   if (approval === 'approved') return 'READY';
@@ -76,6 +119,38 @@ export function needsSpecAction(specExists, approval) {
 /** FIXING 阶梯：miss==1 续原 maker（有 session 才行），其余冷启动。 */
 export function fixingMode(missCount, sessionId) {
   return missCount === 1 && sessionId ? 'resume' : 'cold';
+}
+
+/**
+ * spec-verifier 有效 fail 后：前两次回 SPEC_FIXING；第三次 fail 触发新 spec-agent 冷启动。
+ * maxMisses=3 时：0→1 修、1→2 修、2→3 冷启动重写。
+ */
+export function specMissNext(missCount, maxMisses = 3) {
+  const m = (missCount ?? 0) + 1;
+  if (m >= maxMisses) return { stage: 'NEEDS_SPEC', missCount: m, coldRestart: true };
+  return { stage: 'SPEC_FIXING', missCount: m, coldRestart: false };
+}
+
+/**
+ * spec-agent 交付产物契约门失败（spec-doc/v1：文件缺失 / 缺 AC 段 / 编号冲突）：
+ * 留在原 stage（NEEDS_SPEC / SPEC_FIXING）重试 spec-agent，超额收箱。
+ * 与 verifier 协议失败同构：这是交付协议失败，不是 spec 质量 miss（后者归 specMissNext）。
+ */
+export function specContractInvalidNext(invalidCount, maxInvalid) {
+  const c = (invalidCount ?? 0) + 1;
+  if (c > maxInvalid) {
+    return { exhausted: true, invalidCount: c, failureType: 'spec_contract_exhausted' };
+  }
+  return { exhausted: false, invalidCount: c, failureType: null };
+}
+
+/** spec-verifier 协议/schema 失败：留在 SPEC_VERIFY 重试，超额收箱。 */
+export function specVerifierInvalidNext(invalidCount, maxInvalid) {
+  const c = (invalidCount ?? 0) + 1;
+  if (c > maxInvalid) {
+    return { stage: 'FAILED_BOX', invalidCount: c, failureType: 'spec_verifier_protocol_exhausted' };
+  }
+  return { stage: 'SPEC_VERIFY', invalidCount: c, failureType: null };
 }
 
 /**
@@ -101,8 +176,10 @@ export function validateVerifierVerdict(parsed, expectedAcIds) {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     return { ok: false, errors: ['verdict 不是对象'] };
   }
-  if (parsed.schema_version !== 1) errors.push('schema_version 必须为 1');
-  if (parsed.overall !== 'pass' && parsed.overall !== 'fail') {
+  if (parsed.schema_version !== VERIFIER_VERDICT_CONTRACT.schemaVersion) {
+    errors.push(`schema_version 必须为 ${VERIFIER_VERDICT_CONTRACT.schemaVersion}`);
+  }
+  if (!VERIFIER_VERDICT_CONTRACT.overallValues.includes(parsed.overall)) {
     errors.push('overall 必须 ∈ {pass,fail}');
   }
   if (!Array.isArray(parsed.criteria_results)) {
@@ -122,7 +199,7 @@ export function validateVerifierVerdict(parsed, expectedAcIds) {
       if (seen.has(c.ac_id)) errors.push(`criterion.ac_id 重复：${c.ac_id}`);
       seen.add(c.ac_id);
     }
-    if (c.status !== 'pass' && c.status !== 'fail' && c.status !== 'unknown') {
+    if (!VERIFIER_VERDICT_CONTRACT.criterionStatuses.includes(c.status)) {
       errors.push(`criterion.status 非法：${c.ac_id ?? '?'}`);
       allPass = false;
     } else if (c.status !== 'pass') {
@@ -168,11 +245,67 @@ export function validateVerifierVerdict(parsed, expectedAcIds) {
   return {
     ok: true,
     verdict: {
-      schema_version: 1,
+      schema_version: VERIFIER_VERDICT_CONTRACT.schemaVersion,
       round: parsed.round,
       overall: parsed.overall,
       criteria_results: parsed.criteria_results,
       non_ac_findings: nonAcFindings,
+    },
+  };
+}
+
+export function validateSpecVerifierVerdict(parsed) {
+  const errors = [];
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ok: false, errors: ['spec verdict 不是对象'] };
+  }
+  if (parsed.schema_version !== SPEC_VERIFIER_CONTRACT.schemaVersion) {
+    errors.push(`schema_version 必须为 ${SPEC_VERIFIER_CONTRACT.schemaVersion}`);
+  }
+  if (!Number.isInteger(parsed.round) || parsed.round < 1) {
+    errors.push('round 必须为正整数');
+  }
+  if (!SPEC_VERIFIER_CONTRACT.overallValues.includes(parsed.overall)) {
+    errors.push('overall 必须 ∈ {pass,fail}');
+  }
+  for (const key of ['summary', 'human_report', 'spec_agent_feedback']) {
+    if (typeof parsed[key] !== 'string' || parsed[key].trim() === '') {
+      errors.push(`${key} 必须是非空字符串`);
+    }
+  }
+  if (!Array.isArray(parsed.findings)) {
+    errors.push('findings 必须是数组');
+  } else {
+    if (parsed.overall === 'fail' && parsed.findings.length < 1) {
+      errors.push('overall=fail 时 findings 至少 1 条');
+    }
+    for (const f of parsed.findings) {
+      if (!f || typeof f !== 'object') { errors.push('finding 不是对象'); continue; }
+      if (!SPEC_VERIFIER_CONTRACT.severities.includes(f.severity)) {
+        errors.push(`finding.severity 非法：${f.severity ?? '?'}`);
+      }
+      if (!SPEC_VERIFIER_CONTRACT.audiences.includes(f.audience)) {
+        errors.push(`finding.audience 非法：${f.audience ?? '?'}`);
+      }
+      for (const key of ['issue', 'recommendation']) {
+        if (typeof f[key] !== 'string' || f[key].trim() === '') {
+          errors.push(`finding.${key} 必须是非空字符串`);
+        }
+      }
+    }
+  }
+
+  if (errors.length > 0) return { ok: false, errors };
+  return {
+    ok: true,
+    verdict: {
+      schema_version: SPEC_VERIFIER_CONTRACT.schemaVersion,
+      round: parsed.round,
+      overall: parsed.overall,
+      summary: parsed.summary,
+      human_report: parsed.human_report,
+      spec_agent_feedback: parsed.spec_agent_feedback,
+      findings: parsed.findings,
     },
   };
 }
