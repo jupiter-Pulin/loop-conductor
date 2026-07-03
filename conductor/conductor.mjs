@@ -5,7 +5,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as state from './lib/state.mjs';
-import { acquireLock, releaseLock, lockDirPath, STALE_MS } from './lib/lock.mjs';
+import { acquireLock, releaseLock, lockDirPath, STALE_MS, startLockHeartbeat } from './lib/lock.mjs';
+import { runScheduler, initRunBudget } from './lib/scheduler.mjs';
+import { withTaskLock, TaskLockBusyError } from './lib/task-lock.mjs';
 import { currentBranch, mergeBranch, removeWorktree, deleteBranch } from './lib/git.mjs';
 import { hasApprovedSetupProfile } from './lib/profile.mjs';
 import needsTargetSetupHandler from './stages/needs_target_setup.mjs';
@@ -29,8 +31,8 @@ const STAGE_HANDLERS = {
   VERIFY: verifyHandler,
   FIXING: fixingHandler,
   // 终态：只响应人工 merge / retry 命令
-  AWAIT_HUMAN_MERGE: () => ({ changed: false }),
-  FAILED_BOX: () => ({ changed: false }),
+  AWAIT_HUMAN_MERGE: async () => ({ changed: false }),
+  FAILED_BOX: async () => ({ changed: false }),
 };
 
 // ---- 配置与路径 ----
@@ -44,7 +46,6 @@ export function loadCfg(root = resolveRoot()) {
   const defaults = {
     budgetUsd: 5,
     maxTurns: 30,
-    maxDrainSteps: 20, // 全局步数上限/次 run（spec §3.3）；耗尽记日志，下次 run 续推
     testCommand: 'node --test',
     targetRepo: './target',
     baseBranch: null, // null = new 时读 currentBranch(targetRepo) 兜底 'main'
@@ -58,15 +59,25 @@ export function loadCfg(root = resolveRoot()) {
     verifierDiffMaxBytes: 200000, // verifier prompt 内嵌 diff 的字节上限，超限降级为 name-status 清单
     spawnRetries: 4, // Claude 瞬态重试次数（保留现状）
     spawnBackoffMs: [15000, 30000, 60000, 120000], // 瞬态重试退避（保留现状）
+    maxConcurrentTasks: 3,
+    inactivityTimeoutMs: 600000,
+    spawnWallClockMs: 14400000,
+    greenGateTimeoutMs: 1800000,
+    lockHeartbeatMs: 60000,
+    maxStepsPerTask: 20,
+    runBudgetUsd: null,
     models: { setup: null, spec: null, specVerifier: null, maker: null, verifier: null },
   };
   let user = {};
   try {
     user = JSON.parse(fs.readFileSync(path.join(root, 'conductor.config.json'), 'utf8'));
   } catch { /* 配置缺失时用默认值 */ }
+  const deprecatedMaxDrainStepsConfigured = Object.hasOwn(user, 'maxDrainSteps');
   const merged = { ...defaults, ...user, models: { ...defaults.models, ...(user.models ?? {}) } };
+  delete merged.maxDrainSteps;
   return {
     ...merged,
+    deprecatedMaxDrainStepsConfigured,
     root,
     targetRepo: path.resolve(root, merged.targetRepo),
     stateDir: path.join(root, 'state'),
@@ -121,8 +132,12 @@ function warnLegacyTasks(cfg) {
 
 // ---- run：drain 循环 ----
 
-function cmdRun(cfg) {
-  const lock = acquireLock(cfg.stateDir);
+async function cmdRun(cfg) {
+  const lock = acquireLock(cfg.stateDir, {
+    onSelfHeal: (info) => {
+      console.error(`[conductor] 检测到锁 pid=${info?.pid ?? '?'} 已不存活，已自动清除残锁并重新获锁。`);
+    },
+  });
   if (!lock.acquired) {
     if (lock.stale) {
       console.error(
@@ -136,39 +151,24 @@ function cmdRun(cfg) {
     process.exitCode = 1;
     return;
   }
+  let stopHeartbeat = null;
   try {
-    let pending = false; // 最后一轮是否仍有状态变化（true = 步数耗尽时队列未 drain 干净）
-    for (let step = 0; step < cfg.maxDrainSteps; step++) {
-      warnLegacyTasks(cfg); // 每轮检旧 .md 布局，清晰告警并跳过（不当新任务）
-      let changed = false;
-      for (const ts of state.listTaskStates(cfg.queueDir, 'queue')) {
-        if (ts.error) {
-          console.error(`[conductor] 任务目录损坏，跳过 ${ts.dir}: ${ts.error}`);
-          continue;
-        }
-        const handler = STAGE_HANDLERS[ts.runtime.stage];
-        if (!handler) {
-          console.error(`[${ts.id}] 未知 stage "${ts.runtime.stage}"，跳过`);
-          continue;
-        }
-        try {
-          const r = handler(ts, cfg) ?? {};
-          if (r.changed) changed = true;
-        } catch (err) {
-          console.error(`[${ts.id}] handler(${ts.runtime.stage}) 异常：${err.message}`);
-        }
-      }
-      pending = changed;
-      if (!changed) break; // 一轮无状态变化 → drain 完成（人类闸门天然停住）
+    stopHeartbeat = startLockHeartbeat(cfg.stateDir, cfg.lockHeartbeatMs);
+    if (cfg.deprecatedMaxDrainStepsConfigured) {
+      console.error('[conductor] 警告：maxDrainSteps 已废弃，本次 run 忽略；请改用 maxStepsPerTask。');
     }
-    if (pending) {
-      // 步数上限耗尽且仍有任务可推进：显式记日志（状态已落盘，不丢转移），下次 run 续推
-      console.error(
-        `[conductor] drain 步数上限 ${cfg.maxDrainSteps} 耗尽，队列仍有可推进的任务；` +
-        '状态已全部落盘，下次 conductor run 将续推。',
-      );
+    if (!(Number(cfg.maxConcurrentTasks) > 0)) {
+      console.error(`[conductor] 警告：maxConcurrentTasks=${cfg.maxConcurrentTasks} 非法，按 1 处理。`);
     }
+    warnLegacyTasks(cfg);
+    const repaired = state.patrolBoxStageConsistency(cfg);
+    for (const r of repaired) {
+      console.error(`[${r.id}] box/stage 巡检自愈：${r.from} → ${r.to}（stage=${r.stage}）`);
+    }
+    initRunBudget(cfg);
+    await runScheduler(cfg, STAGE_HANDLERS);
   } finally {
+    if (stopHeartbeat) stopHeartbeat();
     releaseLock(cfg.stateDir);
   }
   cmdStatus(cfg);
@@ -261,7 +261,26 @@ function cmdNew(cfg, opts) {
 
 // ---- approve / reject ----
 
-function cmdApprove(cfg, id) {
+async function withCliTaskMutation(cfg, id, fn) {
+  if (!id) {
+    console.error('缺少任务 id');
+    process.exitCode = 1;
+    return;
+  }
+  try {
+    return await withTaskLock(cfg, id, fn, { retries: 3, retryDelayMs: 200 });
+  } catch (err) {
+    if (err instanceof TaskLockBusyError) {
+      console.error(`[${id}] 任务正被推进，请稍后重试。`);
+      process.exitCode = 1;
+      return;
+    }
+    throw err;
+  }
+}
+
+async function cmdApprove(cfg, id) {
+  return withCliTaskMutation(cfg, id, async () => {
   const ts = findTask(cfg, id);
   if (!ts) { console.error(`找不到任务 ${id}`); process.exitCode = 1; return; }
   if (ts.error) { console.error(`${id} 任务目录损坏：${ts.error}`); process.exitCode = 1; return; }
@@ -272,9 +291,11 @@ function cmdApprove(cfg, id) {
   state.saveRuntime(ts);
   state.appendTimeline(cfg, id, 'human approve');
   console.log(`${id} approval=approved。下次 conductor run 时冻结 spec 并进入 READY`);
+  });
 }
 
-function cmdApproveSetup(cfg, id) {
+async function cmdApproveSetup(cfg, id) {
+  return withCliTaskMutation(cfg, id, async () => {
   const ts = findTask(cfg, id);
   if (!ts) { console.error(`找不到任务 ${id}`); process.exitCode = 1; return; }
   if (ts.error) { console.error(`${id} 任务目录损坏：${ts.error}`); process.exitCode = 1; return; }
@@ -285,9 +306,11 @@ function cmdApproveSetup(cfg, id) {
   state.saveRuntime(ts);
   state.appendTimeline(cfg, id, 'human approve setup profile');
   console.log(`${id} setup_approval=approved。下次 conductor run 时冻结 setup profile 并进入任务流程`);
+  });
 }
 
-function cmdReject(cfg, id, notes) {
+async function cmdReject(cfg, id, notes) {
+  return withCliTaskMutation(cfg, id, async () => {
   const ts = findTask(cfg, id);
   if (!ts) { console.error(`找不到任务 ${id}`); process.exitCode = 1; return; }
   if (ts.error) { console.error(`${id} 任务目录损坏：${ts.error}`); process.exitCode = 1; return; }
@@ -298,11 +321,14 @@ function cmdReject(cfg, id, notes) {
   if (notes) {
     // 打回意见累加到任务目录的 reject_notes.md（喂给 spec-agent），不入 runtime。
     const p = path.join(ts.dir, 'reject_notes.md');
-    fs.appendFileSync(p, `- ${new Date().toISOString().slice(0, 10)}: ${notes}\n`);
+    let existing = '';
+    try { existing = fs.readFileSync(p, 'utf8'); } catch { /* optional */ }
+    state.writeFileEnsured(p, `${existing}- ${new Date().toISOString().slice(0, 10)}: ${notes}\n`);
   }
   state.saveRuntime(ts);
   state.appendTimeline(cfg, id, `human reject${notes ? `: ${notes}` : ''}`);
   console.log(`${id} approval=rejected。下次 conductor run 时退回 spec-agent 重写 spec`);
+  });
 }
 
 // ---- status ----
@@ -341,9 +367,66 @@ function cmdStatus(cfg) {
   }
 }
 
+function latestActiveSpawn(cfg, id) {
+  const dir = state.dossierPath(cfg, id);
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch { return null; }
+  const active = [];
+  for (const n of names) {
+    const m = n.match(/^(setup|spec-agent|spec-verifier|maker|verifier)-r(\d+)\.json$/);
+    if (!m) continue;
+    const p = path.join(dir, n);
+    const rec = state.readJsonIf(p);
+    if (!rec?.started || rec.done) continue;
+    const streamFile = path.join(dir, `${m[1]}-r${m[2]}.stream.jsonl`);
+    let lastActivity = rec.started;
+    try {
+      lastActivity = new Date(fs.statSync(streamFile).mtimeMs).toISOString();
+    } catch {
+      try { lastActivity = new Date(fs.statSync(p).mtimeMs).toISOString(); } catch { /* keep started */ }
+    }
+    active.push({
+      role: rec.role ?? m[1],
+      round: rec.round ?? Number(m[2]),
+      started: rec.started,
+      lastActivity,
+    });
+  }
+  active.sort((a, b) => String(b.started).localeCompare(String(a.started)));
+  return active[0] ?? null;
+}
+
+function cmdSpy(cfg) {
+  const rows = [];
+  for (const ts of state.listTaskStates(cfg.queueDir, 'queue')) {
+    if (ts.error) {
+      rows.push({ id: ts.id, stage: `(损坏)`, active: '-', last: '-', spent: '?' });
+      continue;
+    }
+    const active = latestActiveSpawn(cfg, ts.id);
+    rows.push({
+      id: ts.id,
+      stage: ts.runtime.stage ?? '?',
+      active: active ? `${active.role} r${active.round}` : '-',
+      last: active?.lastActivity ?? ts.runtime.updated_at ?? '-',
+      spent: `$${(ts.runtime.spent_usd ?? 0).toFixed(3)}`,
+    });
+  }
+  const cols = [
+    ['id', 'ID', 22], ['stage', 'STAGE', 21], ['active', 'ACTIVE', 18], ['last', 'LAST_ACTIVITY', 28], ['spent', 'SPENT', 10],
+  ];
+  console.log(cols.map(([, h, w]) => h.padEnd(w)).join(''));
+  if (rows.length === 0) {
+    console.log('(no queue tasks)');
+    return;
+  }
+  for (const r of rows) console.log(cols.map(([k, , w]) => String(r[k]).padEnd(w)).join(''));
+}
+
 // ---- merge ----
 
-function cmdMerge(cfg, id) {
+async function cmdMerge(cfg, id) {
+  return withCliTaskMutation(cfg, id, async () => {
   const ts = findTask(cfg, id);
   if (!ts) { console.error(`找不到任务 ${id}`); process.exitCode = 1; return; }
   if (ts.error) { console.error(`${id} 任务目录损坏：${ts.error}`); process.exitCode = 1; return; }
@@ -372,6 +455,7 @@ function cmdMerge(cfg, id) {
   fs.renameSync(ts.dir, dest);
   state.appendTimeline(cfg, id, '归档 → state/done/');
   console.log(`${id} 已 merge 并归档（state/done/），worktree 已清理`);
+  });
 }
 
 // ---- retry ----
@@ -391,7 +475,8 @@ function archiveRoundArtifacts(cfg, id) {
   return targets.length;
 }
 
-function cmdRetry(cfg, id) {
+async function cmdRetry(cfg, id) {
+  return withCliTaskMutation(cfg, id, async () => {
   const ts = findTask(cfg, id);
   if (!ts) { console.error(`找不到任务 ${id}`); process.exitCode = 1; return; }
   if (ts.error) { console.error(`${id} 任务目录损坏：${ts.error}`); process.exitCode = 1; return; }
@@ -432,6 +517,7 @@ function cmdRetry(cfg, id) {
     state.appendTimeline(cfg, id, 'human retry：清理崩溃残留标记');
     console.log(`${id} 在 queue 中（stage=${ts.runtime.stage}），已清理轮次标记，下次 run 重新 spawn`);
   }
+  });
 }
 
 // ---- CLI 分发 ----
@@ -457,22 +543,24 @@ const USAGE = `用法：conductor <command>
   approve-setup <id>                   批准 target repo setup profile（AWAIT_SETUP_APPROVAL 闸门）
   reject <id> [--notes "…"]            打回 spec，notes 追加进任务目录 reject_notes.md
   status                               打印任务表（queue / failed / done）
+  spy                                  只读查看 queue 任务的运行中角色与最近活动
   merge <id>                           人工终点闸门：合入分支、归档、清 worktree
   retry <id>                           FAILED_BOX → READY（重置 miss，保留案卷）/ 清理崩溃标记`;
 
-export function main(argv = process.argv.slice(2)) {
+export async function main(argv = process.argv.slice(2)) {
   const { cmd, opts } = parseArgs(argv);
   const cfg = loadCfg();
   ensureDirs(cfg);
   switch (cmd) {
-    case 'run': cmdRun(cfg); break;
+    case 'run': await cmdRun(cfg); break;
     case 'new': cmdNew(cfg, opts); break;
-    case 'approve': cmdApprove(cfg, opts._[0]); break;
-    case 'approve-setup': cmdApproveSetup(cfg, opts._[0]); break;
-    case 'reject': cmdReject(cfg, opts._[0], opts.notes); break;
+    case 'approve': await cmdApprove(cfg, opts._[0]); break;
+    case 'approve-setup': await cmdApproveSetup(cfg, opts._[0]); break;
+    case 'reject': await cmdReject(cfg, opts._[0], opts.notes); break;
     case 'status': cmdStatus(cfg); break;
-    case 'merge': cmdMerge(cfg, opts._[0]); break;
-    case 'retry': cmdRetry(cfg, opts._[0]); break;
+    case 'spy': cmdSpy(cfg); break;
+    case 'merge': await cmdMerge(cfg, opts._[0]); break;
+    case 'retry': await cmdRetry(cfg, opts._[0]); break;
     default:
       console.error(USAGE);
       process.exitCode = cmd ? 1 : 0;
@@ -480,5 +568,8 @@ export function main(argv = process.argv.slice(2)) {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main();
+  main().catch((err) => {
+    console.error(`[conductor] fatal: ${err?.stack ?? err?.message ?? err}`);
+    process.exitCode = 1;
+  });
 }

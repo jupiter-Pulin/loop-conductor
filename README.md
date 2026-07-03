@@ -93,7 +93,13 @@ npm run conductor -- retry <id>
 | verifier invalid 重试 | `tests/integration/verifier-invalid.test.mjs` |
 | maker retry ladder | `tests/integration/retry-ladder.test.mjs` |
 | crash re-entry | `tests/integration/crash-reentry.test.mjs` |
+| box/stage 崩溃巡检 | `tests/integration/crash-patrol.test.mjs` |
 | budget gate | `tests/integration/budget.test.mjs` |
+| liveness kill / slow alive | `tests/integration/liveness-kill.test.mjs` |
+| green gate timeout | `tests/integration/green-gate-timeout.test.mjs` |
+| parallel scheduling | `tests/integration/parallel-scheduling.test.mjs` |
+| cli task lock + spy | `tests/integration/cli-task-lock-spy.test.mjs` |
+| setup race | `tests/integration/setup-race.test.mjs` |
 | worktree harness exclude | `tests/integration/worktree-harness.test.mjs` |
 | verifier diff 上限降级 | `tests/integration/verifier-diff-cap.test.mjs` |
 

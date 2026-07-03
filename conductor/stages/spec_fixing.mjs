@@ -1,24 +1,30 @@
 // SPEC_FIXING：基于 spec-repair-context 让 spec-agent 直写下一稿（hook 护栏 + 契约门
 // 与 NEEDS_SPEC 相同），过门后回 SPEC_VERIFY。
 // 契约门 fail：留在 SPEC_FIXING 原地重试（修复轮保留现有草稿作上下文，不归档），超额收箱。
+import path from 'node:path';
 import { runClaude } from '../lib/claude.mjs';
 import * as state from '../lib/state.mjs';
 import { specContractInvalidNext } from './decisions.mjs';
 import {
   addCost, budgetExceeded, buildSpecAgentPrompt, failToBox,
   finishSpawnRecord, nextRoleRound, runSpecContractGate, SPEC_AGENT_TOOLS,
-  startSpawnRecord, writeSpecAgentSettings,
+  startSpawnRecord, writeSpecAgentSettings, canStartSpawn,
 } from './shared.mjs';
 
-export default function specFixingHandler(ts, cfg) {
+export default async function specFixingHandler(ts, cfg) {
   const id = ts.id;
   if (budgetExceeded(ts, cfg)) {
     return failToBox(ts, cfg, `budget exceeded: $${ts.runtime.spent_usd} >= $${cfg.budgetUsd}，拒绝 spawn spec-agent`, 'budget_exceeded');
   }
+  if (!canStartSpawn(ts, cfg, 'spec-agent')) return { changed: false };
   const round = nextRoleRound(cfg, id, 'spec-agent');
   const settings = writeSpecAgentSettings(ts, cfg, round);
-  const rec = startSpawnRecord(cfg, id, 'spec-agent', round, { mode: 'repair' });
-  const res = runClaude({
+  const streamFile = state.dossierPath(cfg, id, `spec-agent-r${round}.stream.jsonl`);
+  const rec = startSpawnRecord(cfg, id, 'spec-agent', round, {
+    mode: 'repair',
+    stream_file: path.relative(cfg.root, streamFile),
+  });
+  const res = await runClaude({
     cwd: cfg.targetRepo,
     prompt: buildSpecAgentPrompt(ts, cfg, round, { mode: 'repair' }),
     maxTurns: cfg.maxTurns,
@@ -26,9 +32,13 @@ export default function specFixingHandler(ts, cfg) {
     tools: SPEC_AGENT_TOOLS,
     allowedTools: SPEC_AGENT_TOOLS,
     settings,
+    streamFile,
+    inactivityTimeoutMs: cfg.inactivityTimeoutMs,
+    wallClockMs: cfg.spawnWallClockMs,
   });
   finishSpawnRecord(rec, res);
-  addCost(ts, res.costUsd);
+  addCost(ts, res.costUsd, cfg);
+  if (res.costUnknown) state.appendTimeline(cfg, id, `spec-agent r${round} cost unknown; spent_usd uses lower-bound accounting`);
   if (!res.ok) {
     state.saveRuntime(ts);
     state.appendTimeline(cfg, id, `spec-agent repair failed: ${res.error ?? 'unknown'}`);
