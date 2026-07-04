@@ -79,7 +79,7 @@ export default async function fixingHandler(ts, cfg) {
     // falsifies / error / disabled(null) 照常进 VERIFY（单侧闸门，见 shared.mjs::runTestGateProbe）。
     const probe = await runTestGateProbe(ts, cfg, round);
     if (probe?.verdict === 'vacuous') {
-      const tgCtx = buildRepairContext({ source: 'test_gate', round });
+      const tgCtx = buildRepairContext({ source: 'test_gate', round, probe });
       writeRepairContext(cfg, id, round, tgCtx);
       const tgNext = makerMissNext(ts.runtime.maker_miss_count ?? 0, cfg.maxMakerMisses);
       if (tgNext.stage === 'FAILED_BOX') {

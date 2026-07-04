@@ -70,6 +70,27 @@ export function testGateVerdict(exitCode) {
 }
 
 /**
+ * per-AC 方向裁决（test gate 探针 per-ac 模式，方向表见任务 spec「约定 2」）：
+ *   fail_on_baseline：基线 exit 0 → vacuous（唯一 block 项）；非 0 → falsifies。
+ *   pass_on_baseline：基线 exit 0 → guard_holds；非 0 → guard_broken（放行留痕）。
+ *   超时（exit_code=null）/ spawn error（exit_code<0）→ error，两方向一致（fail-open）。
+ */
+export function perAcProbeVerdict(expect, exitCode, timedOut) {
+  if (timedOut || typeof exitCode !== 'number' || exitCode < 0) return 'error';
+  if (expect === 'fail_on_baseline') return exitCode === 0 ? 'vacuous' : 'falsifies';
+  return exitCode === 0 ? 'guard_holds' : 'guard_broken';
+}
+
+/**
+ * per-AC 顶层聚合：任一条 vacuous → 'vacuous'（复用 ready/fixing 现有
+ * probe?.verdict === 'vacuous' 分支，stage 路由零改动），否则 'falsifies'。
+ * guard_broken / unmapped / error 均不 block（单侧闸门不变）。
+ */
+export function perAcGateVerdict(perAc) {
+  return (perAc ?? []).some((e) => e.verdict === 'vacuous') ? 'vacuous' : 'falsifies';
+}
+
+/**
  * maker 轮次的唯一推导点。不变量：maker 轮次恒等于 miss+1（READY 时 miss=0 → r1，
  * FIXING 时 miss==1 → r2、miss==2 → r3）。`runtime.current_round` 仅为记录性字段，
  * 供人排查 timeline 时对照，绝不作路由依据。
