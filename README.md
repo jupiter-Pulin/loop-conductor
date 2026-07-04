@@ -17,9 +17,10 @@
 | agent hook 脚本（spec 写白名单、Stop 契约预检、maker git 护栏） | `conductor/hooks/` |
 | 纯路由和 schema 判断 | `conductor/stages/decisions.mjs` |
 | agent 角色 prompt | `agents/*.md` |
+| commit / 分支规范（committer 提案的规范源） | `.claude/skills/git-conventions/SKILL.md` |
 | 行为 case | `tests/integration/*.test.mjs` |
 | 单元级不变量 | `tests/unit/*.test.mjs` |
-| 最近一次实现证据 | `docs/features/test-evidence-chain/request-log.md` |
+| 最近一次实现证据 | `docs/features/committer-merge-message/request-log.md` |
 
 ## 当前角色
 
@@ -30,6 +31,7 @@
 | spec-verifier | `agents/spec-verifier-agent.md` | `conductor/stages/spec_verify.mjs` | 用严格 JSON 审查 spec 质量。 |
 | maker | `agents/maker-agent.md` | `conductor/stages/ready.mjs`, `conductor/stages/fixing.mjs` | 修改任务 worktree，使冻结 spec 全部满足（git 破坏性操作由逐轮 settings hook 拦截）。 |
 | verifier | `agents/verifier-agent.md` | `conductor/stages/verify.mjs` | 冷读 spec + diff，逐条裁决 AC。 |
+| committer | `agents/committer-agent.md` | `conductor/conductor.mjs::cmdMerge` | 起草 merge commit 文案（提案制，`validateCommitMessage` 终审，两次不过降级机器文案）。 |
 
 ## 状态流
 
@@ -94,6 +96,7 @@ npm run conductor -- retry <id>
 | green gate 修复路径 | `tests/integration/green-gate.test.mjs` |
 | test gate 空转测试拦截 | `tests/integration/test-gate.test.mjs` |
 | test gate per-AC 定向探针（AC→测试映射） | `tests/integration/test-gate-per-ac.test.mjs` |
+| merge commit 文案提案 + 降级 | `tests/integration/commit-message.test.mjs` |
 | verifier fail repair context | `tests/integration/verifier-fail.test.mjs` |
 | verifier invalid 重试 | `tests/integration/verifier-invalid.test.mjs` |
 | maker retry ladder | `tests/integration/retry-ladder.test.mjs` |

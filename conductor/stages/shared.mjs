@@ -4,9 +4,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { runClaudeWithRetry } from '../lib/claude.mjs';
+import { runClaude, runClaudeWithRetry } from '../lib/claude.mjs';
 import {
-  ensureWorktree, commitAll, diffAgainstBase, diffNameStatusAgainstBase,
+  ensureWorktree, commitAll, diffAgainstBase, diffNameStatusAgainstBase, diffStatAgainstBase,
   mergeBaseWith, addDetachedWorktree, removeWorktree,
 } from '../lib/git.mjs';
 import { DEFAULT_TEST_GLOBS, classifyTestFileChanges, AC_TESTS_MAPPING_PATH, validateAcTestsMapping } from '../lib/test-gate.mjs';
@@ -16,7 +16,8 @@ import { addRunCost, canStartSpawn } from '../lib/scheduler.mjs';
 import { SPEC_DOC_CONTRACT, validateSpecDoc } from '../lib/spec-contract.mjs';
 import {
   overBudget, testGateVerdict, perAcProbeVerdict, perAcGateVerdict,
-  SPEC_VERIFIER_CONTRACT, VERIFIER_VERDICT_CONTRACT,
+  parseStrictJson, validateCommitMessage,
+  SPEC_VERIFIER_CONTRACT, VERIFIER_VERDICT_CONTRACT, COMMIT_MESSAGE_CONTRACT,
 } from './decisions.mjs';
 
 export function worktreePath(cfg, id) {
@@ -910,6 +911,79 @@ export function buildVerifierPrompt(ts, cfg, round, acList) {
     '最终回复必须是且仅是符合 verdict contract 的严格 JSON；不要输出解释文字、不要 Markdown 围栏。\n' +
     `conductor 会把合法 verdict 落盘为 dossier/${id}/verify-r${round}.verdict.json，并且只信该文件。`,
   ].filter(Boolean).join('\n\n');
+}
+
+// ---- committer 提案（agent 提案，conductor 裁决——与 verifier verdict 同模式） ----
+
+/** git-conventions skill（commit/分支规范）的仓库内路径：committer prompt 的唯一规范源。 */
+export const GIT_CONVENTIONS_SKILL_PATH = path.join('.claude', 'skills', 'git-conventions', 'SKILL.md');
+
+/** committer prompt：角色前導 + 规范全文 + 冻结 spec AC 枚举 + diff --stat + 严格 JSON 交付契约。 */
+export function buildCommitterPrompt(ts, cfg, acList, diffStat) {
+  let conventions = '';
+  try {
+    conventions = fs.readFileSync(path.join(cfg.root, GIT_CONVENTIONS_SKILL_PATH), 'utf8');
+  } catch { /* 规范文件缺失时靠角色 prompt 底线 */ }
+  const acEnum = acList.map((a) => `${a.ac_id}: ${a.text}`).join('\n');
+  const { types, subjectMaxLen, bodyLineMaxLen } = COMMIT_MESSAGE_CONTRACT;
+  return [
+    readAgentPrompt(cfg, 'committer-agent.md'),
+    `# 任务 ${ts.id} merge 提交文案（kind=${ts.task.kind}）\n标题：${ts.task.title ?? '(untitled)'}`,
+    conventions ? `# Git 提交规范（git-conventions skill 全文）\n\n${conventions}` : '',
+    `# 冻结 spec 验收标准\n\n${acEnum}`,
+    `# 变更规模（git diff --stat ${ts.task.baseBranch}...HEAD）\n\n\`\`\`\n${diffStat}\`\`\``,
+    `# 交付契约（${COMMIT_MESSAGE_CONTRACT.id}）\n` +
+    '最终回复必须是且仅是严格 JSON：{"subject": "...", "body": "..."}。' +
+    `subject 逐字匹配 \`type(scope)?: 描述\`（type ∈ {${types.join('|')}}，描述 ≤${subjectMaxLen} 字符，禁 WIP）；` +
+    `body 非空、每行 ≤${bodyLineMaxLen} 字符。唯一程序级校验在 ` +
+    '`conductor/stages/decisions.mjs::validateCommitMessage`，不合格会被要求重出，两次不合格降级机器文案。',
+  ].filter(Boolean).join('\n\n');
+}
+
+/**
+ * committer 提案：spawn 便宜小 agent（可配 models.committer）起草 merge commit 文案，
+ * validateCommitMessage 终审；invalid 重试一次（prompt 附错误反馈），再不过返回 null——
+ * 调用方降级机器文案（fail-open，与映射非法降级 suite 同一伦理：格式问题绝不 block 交付）。
+ * 轮次 commit 不受影响：merge 仍 --no-ff，任务分支的 maker r<n> 颗粒度原样保留。
+ */
+export async function runCommitterProposal(ts, cfg) {
+  const id = ts.id;
+  if (budgetExceeded(ts, cfg)) {
+    state.appendTimeline(cfg, id, 'committer 提案跳过（budget exceeded），merge 用机器文案');
+    return null;
+  }
+  const wt = worktreePath(cfg, id);
+  const acList = state.extractAcceptanceCriteria(readDossierSpec(ts, cfg));
+  let prompt = buildCommitterPrompt(ts, cfg, acList, diffStatAgainstBase(wt, ts.task.baseBranch));
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const streamFile = state.dossierPath(cfg, id, `committer-r${attempt}.stream.jsonl`);
+    const rec = startSpawnRecord(cfg, id, 'committer', attempt, {
+      stream_file: path.relative(cfg.root, streamFile),
+    });
+    const res = await runClaude({
+      cwd: wt,
+      prompt,
+      maxTurns: 4, // 纯文案起草：给只读工具但不需要长会话
+      model: cfg.models?.committer ?? null,
+      tools: READONLY_TOOLS,
+      allowedTools: READONLY_TOOLS,
+      streamFile,
+      inactivityTimeoutMs: cfg.inactivityTimeoutMs,
+      wallClockMs: cfg.spawnWallClockMs,
+    });
+    finishSpawnRecord(rec, res);
+    addCost(ts, res.costUsd);
+    state.saveRuntime(ts);
+    const check = validateCommitMessage(parseStrictJson(res.result));
+    if (check.ok) {
+      state.appendTimeline(cfg, id, `committer 提案 a${attempt} 有效：${check.subject}`);
+      return `${check.subject}\n\n${check.body}`;
+    }
+    state.appendTimeline(cfg, id, `committer 提案 a${attempt} invalid：${check.errors.join('; ')}`);
+    prompt += `\n\n# 上一轮提案校验失败（必须全部修复后重出）\n${check.errors.map((e) => `- ${e}`).join('\n')}`;
+  }
+  state.appendTimeline(cfg, id, 'committer 提案两次 invalid，merge 降级机器文案');
+  return null;
 }
 
 // ---- maker spawn（双标记 + 预算累计） ----

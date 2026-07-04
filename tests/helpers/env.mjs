@@ -19,6 +19,7 @@ const AGENT_STUBS = {
   'spec-verifier-agent.md': '# spec verifier stub\n',
   'maker-agent.md': '# maker stub\n',
   'verifier-agent.md': '# verifier stub\n',
+  'committer-agent.md': '# committer stub\n',
 };
 
 function setupProfileKey(targetRepo) {
