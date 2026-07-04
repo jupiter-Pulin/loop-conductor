@@ -1,6 +1,7 @@
-// 单元：spec-agent 的两个 hook 脚本按 Claude Code hook 协议独立驱动（stdin JSON + 退出码）。
+// 单元：agent hook 脚本按 Claude Code hook 协议独立驱动（stdin JSON + 退出码）。
 // spec-write-guard：PreToolUse 写路径白名单（exit 2 = 拦截，stderr 喂回模型）。
 // check-spec：Stop 契约预检（不合格 exit 2 只拦一次；stop_hook_active=true 放行给 conductor 终审）。
+// maker-git-guard：PreToolUse(Bash) git 破坏性操作护栏（拦 push/不可逆，放行 commit）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -12,6 +13,7 @@ import { spawnSync } from 'node:child_process';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const GUARD = path.resolve(HERE, '..', '..', 'conductor', 'hooks', 'spec-write-guard.mjs');
 const CHECK = path.resolve(HERE, '..', '..', 'conductor', 'hooks', 'check-spec.mjs');
+const GIT_GUARD = path.resolve(HERE, '..', '..', 'conductor', 'hooks', 'maker-git-guard.mjs');
 
 function runHook(script, args, stdinObj) {
   return spawnSync(process.execPath, [script, ...args], {
@@ -134,4 +136,64 @@ test('check-spec：交付文件未写入也是契约失败（exit 2）', (t) => 
   const r = runHook(CHECK, ['--spec', spec, '--report', report], { stop_hook_active: false });
   assert.equal(r.status, 2);
   assert.match(r.stderr, /缺失或为空/);
+});
+
+// ---- maker-git-guard ----
+
+function bashCall(command) {
+  return { tool_name: 'Bash', tool_input: { command } };
+}
+
+test('git-guard：拦截 push 与不可逆操作（exit 2 + 指引）', () => {
+  const denied = [
+    'git push',
+    'git push --force origin main',
+    'git -C /some/dir push origin HEAD',
+    'git reset --hard HEAD~1',
+    'git clean -fd',
+    'git checkout -- lib/stats.mjs',
+    'git checkout .',
+    'git restore lib/stats.mjs',
+    'git branch -D task/x',
+    'git stash drop',
+    'git filter-branch --all',
+    'npm test && git push',
+    'sh -c "git push origin main"',
+  ];
+  for (const command of denied) {
+    const r = runHook(GIT_GUARD, [], bashCall(command));
+    assert.equal(r.status, 2, `应拦截：${command}`);
+    assert.match(r.stderr, /maker-git-guard 拦截/, command);
+  }
+});
+
+test('git-guard：放行本地 commit、只读 git 与普通命令', () => {
+  const allowed = [
+    'git status',
+    'git add -A && git commit -m "fix median"',
+    'git diff main...HEAD',
+    'git log --oneline -5',
+    'git restore --staged lib/stats.mjs',
+    'node --test',
+    'ls -la',
+  ];
+  for (const command of allowed) {
+    const r = runHook(GIT_GUARD, [], bashCall(command));
+    assert.equal(r.status, 0, `不应拦截：${command}（stderr: ${r.stderr}）`);
+  }
+});
+
+test('git-guard：引号内字面 "git push" 不误报（commit message）', () => {
+  const r = runHook(GIT_GUARD, [], bashCall('git commit -m "do not git push from agents"'));
+  assert.equal(r.status, 0, r.stderr);
+});
+
+test('git-guard：非 Bash 工具与空命令不拦', () => {
+  for (const input of [
+    { tool_name: 'Write', tool_input: { file_path: '/x' } },
+    { tool_name: 'Bash', tool_input: {} },
+  ]) {
+    const r = runHook(GIT_GUARD, [], input);
+    assert.equal(r.status, 0);
+  }
 });
