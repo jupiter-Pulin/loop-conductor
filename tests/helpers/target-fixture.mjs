@@ -26,7 +26,7 @@ export function median(values) {
 }
 `;
 
-const TEST_FILE = `import test from 'node:test';
+export const TEST_FILE = `import test from 'node:test';
 import assert from 'node:assert/strict';
 import { median } from '../lib/stats.mjs';
 

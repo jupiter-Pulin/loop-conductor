@@ -2,6 +2,7 @@
 // fake-claude — 测试 stub，经 CLAUDE_BIN 注入 lib/claude.mjs。
 // 按调用序消费 FAKE_CLAUDE_SCRIPT（JSON 数组），每步可：
 //   actions: [{type:'writeFile', path, content}]  在 cwd（即任务 worktree）落盘文件
+//            [{type:'deleteFile', path}]          在 cwd 删除文件（对抗性删测试场景）
 //   exitCode: 非零则报错退出（模拟 CLI 失败 / resume 失效）
 //   session_id / cost / result: 拼成 --output-format stream-json 的 result 事件
 // 全部调用的 argv+cwd 追加记录到 FAKE_CLAUDE_LOG，测试据此断言（如 resume 是否带 -r）。
@@ -39,6 +40,8 @@ for (const a of step.actions ?? []) {
     const p = path.resolve(process.cwd(), a.path);
     fs.mkdirSync(path.dirname(p), { recursive: true });
     fs.writeFileSync(p, a.content);
+  } else if (a.type === 'deleteFile') {
+    fs.rmSync(path.resolve(process.cwd(), a.path), { force: true });
   } else {
     console.error(`fake-claude: unknown action type ${a.type}`);
     process.exit(2);
