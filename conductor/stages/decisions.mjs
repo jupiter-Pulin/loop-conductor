@@ -35,6 +35,53 @@ export const SPEC_VERIFIER_CONTRACT = Object.freeze({
 });
 
 /**
+ * merge commit 文案的程序级契约（committer 提案 → conductor 裁决）。
+ * type 白名单即 .claude/skills/git-conventions/SKILL.md 决策表的机器形态。
+ */
+export const COMMIT_MESSAGE_CONTRACT = Object.freeze({
+  id: 'commit-message/v1',
+  types: Object.freeze(['feat', 'fix', 'refactor', 'perf', 'test', 'docs', 'chore']),
+  subjectMaxLen: 72, // `type(scope): ` 之后的描述长度上限
+  bodyLineMaxLen: 100,
+});
+
+/**
+ * committer 提案的唯一裁判（绝不抛错）：subject 匹配
+ * ^(type)(\(scope\))?: 描述{1,72}$，单行、无首尾空白、不含 WIP；
+ * body 非空字符串且每行 ≤bodyLineMaxLen。合格返回 { ok:true, subject, body }。
+ * 不合格由调用方重试一次，再不过降级机器文案（fail-open，格式问题绝不 block merge）。
+ */
+export function validateCommitMessage(parsed) {
+  const { types, subjectMaxLen, bodyLineMaxLen } = COMMIT_MESSAGE_CONTRACT;
+  const errors = [];
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ok: false, errors: ['提案不是对象'] };
+  }
+  const { subject, body } = parsed;
+  if (typeof subject !== 'string' || subject.trim() === '') {
+    errors.push('subject 必须是非空字符串');
+  } else {
+    if (subject !== subject.trim() || subject.includes('\n')) {
+      errors.push('subject 必须单行且无首尾空白');
+    }
+    const re = new RegExp(`^(${types.join('|')})(\\(.+\\))?: .{1,${subjectMaxLen}}$`);
+    if (!re.test(subject)) {
+      errors.push(`subject 必须匹配 \`type(scope)?: 描述\`（type ∈ {${types.join('|')}}，描述 ≤${subjectMaxLen} 字符）`);
+    }
+    if (/\bwip\b/i.test(subject)) errors.push('subject 不得含 WIP');
+  }
+  if (typeof body !== 'string' || body.trim() === '') {
+    errors.push('body 必须是非空字符串（为什么 / 契约边界 / 验证 / 索引指针）');
+  } else {
+    body.split('\n').forEach((line, i) => {
+      if (line.length > bodyLineMaxLen) errors.push(`body 第 ${i + 1} 行超 ${bodyLineMaxLen} 字符`);
+    });
+  }
+  if (errors.length > 0) return { ok: false, errors };
+  return { ok: true, errors: [], subject, body };
+}
+
+/**
  * spawn 双标记判定：none | in-progress（上次崩溃）| done。
  * 崩溃收箱语义只对 maker 生效：maker 是唯一改 worktree 的角色，孤儿标记（有 started 无 done）
  * 意味着 worktree 可能停在半改状态，必须 FAILED_BOX(crashed) 等人工 retry（见 ready/fixing）。

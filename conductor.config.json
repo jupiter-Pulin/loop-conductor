@@ -8,7 +8,8 @@
     "spec": null,
     "specVerifier": null,
     "maker": null,
-    "verifier": null
+    "verifier": null,
+    "committer": null
   },
   "spawnRetries": 4,
   "spawnBackoffMs": [
