@@ -386,6 +386,27 @@ export function writeSpecAgentSettings(ts, cfg, round) {
 }
 
 /**
+ * 生成 maker 逐轮 settings 文件（git 护栏），落盘 dossier 留档，返回路径。
+ * PreToolUse(Bash)：拦截 push 与不可逆 git 操作（maker 只改代码，commit/merge 归 conductor）。
+ * 与 spec-agent settings 同理：显式 --settings 注入，不依赖 target 仓库自带设置。
+ */
+export function writeMakerSettings(ts, cfg, round) {
+  const q = (s) => JSON.stringify(s); // 路径含空格时 shell 安全
+  const guard = path.join(cfg.root, 'conductor', 'hooks', 'maker-git-guard.mjs');
+  const settings = {
+    hooks: {
+      PreToolUse: [{
+        matcher: 'Bash',
+        hooks: [{ type: 'command', command: `${q(process.execPath)} ${q(guard)}` }],
+      }],
+    },
+  };
+  const p = state.dossierPath(cfg, ts.id, `maker-r${round}.settings.json`);
+  state.writeJson(p, settings);
+  return p;
+}
+
+/**
  * conductor 契约门（权威终审）：读 spec-agent 直写的 specs/<id>.md，跑 validateSpecDoc，
  * 结果落盘 spec-check-r<n>.json（source=conductor）。返回 { ok, errors, acs }。
  * Stop hook 只是快反馈层——是否真跑过、跑的结果如何，conductor 一律不采信，这里重新裁。
@@ -812,6 +833,7 @@ export function buildVerifierPrompt(ts, cfg, round, acList) {
 export async function runMakerRound(ts, cfg, round, { mode, prompt, coldPrompt, wt }) {
   const id = ts.id;
   const streamFile = state.dossierPath(cfg, id, `maker-r${round}.stream.jsonl`);
+  const settings = writeMakerSettings(ts, cfg, round); // git 护栏，逐轮留档
   const rec = startSpawnRecord(cfg, id, 'maker', round, {
     mode,
     stream_file: path.relative(cfg.root, streamFile),
@@ -823,6 +845,7 @@ export async function runMakerRound(ts, cfg, round, { mode, prompt, coldPrompt, 
     permissionMode: 'acceptEdits',
     maxTurns: cfg.maxTurns,
     model: cfg.models?.maker ?? null,
+    settings,
     streamFile,
     inactivityTimeoutMs: cfg.inactivityTimeoutMs,
     wallClockMs: cfg.spawnWallClockMs,

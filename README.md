@@ -14,7 +14,7 @@
 | setup profile 存储 | `conductor/lib/profile.mjs` |
 | spec 交付契约（spec-doc/v1，AC 枚举/校验） | `conductor/lib/spec-contract.mjs` |
 | test gate 纯函数（测试 glob / 变更分类） | `conductor/lib/test-gate.mjs` |
-| spec-agent hook 脚本（写白名单、Stop 契约预检） | `conductor/hooks/` |
+| agent hook 脚本（spec 写白名单、Stop 契约预检、maker git 护栏） | `conductor/hooks/` |
 | 纯路由和 schema 判断 | `conductor/stages/decisions.mjs` |
 | agent 角色 prompt | `agents/*.md` |
 | 行为 case | `tests/integration/*.test.mjs` |
@@ -28,7 +28,7 @@
 | setup | `agents/setup-agent.md` | `conductor/stages/needs_target_setup.mjs` | 只读探索 target repo，产出可复用 setup profile。 |
 | spec | `agents/spec-agent.md` | `conductor/stages/needs_spec.mjs`, `conductor/stages/spec_fixing.mjs` | 直写 `specs/<id>.md`（唯一交付物，hook 写白名单 + Stop 预检 + conductor 契约门终审）。 |
 | spec-verifier | `agents/spec-verifier-agent.md` | `conductor/stages/spec_verify.mjs` | 用严格 JSON 审查 spec 质量。 |
-| maker | `agents/maker-agent.md` | `conductor/stages/ready.mjs`, `conductor/stages/fixing.mjs` | 修改任务 worktree，使冻结 spec 全部满足。 |
+| maker | `agents/maker-agent.md` | `conductor/stages/ready.mjs`, `conductor/stages/fixing.mjs` | 修改任务 worktree，使冻结 spec 全部满足（git 破坏性操作由逐轮 settings hook 拦截）。 |
 | verifier | `agents/verifier-agent.md` | `conductor/stages/verify.mjs` | 冷读 spec + diff，逐条裁决 AC。 |
 
 ## 状态流
@@ -90,6 +90,7 @@ npm run conductor -- retry <id>
 | feature spec 审批路径 | `tests/integration/feature-flow.test.mjs` |
 | setup gate + spec repair loop | `tests/integration/setup-spec-loop.test.mjs` |
 | spec 直写交付 + 契约门（hook 护栏） | `tests/integration/spec-contract-gate.test.mjs` |
+| maker git 护栏（--settings 注入形态） | `tests/integration/maker-git-guard.test.mjs` |
 | green gate 修复路径 | `tests/integration/green-gate.test.mjs` |
 | test gate 空转测试拦截 | `tests/integration/test-gate.test.mjs` |
 | verifier fail repair context | `tests/integration/verifier-fail.test.mjs` |
