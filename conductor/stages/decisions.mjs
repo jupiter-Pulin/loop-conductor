@@ -61,6 +61,15 @@ export function greenGatePassed(exitCode) {
 }
 
 /**
+ * test gate（基线空转测试探针）单侧判定：只有「当前测试叠加到基线后 testCommand 仍
+ * exit 0」才是 vacuous（测试没钉住 spec 要求的新行为）；红/超时（exit_code=null）/
+ * 跑不起来一律 falsifies——绝不因基线本身烂或基建抖动误伤 maker。
+ */
+export function testGateVerdict(exitCode) {
+  return exitCode === 0 ? 'vacuous' : 'falsifies';
+}
+
+/**
  * maker 轮次的唯一推导点。不变量：maker 轮次恒等于 miss+1（READY 时 miss=0 → r1，
  * FIXING 时 miss==1 → r2、miss==2 → r3）。`runtime.current_round` 仅为记录性字段，
  * 供人排查 timeline 时对照，绝不作路由依据。
