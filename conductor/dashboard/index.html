@@ -6,11 +6,12 @@
 <title>Loop Conductor Dashboard</title>
 <style>
   :root {
-    --bg: #faf6ee;
+    --bg: #f2ecdf;
     --card-bg: #ffffff;
-    --border: #e4ddd0;
+    --shell-bg: #fbf8f1;
+    --border: #d9cfbc;
     --text: #2b2a28;
-    --muted: #8a8378;
+    --muted: #7a7264;
     --blue: #2b6cb0;
     --blue-dark: #1d4e82;
     --red: #c0392b;
@@ -21,9 +22,15 @@
   * { box-sizing: border-box; }
   body {
     margin: 0;
+    padding: 28px 20px 56px;
     background: var(--bg);
     color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  .board-shell {
+    max-width: 1080px; margin: 0 auto; background: var(--shell-bg);
+    border: 1px solid var(--border); border-radius: 16px;
+    box-shadow: 0 2px 12px rgba(60,50,30,.06); padding: 6px 0 20px;
   }
   h1, h2, h3, .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; }
   header.top {
@@ -47,8 +54,8 @@
     border: 1px solid var(--border); background: #fff; border-radius: 20px;
     padding: 6px 14px; font-size: 13px; font-weight: 600;
   }
-  .box-toggle.done { color: var(--green); }
-  .box-toggle.failed { color: var(--red); }
+  .box-toggle.done { color: var(--green); background: #e7f2ea; border-color: #bedccb; }
+  .box-toggle.failed { color: var(--red); background: #faeae6; border-color: #eac9c1; }
   .collapsible { padding: 0 28px 12px; display: flex; flex-direction: column; gap: 6px; }
   .collapsible[hidden] { display: none; }
   .box-row {
@@ -57,20 +64,25 @@
   }
   .box-row:hover { border-color: var(--muted); }
 
-  main { padding: 0 28px 40px; }
-  .lane { margin-bottom: 22px; }
+  main { padding: 0 28px 8px; }
+  .lane { padding: 16px 0 20px; border-top: 1px solid var(--border); margin: 0; }
   .lane-header {
-    display: flex; align-items: center; gap: 8px; text-transform: uppercase;
-    font-size: 12px; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 8px;
+    display: flex; align-items: baseline; gap: 10px;
+    margin-bottom: 10px;
   }
-  .lane-header .you-label { color: var(--muted); text-transform: none; font-size: 11px; }
+  .lane-name {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 15px; font-weight: 700; color: var(--text);
+  }
+  .lane-sub { font-size: 12px; color: var(--muted); }
+  .lane-header .you-label { color: var(--muted); font-size: 12px; }
   .lane-flag { color: var(--orange); }
   .lane-row { display: flex; gap: 12px; flex-wrap: wrap; }
 
   .card {
     background: var(--card-bg); border: 1px solid var(--border); border-left: 4px solid transparent;
     border-radius: 10px; padding: 10px 14px; min-width: 230px; max-width: 280px;
-    box-shadow: 0 1px 2px rgba(0,0,0,.05); cursor: pointer;
+    box-shadow: 0 1px 3px rgba(60,50,30,.10); cursor: pointer;
   }
   .card:hover { border-color: var(--muted); }
   .card.needs-human { border-left-color: var(--orange); background: var(--orange-bg); }
@@ -145,6 +157,7 @@
 </style>
 </head>
 <body>
+<div class="board-shell">
 <header class="top">
   <h1>Tasks · by agent</h1>
   <button class="btn btn-primary" id="btn-new-task">+ 新建任务</button>
@@ -161,6 +174,7 @@
   <div id="broken-banner-slot"></div>
   <div id="lanes"></div>
 </main>
+</div>
 
 <div class="overlay align-right" id="drawer-overlay" hidden>
   <div class="drawer" id="drawer"></div>
@@ -243,9 +257,9 @@ function renderLanes(board) {
     const laneData = board.lanes.find((l) => l.lane === laneDef.key) || { tasks: [] };
     const hasHuman = laneData.tasks.some((t) => t.needsHuman);
     const header = el('div', { class: 'lane-header' }, [
-      el('span', { text: laneDef.label }),
+      el('span', { class: 'lane-name', text: laneDef.label }),
       hasHuman ? el('span', { class: 'lane-flag', text: '⚑' }) : null,
-      laneDef.you ? el('span', { class: 'you-label', text: 'you · merge' }) : null,
+      el('span', { class: 'lane-sub', text: laneDef.you ? 'you · merge' : `${laneDef.label} agent` }),
     ]);
     const row = el('div', { class: 'lane-row' });
     if (laneData.tasks.length === 0) {
