@@ -9,7 +9,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import * as state from '../lib/state.mjs';
-import { runClaude } from '../lib/claude.mjs';
+import { runClaudeWithRetry } from '../lib/claude.mjs';
 import {
   parseStrictJson, validateVerifierVerdict, verdictNext, verifierInvalidNext, makerMissNext, makerRound,
 } from './decisions.mjs';
@@ -45,7 +45,7 @@ export default async function verifyHandler(ts, cfg) {
   const rec = startSpawnRecord(cfg, id, 'verifier', round, {
     stream_file: path.relative(cfg.root, streamFile),
   });
-  const res = await runClaude({
+  const res = await runClaudeWithRetry({
     cwd: worktreePath(cfg, id),
     prompt,
     maxTurns: cfg.maxTurns,
@@ -55,11 +55,23 @@ export default async function verifyHandler(ts, cfg) {
     streamFile,
     inactivityTimeoutMs: cfg.inactivityTimeoutMs,
     wallClockMs: cfg.spawnWallClockMs,
+  }, {
+    retries: cfg.spawnRetries,
+    backoffMs: cfg.spawnBackoffMs,
+    onRetry: ({ attempt, status }) =>
+      state.appendTimeline(cfg, id, `verifier r${round} transient retry attempt ${attempt} (status=${status ?? 'spawn-error'})`),
   });
   finishSpawnRecord(rec, res);
   addCost(ts, res.costUsd, cfg);
   if (res.costUnknown) state.appendTimeline(cfg, id, `verifier r${round} cost unknown; spent_usd uses lower-bound accounting`);
   state.saveRuntime(ts); // 成本先落盘
+
+  if (!res.ok) {
+    // 基建失败（spawn 错误 / killed / 非零退出 / 无 result 事件，瞬态重试已耗尽）：
+    // 不是 verifier 的协议失败，不计 invalid、不动 verifier_invalid_count，留在 VERIFY 下次 run 重 spawn。
+    state.appendTimeline(cfg, id, `verifier r${round} 基建失败（${res.error ?? 'unknown'}），任务留在 VERIFY，下次 run 重试`);
+    return { changed: false };
+  }
 
   // 严格解析 + schema 校验：绝不在叙事里打捞 JSON。
   const parsed = parseStrictJson(res.result);

@@ -2,7 +2,7 @@
 // pass → AWAIT_SPEC_APPROVAL；fail → SPEC_FIXING，第三次 fail 冷启动新 spec-agent。
 import fs from 'node:fs';
 import path from 'node:path';
-import { runClaude } from '../lib/claude.mjs';
+import { runClaudeWithRetry } from '../lib/claude.mjs';
 import * as state from '../lib/state.mjs';
 import {
   parseStrictJson, specMissNext, specVerifierInvalidNext, validateSpecVerifierVerdict,
@@ -39,7 +39,7 @@ export default async function specVerifyHandler(ts, cfg) {
   const rec = startSpawnRecord(cfg, id, 'spec-verifier', round, {
     stream_file: path.relative(cfg.root, streamFile),
   });
-  const res = await runClaude({
+  const res = await runClaudeWithRetry({
     cwd: cfg.targetRepo,
     prompt: buildSpecVerifierPrompt(ts, cfg, round),
     maxTurns: cfg.maxTurns,
@@ -49,11 +49,23 @@ export default async function specVerifyHandler(ts, cfg) {
     streamFile,
     inactivityTimeoutMs: cfg.inactivityTimeoutMs,
     wallClockMs: cfg.spawnWallClockMs,
+  }, {
+    retries: cfg.spawnRetries,
+    backoffMs: cfg.spawnBackoffMs,
+    onRetry: ({ attempt, status }) =>
+      state.appendTimeline(cfg, id, `spec-verifier r${round} transient retry attempt ${attempt} (status=${status ?? 'spawn-error'})`),
   });
   finishSpawnRecord(rec, res);
   addCost(ts, res.costUsd, cfg);
   if (res.costUnknown) state.appendTimeline(cfg, id, `spec-verifier r${round} cost unknown; spent_usd uses lower-bound accounting`);
   state.saveRuntime(ts);
+
+  if (!res.ok) {
+    // 基建失败：不是 spec-verifier 的协议失败，不计 invalid、不动 spec_verifier_invalid_count，
+    // 留在 SPEC_VERIFY 下次 run 重 spawn。
+    state.appendTimeline(cfg, id, `spec-verifier r${round} 基建失败（${res.error ?? 'unknown'}），任务留在 SPEC_VERIFY，下次 run 重试`);
+    return { changed: false };
+  }
 
   const parsed = parseStrictJson(res.result);
   const check = validateSpecVerifierVerdict(parsed);
