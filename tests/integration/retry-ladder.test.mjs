@@ -57,6 +57,12 @@ test('verdict fail×3：1/2/3 阶梯 → FAILED_BOX；retry 复活', (t) => {
   // verifier_invalid_count 全程为 0（valid fail 不算协议失败）
   assert.equal(after.runtime.verifier_invalid_count, 0);
 
+  // retry 前：三轮 maker/verifier 的 stream-json 留档应已落在 dossier 根目录
+  for (const n of [1, 2, 3]) {
+    assert.ok(fs.existsSync(env.dossier(id, `maker-r${n}.stream.jsonl`)), `retry 前 maker-r${n}.stream.jsonl 应存在于根目录`);
+    assert.ok(fs.existsSync(env.dossier(id, `verifier-r${n}.stream.jsonl`)), `retry 前 verifier-r${n}.stream.jsonl 应存在于根目录`);
+  }
+
   // retry：FAILED_BOX → READY，重置 miss，案卷保留（轮次产物移入 attempts/）
   const retry = env.run('retry', id);
   assert.equal(retry.status, 0, retry.stderr);
@@ -69,6 +75,15 @@ test('verdict fail×3：1/2/3 阶梯 → FAILED_BOX；retry 复活', (t) => {
   assert.ok(!fs.existsSync(env.dossier(id, 'maker-r1.json')), '轮次标记已腾出命名空间');
   assert.ok(fs.existsSync(env.dossier(id, 'attempts')), '历史轮次产物保留在 attempts/');
   assert.ok(fs.existsSync(env.dossier(id, 'timeline.md')), 'timeline 保留');
+
+  // AC-001：retry 后 dossier 根目录不残留任何 *.stream.jsonl，全部移入 attempts/<ts>/
+  const rootEntries = fs.readdirSync(env.dossier(id));
+  assert.ok(!rootEntries.some((n) => n.endsWith('.stream.jsonl')), `dossier 根目录不应残留 stream.jsonl，实际：${rootEntries.join(',')}`);
+  const archivedEntries = fs.readdirSync(env.dossier(id, 'attempts'), { recursive: true });
+  for (const n of [1, 2, 3]) {
+    assert.ok(archivedEntries.some((p) => p.endsWith(`maker-r${n}.stream.jsonl`)), `maker-r${n}.stream.jsonl 应归档到 attempts/`);
+    assert.ok(archivedEntries.some((p) => p.endsWith(`verifier-r${n}.stream.jsonl`)), `verifier-r${n}.stream.jsonl 应归档到 attempts/`);
+  }
 });
 
 test('resume 失败自动降级为冷启动，阶梯顺延', (t) => {
