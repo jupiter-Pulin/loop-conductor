@@ -124,6 +124,24 @@ function readTimelineText(cfg, id) {
   try { return fs.readFileSync(state.dossierPath(cfg, id, 'timeline.md'), 'utf8'); } catch { return ''; }
 }
 
+// ---- timeline 原文 → 结构化条目（AC-001） ----
+
+const TIMELINE_LINE_RE = /^-\s+(\S+)\s+([\s\S]*)$/;
+
+/** timeline.md 原文（appendTimeline 的 `- <ISO时间戳> <正文>` 格式）→ [{ ts, text }]。
+ *  不符合格式的行保留原文、ts 置 null；不丢弃、不抛错。 */
+export function parseTimeline(text) {
+  if (!text) return [];
+  return text.split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '')
+    .map((line) => {
+      const m = line.match(TIMELINE_LINE_RE);
+      if (m && !Number.isNaN(Date.parse(m[1]))) return { ts: m[1], text: m[2] };
+      return { ts: null, text: line };
+    });
+}
+
 function buildSetupReview(cfg) {
   const draft = setupProfilePaths(cfg).draft;
   try {
@@ -175,6 +193,7 @@ export function buildTaskDetail(cfg, id) {
   const ts = findTaskAnyBox(cfg, id);
   if (!ts) return null;
   const timeline = readTimelineText(cfg, id);
+  const timelineEntries = parseTimeline(timeline);
   const paths = {
     taskDir: ts.dir,
     specDraft: path.join(cfg.specsDir, `${id}.md`),
@@ -183,7 +202,7 @@ export function buildTaskDetail(cfg, id) {
   if (ts.error) {
     return {
       task: null, runtime: null, box: ts.box, lane: null, needsHuman: false, working: false,
-      timeline, paths, review: { kind: 'broken', error: ts.error },
+      timeline, timelineEntries, paths, review: { kind: 'broken', error: ts.error },
     };
   }
   const stage = ts.runtime.stage;
@@ -194,6 +213,7 @@ export function buildTaskDetail(cfg, id) {
     lane: laneForStage(stage),
     ...computeWorkingFlags(ts.box, stage),
     timeline,
+    timelineEntries,
     paths,
     review: buildReview(cfg, ts, stage),
   };
