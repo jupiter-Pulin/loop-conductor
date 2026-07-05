@@ -41,7 +41,11 @@
   }
   header.top h1 { margin: 0; font-size: 20px; letter-spacing: 0.02em; }
   button { font: inherit; cursor: pointer; }
-  .btn { border: none; border-radius: 8px; padding: 8px 16px; font-weight: 600; }
+  .btn {
+    border: none; border-radius: 8px; padding: 8px 16px; font-weight: 600;
+    transition: background .15s ease, color .15s ease, transform .1s ease, box-shadow .15s ease;
+  }
+  .btn:active { transform: scale(.97); }
   .btn-primary { background: var(--blue); color: #fff; }
   .btn-primary:hover { background: var(--blue-dark); }
   .btn-primary:disabled { background: #a9c3dd; cursor: not-allowed; }
@@ -53,19 +57,29 @@
   .box-toggle {
     border: 1px solid var(--border); background: #fff; border-radius: 20px;
     padding: 6px 14px; font-size: 13px; font-weight: 600;
+    transition: transform .12s ease, box-shadow .15s ease;
   }
+  .box-toggle:hover { transform: translateY(-1px); box-shadow: 0 2px 6px rgba(60,50,30,.10); }
   .box-toggle.done { color: var(--green); background: #e7f2ea; border-color: #bedccb; }
   .box-toggle.failed { color: var(--red); background: #faeae6; border-color: #eac9c1; }
-  .collapsible { padding: 0 28px 12px; display: flex; flex-direction: column; gap: 6px; }
-  .collapsible[hidden] { display: none; }
+  .collapsible {
+    display: grid; grid-template-rows: 0fr; transition: grid-template-rows .28s ease;
+    padding: 0 28px;
+  }
+  .collapsible.open { grid-template-rows: 1fr; padding-bottom: 12px; }
+  .collapsible-inner { overflow: hidden; min-height: 0; display: flex; flex-direction: column; gap: 6px; }
   .box-row {
     display: flex; gap: 10px; align-items: center; background: #fff; border: 1px solid var(--border);
     border-radius: 8px; padding: 8px 12px; font-size: 13px; cursor: pointer;
+    transition: border-color .15s ease, transform .12s ease;
   }
-  .box-row:hover { border-color: var(--muted); }
+  .box-row:hover { border-color: var(--muted); transform: translateX(2px); }
 
   main { padding: 0 28px 8px; }
-  .lane { padding: 16px 0 20px; border-top: 1px solid var(--border); margin: 0; }
+  .lane {
+    padding: 16px 0 20px; border-top: 1px solid var(--border); margin: 0;
+    animation: fade-up .4s ease both; animation-delay: calc(var(--lane-i, 0) * 50ms);
+  }
   .lane-header {
     display: flex; align-items: baseline; gap: 10px;
     margin-bottom: 10px;
@@ -83,9 +97,14 @@
     background: var(--card-bg); border: 1px solid var(--border); border-left: 4px solid transparent;
     border-radius: 10px; padding: 10px 14px; min-width: 230px; max-width: 280px;
     box-shadow: 0 1px 3px rgba(60,50,30,.10); cursor: pointer;
+    transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease;
   }
-  .card:hover { border-color: var(--muted); }
-  .card.needs-human { border-left-color: var(--orange); background: var(--orange-bg); }
+  .card:hover { border-color: var(--muted); transform: translateY(-2px); box-shadow: 0 4px 12px rgba(60,50,30,.14); }
+  .card.needs-human { border-left-color: var(--orange); background: var(--orange-bg); animation: beacon 2.6s ease-in-out infinite; }
+  .card.card-enter { animation: fade-up .35s ease both; }
+  .card.needs-human.card-enter { animation: fade-up .35s ease both, beacon 2.6s ease-in-out .35s infinite; }
+  .card.card-updated { animation: update-flash .8s ease both; }
+  .card.needs-human.card-updated { animation: beacon 2.6s ease-in-out infinite; }
   .card .top-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
   .badge { font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 5px; letter-spacing: .03em; }
   .badge-kind.feature { background: #dbe9f8; color: var(--blue-dark); }
@@ -99,29 +118,42 @@
   }
   .card .review-btn { margin-top: 8px; display: inline-block; font-size: 12px; font-weight: 700; color: var(--orange); }
   .card .working { margin-top: 8px; font-size: 12px; color: var(--muted); }
+  .spin { display: inline-block; animation: spin 1.4s linear infinite; }
   .idle-card {
     border: 1px dashed var(--border); border-radius: 10px; padding: 14px; color: var(--muted);
     font-size: 12px; min-width: 230px;
   }
 
-  .overlay { position: fixed; inset: 0; background: rgba(30,26,20,.35); display: flex; z-index: 50; }
+  .overlay { position: fixed; inset: 0; background: rgba(30,26,20,0); display: flex; z-index: 50; transition: background .22s ease; }
+  .overlay.open { background: rgba(30,26,20,.35); }
   .overlay[hidden] { display: none; }
   .overlay.align-right { justify-content: flex-end; }
   .overlay.align-center { justify-content: center; align-items: center; }
 
-  .drawer { width: 680px; max-width: 95vw; height: 100%; background: #fff; overflow-y: auto; padding: 24px; }
+  .drawer {
+    width: 680px; max-width: 95vw; height: 100%; background: #fff; overflow-y: auto; padding: 24px;
+    transform: translateX(48px); opacity: 0;
+    transition: transform .28s cubic-bezier(.2,.8,.2,1), opacity .22s ease;
+  }
+  .overlay.open .drawer { transform: none; opacity: 1; }
   .panel {
     width: 560px; max-width: 95vw; max-height: 90vh; overflow-y: auto; background: #fff;
     border-radius: 12px; padding: 24px;
+    transform: scale(.96) translateY(8px); opacity: 0;
+    transition: transform .24s cubic-bezier(.2,.8,.2,1), opacity .2s ease;
   }
+  .overlay.open .panel { transform: none; opacity: 1; }
   .drawer-header, .panel-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
   .close-x { background: none; border: none; font-size: 20px; color: var(--muted); }
 
   .stage-dots { display: flex; align-items: flex-start; gap: 4px; margin: 16px 0 20px; }
   .dot-group { display: flex; flex-direction: column; align-items: center; gap: 4px; flex-shrink: 0; }
-  .dot { width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--border); background: #fff; flex-shrink: 0; }
+  .dot {
+    width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--border); background: #fff; flex-shrink: 0;
+    transition: background .3s ease, border-color .3s ease;
+  }
   .dot.done { background: var(--muted); border-color: var(--muted); }
-  .dot.current { background: var(--orange); border-color: var(--orange); }
+  .dot.current { background: var(--orange); border-color: var(--orange); animation: dot-ring 2.2s ease-out infinite; }
   .dot-label { font-size: 10px; color: var(--muted); white-space: nowrap; }
   .dot-label.done { color: var(--text); }
   .dot-label.current { color: var(--orange); font-weight: 700; }
@@ -130,7 +162,28 @@
   .drawer-body { display: flex; gap: 24px; }
   .main-col { flex: 1; min-width: 0; }
   .timeline-col { width: 220px; flex-shrink: 0; border-left: 1px solid var(--border); padding-left: 16px; }
-  .timeline-item { font-size: 12px; margin-bottom: 12px; color: var(--muted); }
+  .timeline-item {
+    font-size: 12px; margin-bottom: 12px; color: var(--muted);
+    animation: fade-up .35s ease both; animation-delay: calc(var(--i, 0) * 30ms);
+  }
+
+  @keyframes fade-up { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes beacon {
+    0%, 100% { box-shadow: 0 1px 3px rgba(60,50,30,.10); }
+    50% { box-shadow: 0 1px 3px rgba(60,50,30,.10), 0 0 0 5px rgba(217,126,31,.12); }
+  }
+  @keyframes dot-ring {
+    0% { box-shadow: 0 0 0 0 rgba(217,126,31,.35); }
+    70%, 100% { box-shadow: 0 0 0 8px rgba(217,126,31,0); }
+  }
+  @keyframes update-flash {
+    0% { background: var(--orange-bg); }
+    100% { background: var(--card-bg); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+  }
 
   pre.readonly {
     white-space: pre-wrap; word-break: break-word; background: #faf8f4; border: 1px solid var(--border);
@@ -167,8 +220,8 @@
   <button class="box-toggle done" id="toggle-done">✓ Done · <span id="done-count">0</span></button>
   <button class="box-toggle failed" id="toggle-failed">✕ Failed · <span id="failed-count">0</span></button>
 </div>
-<div class="collapsible" id="done-list" hidden></div>
-<div class="collapsible" id="failed-list" hidden></div>
+<div class="collapsible" id="done-wrap"><div class="collapsible-inner" id="done-list"></div></div>
+<div class="collapsible" id="failed-wrap"><div class="collapsible-inner" id="failed-list"></div></div>
 
 <main>
   <div id="broken-banner-slot"></div>
@@ -225,11 +278,23 @@ async function api(path, opts) {
 
 function fmtUsd(n) { return `$${Number(n || 0).toFixed(2)}`; }
 
-// ---- 屏 1：看板 ----
+// ---- 屏 1：看板（keyed 增量渲染：卡片按任务 id 复用节点，签名变化才重建，避免轮询闪烁） ----
 
-function taskCard(entry) {
+const cardCache = new Map(); // id -> { node, sig }
+const laneEls = new Map();   // lane key -> { flag, row }
+
+function workingLabel() {
+  return el('div', { class: 'working' }, [el('span', { class: 'spin', text: '↻' }), ' working…']);
+}
+
+function cardSig(entry) {
+  return [entry.stage, entry.needsHuman, entry.working, entry.spentUsd, entry.kind, entry.title].join('|');
+}
+
+function buildCardNode(entry) {
   const card = el('div', {
     class: 'card' + (entry.needsHuman ? ' needs-human' : ''),
+    'data-id': entry.id,
     onclick: () => openDrawer(entry.id),
   }, [
     el('div', { class: 'top-row' }, [
@@ -245,33 +310,75 @@ function taskCard(entry) {
     card.appendChild(el('div', { class: 'needs-you', text: '⚑ needs you' }));
     card.appendChild(el('div', { class: 'review-btn', text: 'Review →' }));
   } else if (entry.working) {
-    card.appendChild(el('div', { class: 'working', text: '↻ working…' }));
+    card.appendChild(workingLabel());
   }
   return card;
 }
 
-function renderLanes(board) {
+/** 泳道骨架只建一次；轮询只做 per-lane 补丁。 */
+function ensureLaneSkeleton() {
+  if (laneEls.size > 0) return;
   const container = document.getElementById('lanes');
-  container.innerHTML = '';
-  for (const laneDef of LANES) {
-    const laneData = board.lanes.find((l) => l.lane === laneDef.key) || { tasks: [] };
-    const hasHuman = laneData.tasks.some((t) => t.needsHuman);
+  LANES.forEach((laneDef, i) => {
+    const flag = el('span', { class: 'lane-flag', text: '⚑' });
+    flag.style.display = 'none';
     const header = el('div', { class: 'lane-header' }, [
       el('span', { class: 'lane-name', text: laneDef.label }),
-      hasHuman ? el('span', { class: 'lane-flag', text: '⚑' }) : null,
+      flag,
       el('span', { class: 'lane-sub', text: laneDef.you ? 'you · merge' : `${laneDef.label} agent` }),
     ]);
     const row = el('div', { class: 'lane-row' });
-    if (laneData.tasks.length === 0) {
-      row.appendChild(el('div', { class: 'idle-card', text: 'idle · 无任务' }));
-    } else {
-      for (const entry of laneData.tasks) row.appendChild(taskCard(entry));
+    const lane = el('div', { class: 'lane' }, [header, row]);
+    lane.style.setProperty('--lane-i', i);
+    container.appendChild(lane);
+    laneEls.set(laneDef.key, { flag, row });
+  });
+}
+
+function renderLanes(board) {
+  ensureLaneSkeleton();
+  const seen = new Set();
+  for (const laneDef of LANES) {
+    const { flag, row } = laneEls.get(laneDef.key);
+    const laneData = board.lanes.find((l) => l.lane === laneDef.key) || { tasks: [] };
+    flag.style.display = laneData.tasks.some((t) => t.needsHuman) ? '' : 'none';
+    const idle = row.querySelector('.idle-card');
+    if (laneData.tasks.length > 0 && idle) idle.remove();
+    let anchor = null; // 已就位的前一张卡，用于保序且不打扰未变动节点（DOM 重插会重置 CSS 动画）
+    for (const entry of laneData.tasks) {
+      seen.add(entry.id);
+      const sig = cardSig(entry);
+      let cached = cardCache.get(entry.id);
+      if (!cached) {
+        cached = { node: buildCardNode(entry), sig };
+        cached.node.classList.add('card-enter');
+        cardCache.set(entry.id, cached);
+      } else if (cached.sig !== sig) {
+        const fresh = buildCardNode(entry);
+        fresh.classList.add('card-updated');
+        if (cached.node.parentNode) cached.node.replaceWith(fresh);
+        cached.node = fresh;
+        cached.sig = sig;
+      }
+      const expected = anchor ? anchor.nextSibling : row.firstChild;
+      if (cached.node !== expected) row.insertBefore(cached.node, expected);
+      anchor = cached.node;
     }
-    container.appendChild(el('div', { class: 'lane' }, [header, row]));
+    if (laneData.tasks.length === 0 && !row.querySelector('.idle-card')) {
+      row.appendChild(el('div', { class: 'idle-card', text: 'idle · 无任务' }));
+    }
+  }
+  for (const [id, cached] of cardCache) {
+    if (!seen.has(id)) { cached.node.remove(); cardCache.delete(id); }
   }
 }
 
+const boxListSig = new Map(); // containerId -> 上次渲染的内容签名（变化才重建，保住 hover 与动画）
+
 function renderBoxList(containerId, tasks) {
+  const sig = tasks.map((t) => `${t.id}|${t.kind}|${t.title}|${t.spentUsd}`).join(';');
+  if (boxListSig.get(containerId) === sig) return;
+  boxListSig.set(containerId, sig);
   const container = document.getElementById(containerId);
   container.innerHTML = '';
   for (const entry of tasks) {
@@ -307,13 +414,28 @@ async function loadBoard() {
 }
 
 document.getElementById('toggle-done').addEventListener('click', () => {
-  const list = document.getElementById('done-list');
-  list.hidden = !list.hidden;
+  document.getElementById('done-wrap').classList.toggle('open');
 });
 document.getElementById('toggle-failed').addEventListener('click', () => {
-  const list = document.getElementById('failed-list');
-  list.hidden = !list.hidden;
+  document.getElementById('failed-wrap').classList.toggle('open');
 });
+
+// ---- overlay 开合（class 驱动过渡；hidden 只负责最终 display） ----
+
+const overlayHideTimers = new Map();
+
+function showOverlay(id) {
+  const ov = document.getElementById(id);
+  clearTimeout(overlayHideTimers.get(id)); // 取消未决的延迟隐藏，避免快速重开被藏掉
+  ov.hidden = false;
+  requestAnimationFrame(() => requestAnimationFrame(() => ov.classList.add('open')));
+}
+
+function hideOverlay(id) {
+  const ov = document.getElementById(id);
+  ov.classList.remove('open');
+  overlayHideTimers.set(id, setTimeout(() => { ov.hidden = true; }, 240));
+}
 
 // ---- 屏 2：详情抽屉 ----
 
@@ -322,14 +444,14 @@ function closeDrawer() {
   lastDetail = null;
   selectedOption = null;
   pendingActionMessage = null;
-  document.getElementById('drawer-overlay').hidden = true;
+  hideOverlay('drawer-overlay');
 }
 
 async function openDrawer(id) {
   drawerTaskId = id;
   selectedOption = null;
   pendingActionMessage = null;
-  document.getElementById('drawer-overlay').hidden = false;
+  showOverlay('drawer-overlay');
   await refreshDrawer();
 }
 
@@ -492,7 +614,7 @@ function renderDrawer(drawer, id, detail) {
     mainCol.appendChild(el('div', { class: 'broken-banner', text: review.error }));
   } else {
     mainCol.appendChild(el('div', { text: `当前 stage：${runtime ? runtime.stage : '?'}` }));
-    if (detail.working === true) mainCol.appendChild(el('div', { class: 'working', text: '↻ working…' }));
+    if (detail.working === true) mainCol.appendChild(workingLabel());
   }
 
   mainCol.appendChild(resultSlot);
@@ -503,10 +625,12 @@ function renderDrawer(drawer, id, detail) {
   if (entries.length === 0) {
     timelineCol.appendChild(el('div', { class: 'timeline-item', text: '(无记录)' }));
   } else {
-    for (const entry of entries) {
+    entries.forEach((entry, i) => {
       const prefix = entry.ts == null ? '' : `${formatLocalTimestamp(entry.ts)} `;
-      timelineCol.appendChild(el('div', { class: 'timeline-item', text: `${prefix}${entry.text}` }));
-    }
+      const item = el('div', { class: 'timeline-item', text: `${prefix}${entry.text}` });
+      item.style.setProperty('--i', Math.min(i, 12));
+      timelineCol.appendChild(item);
+    });
   }
   body.appendChild(timelineCol);
   drawer.appendChild(body);
@@ -522,11 +646,11 @@ let newTaskState = { kind: null, feasibility: null };
 
 document.getElementById('btn-new-task').addEventListener('click', () => {
   newTaskState = { kind: null, feasibility: null };
-  document.getElementById('panel-overlay').hidden = false;
+  showOverlay('panel-overlay');
   renderNewTaskPanel();
 });
 document.getElementById('panel-overlay').addEventListener('click', (e) => {
-  if (e.target.id === 'panel-overlay') document.getElementById('panel-overlay').hidden = true;
+  if (e.target.id === 'panel-overlay') hideOverlay('panel-overlay');
 });
 
 function renderNewTaskPanel(resultBody) {
@@ -534,7 +658,7 @@ function renderNewTaskPanel(resultBody) {
   panel.innerHTML = '';
   panel.appendChild(el('div', { class: 'panel-header' }, [
     el('h2', { text: '新建任务' }),
-    el('button', { class: 'close-x', text: '×', onclick: () => { document.getElementById('panel-overlay').hidden = true; } }),
+    el('button', { class: 'close-x', text: '×', onclick: () => hideOverlay('panel-overlay') }),
   ]));
 
   const kindWrap = el('div', { class: 'kind-cards' });
@@ -600,7 +724,7 @@ function renderNewTaskPanel(resultBody) {
   submitBtn.disabled = !newTaskState.kind;
   const cancelBtn = el('button', {
     class: 'btn btn-ghost', text: '取消',
-    onclick: () => { document.getElementById('panel-overlay').hidden = true; },
+    onclick: () => hideOverlay('panel-overlay'),
   });
   panel.appendChild(el('div', { class: 'action-row' }, [submitBtn, cancelBtn]));
   panel.appendChild(resultSlot);
