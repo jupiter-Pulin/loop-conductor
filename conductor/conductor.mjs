@@ -469,19 +469,63 @@ async function cmdMerge(cfg, id) {
 
 // ---- retry ----
 
-/** 把上一攻坚周期的轮次产物移入 attempts/<ts>/（保留案卷，腾出轮次命名空间）。 */
-function archiveRoundArtifacts(cfg, id) {
+/** 把 dossier 内匹配 pattern 的产物移入 attempts/<ts>/；无匹配则不建目录，返回 0。 */
+function archiveArtifactsMatching(cfg, id, pattern) {
   const dir = state.dossierPath(cfg, id);
   let names = [];
   try { names = fs.readdirSync(dir); } catch { return 0; }
-  const targets = names.filter((n) => /^((setup|spec-agent|spec-verifier|maker|verifier)-r\d+\.stream\.jsonl|maker-r\d+\.json|maker-r\d+\.settings\.json|verifier-r\d+\.json|setup-r\d+\.json|spec-agent-r\d+\.json|spec-agent-r\d+\.settings\.json|spec-verifier-r\d+\.json|verify-r\d+\.(md|verdict\.json)|verify-r\d+\.invalid-a\d+\.json|spec-verify-r\d+\.(md|verdict\.json)|spec-verify-r\d+\.invalid-a\d+\.json|spec-check-r\d+(\.hook)?\.json|green-gate-r\d+\.json|test-gate-r\d+\.json|repair-context-r\d+\.json|spec-repair-context-r\d+\.json|review-findings\.md)$/.test(n));
+  const targets = names.filter((n) => pattern.test(n));
   if (targets.length === 0) return 0;
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const dest = path.join(dir, 'attempts', stamp);
   fs.mkdirSync(dest, { recursive: true });
   for (const n of targets) fs.renameSync(path.join(dir, n), path.join(dest, n));
-  state.appendTimeline(cfg, id, `retry：${targets.length} 个轮次产物移入 attempts/${stamp}/（案卷保留）`);
   return targets.length;
+}
+
+/** 把上一攻坚周期的轮次产物移入 attempts/<ts>/（保留案卷，腾出轮次命名空间）。 */
+function archiveRoundArtifacts(cfg, id) {
+  const n = archiveArtifactsMatching(cfg, id, /^((setup|spec-agent|spec-verifier|maker|verifier)-r\d+\.stream\.jsonl|maker-r\d+\.json|maker-r\d+\.settings\.json|verifier-r\d+\.json|setup-r\d+\.json|spec-agent-r\d+\.json|spec-agent-r\d+\.settings\.json|spec-verifier-r\d+\.json|verify-r\d+\.(md|verdict\.json)|verify-r\d+\.invalid-a\d+\.json|spec-verify-r\d+\.(md|verdict\.json)|spec-verify-r\d+\.invalid-a\d+\.json|spec-check-r\d+(\.hook)?\.json|green-gate-r\d+\.json|test-gate-r\d+\.json|repair-context-r\d+\.json|spec-repair-context-r\d+\.json|review-findings\.md)$/);
+  if (n > 0) state.appendTimeline(cfg, id, `retry：${n} 个轮次产物移入 attempts/（案卷保留）`);
+  return n;
+}
+
+/**
+ * failed box 的失败类型感知恢复（契约变更：verifier/spec-verifier 协议耗尽不该连累无辜的
+ * maker/spec-agent 产出整轮重跑）。前置产物（worktree / spec 草稿）缺失时返回 null，
+ * 交回调用方走原有全量重置路径。
+ */
+function narrowRetryKind(cfg, ts) {
+  const type = ts.runtime.last_failure_type;
+  if (type === 'verifier_protocol_exhausted' && fs.existsSync(path.join(cfg.worktreesDir, ts.id))) {
+    return 'verifier';
+  }
+  if (type === 'spec_verifier_protocol_exhausted' && fs.existsSync(path.join(cfg.specsDir, `${ts.id}.md`))) {
+    return 'spec_verifier';
+  }
+  return null;
+}
+
+/** 只归档对应协议失败的 invalid 产物，任务回 queue 且 stage 回到失败前的验收环节，不重跑 maker/spec-agent。 */
+function applyNarrowRetry(cfg, ts, kind) {
+  const id = ts.id;
+  const isVerifier = kind === 'verifier';
+  const n = archiveArtifactsMatching(
+    cfg, id,
+    isVerifier ? /^verify-r\d+\.invalid-a\d+\.json$/ : /^spec-verify-r\d+\.invalid-a\d+\.json$/,
+  );
+  Object.assign(ts.runtime, isVerifier
+    ? { stage: 'VERIFY', verifier_invalid_count: 0, last_failure_type: null }
+    : { stage: 'SPEC_VERIFY', spec_verifier_invalid_count: 0, last_failure_type: null });
+  state.saveRuntime(ts);
+  const dest = state.taskDir(cfg.queueDir, id);
+  fs.mkdirSync(cfg.queueDir, { recursive: true });
+  fs.renameSync(ts.dir, dest);
+  ts.dir = dest;
+  ts.box = 'queue';
+  const label = isVerifier ? 'VERIFY（不重跑 maker）' : 'SPEC_VERIFY（不重跑 spec-agent）';
+  state.appendTimeline(cfg, id, `retry → ${label}，${n} 个 invalid 产物移入 attempts/`);
+  console.log(`${id} 已重回 queue（stage=${ts.runtime.stage}），协议失败已恢复，${isVerifier ? 'maker' : 'spec 草稿'}产出保留`);
 }
 
 async function cmdRetry(cfg, id) {
@@ -493,6 +537,10 @@ async function cmdRetry(cfg, id) {
     console.error(`${id} 已归档（done），不支持 retry`);
     process.exitCode = 1;
     return;
+  }
+  if (ts.box === 'failed') {
+    const narrow = narrowRetryKind(cfg, ts);
+    if (narrow) { applyNarrowRetry(cfg, ts, narrow); return; }
   }
   archiveRoundArtifacts(cfg, id);
   if (ts.box === 'failed') {
