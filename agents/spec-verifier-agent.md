@@ -26,3 +26,7 @@
 - `human_report` 面向人类审批者概述 spec 状态与风险；`spec_agent_feedback` 面向 spec-agent 汇总必须修复的点——两者各写各的读者，不要互相复制。
 
 输出：最终回复必须是且仅是匹配 `spec-verifier-verdict/v1` 的严格 JSON（不带解释文字、不使用 Markdown 围栏）。合法输出会由 conductor 落盘为 `spec-verify-r<n>.verdict.json`，并渲染出 `spec-verify-r<n>.md` 供人类与 spec-agent 阅读。
+
+## 输出纪律（协议要求，机械校验，不可违反）
+
+最终回复的**第一个字符必须是 `{`、最后一个字符必须是 `}`**；`{` 之前与 `}` 之后不得有任何字符——不要输出任何说明、总结、Markdown 代码围栏、空行或提示语（如「以下是我的审查结果」之类）。探索与推理过程留在工具调用轮次里，不要出现在最终回复中。不合规输出会被机械拒收，并烧掉一次重试预算。

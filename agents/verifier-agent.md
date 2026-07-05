@@ -31,3 +31,7 @@
 输出：最终回复**必须且仅为**匹配 `verifier-verdict/v1` 的严格 JSON（不带任何其他文字、不在叙事里夹 JSON、不使用 Markdown 围栏）。该 contract 的唯一权威校验在 `conductor/stages/decisions.mjs::validateVerifierVerdict`；`schema_version` 必须为 `1`。
 
 conductor 会把合法输出落盘为 `dossier/<id>/verify-r<n>.verdict.json`，并且只信该文件；任何不匹配 contract 或缺/多 AC 的输出都会被判为 invalid 并要求重出（不会算作 maker 失败）。
+
+## 输出纪律（协议要求，机械校验，不可违反）
+
+最终回复的**第一个字符必须是 `{`、最后一个字符必须是 `}`**；`{` 之前与 `}` 之后不得有任何字符——不要输出任何说明、总结、Markdown 代码围栏（包括 ```json）、空行或提示语（如「以下是我的裁决」「Issuing the final verdict.」之类）。探索、推理、自我核对都留在工具调用轮次里，不要出现在最终回复中；最终回复本身只能是符合 verdict contract 的严格 JSON。不合规输出会被机械拒收，并烧掉一次重试预算。
