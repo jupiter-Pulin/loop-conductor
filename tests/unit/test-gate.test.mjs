@@ -1,9 +1,12 @@
-// test gate 纯函数单测：glob 匹配、name-status 分类（lib/test-gate.mjs）与 verdict 判定（decisions.mjs）。
-// 全部零 IO（AC-006）。
+// test gate 纯函数单测：glob 匹配、name-status 分类、AC→测试映射校验（lib/test-gate.mjs）
+// 与 verdict 判定 / per-AC 方向裁决（decisions.mjs）。全部零 IO（AC-006）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { DEFAULT_TEST_GLOBS, matchesTestGlobs, classifyTestFileChanges } from '../../conductor/lib/test-gate.mjs';
-import { testGateVerdict } from '../../conductor/stages/decisions.mjs';
+import {
+  DEFAULT_TEST_GLOBS, matchesTestGlobs, classifyTestFileChanges,
+  AC_TESTS_MAPPING_PATH, validateAcTestsMapping,
+} from '../../conductor/lib/test-gate.mjs';
+import { testGateVerdict, perAcProbeVerdict, perAcGateVerdict } from '../../conductor/stages/decisions.mjs';
 
 test('matchesTestGlobs：默认 glob 集命中测试文件、放过源码', () => {
   for (const p of [
@@ -54,4 +57,74 @@ test('testGateVerdict：单侧闸门，只有基线 exit 0 判 vacuous', () => {
   assert.equal(testGateVerdict(1), 'falsifies');
   assert.equal(testGateVerdict(-1), 'falsifies');
   assert.equal(testGateVerdict(null), 'falsifies'); // 超时（exit_code=null）不误伤
+});
+
+// ---- 约定 2（B 批）：AC→测试映射校验（AC-006） ----
+
+test('validateAcTestsMapping：合法映射 → ok:true，entries 归一为 {ac_id,command,expect}', () => {
+  assert.equal(AC_TESTS_MAPPING_PATH, '.will-workflow/ac-tests.json', '路径常量即约定，不新增配置项');
+  const raw = {
+    schema_version: 1,
+    entries: [
+      { ac_id: 'AC-001', command: 'node --test test/a.test.mjs', expect: 'fail_on_baseline', extra: '多余字段忽略' },
+      { ac_id: 'AC-002', command: 'node --test test/b.test.mjs', expect: 'pass_on_baseline' },
+    ],
+  };
+  const r = validateAcTestsMapping(raw, ['AC-001', 'AC-002', 'AC-003']);
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.errors, []);
+  assert.deepEqual(r.entries, [
+    { ac_id: 'AC-001', command: 'node --test test/a.test.mjs', expect: 'fail_on_baseline' },
+    { ac_id: 'AC-002', command: 'node --test test/b.test.mjs', expect: 'pass_on_baseline' },
+  ]);
+});
+
+test('validateAcTestsMapping：全部非法分支 → ok:false + errors，绝不抛错（AC-006）', () => {
+  const expected = ['AC-001', 'AC-002'];
+  const entry = (over = {}) => ({ ac_id: 'AC-001', command: 'node --test', expect: 'fail_on_baseline', ...over });
+  const cases = [
+    ['非对象：null', null],
+    ['非对象：数组', []],
+    ['非对象：字符串', 'not-an-object'],
+    ['schema_version≠1', { schema_version: 2, entries: [entry()] }],
+    ['entries 非数组', { schema_version: 1, entries: {} }],
+    ['entry 非对象', { schema_version: 1, entries: ['x'] }],
+    ['ac_id 非字符串', { schema_version: 1, entries: [entry({ ac_id: 3 })] }],
+    ['ac_id 空白串', { schema_version: 1, entries: [entry({ ac_id: ' ' })] }],
+    ['command 非字符串', { schema_version: 1, entries: [entry({ command: null })] }],
+    ['command 空串', { schema_version: 1, entries: [entry({ command: '' })] }],
+    ['expect 非枚举', { schema_version: 1, entries: [entry({ expect: 'always_green' })] }],
+    ['ac_id 重复', { schema_version: 1, entries: [entry(), entry()] }],
+    ['ac_id 不在枚举集', { schema_version: 1, entries: [entry({ ac_id: 'AC-999' })] }],
+  ];
+  for (const [label, raw] of cases) {
+    let r;
+    assert.doesNotThrow(() => { r = validateAcTestsMapping(raw, expected); }, label);
+    assert.equal(r.ok, false, label);
+    assert.ok(Array.isArray(r.errors) && r.errors.length >= 1, `${label}：errors 至少 1 条`);
+    assert.deepEqual(r.entries, [], `${label}：非法映射不得回传 entries`);
+  }
+});
+
+// ---- 方向裁决（B 批）：perAcProbeVerdict 六格真值表 + 顶层聚合 ----
+
+test('perAcProbeVerdict：方向表六格 + 超时/spawn error 一律 error 放行（AC-011）', () => {
+  // fail_on_baseline：基线绿 → vacuous（block）；基线红 → falsifies
+  assert.equal(perAcProbeVerdict('fail_on_baseline', 0, false), 'vacuous');
+  assert.equal(perAcProbeVerdict('fail_on_baseline', 1, false), 'falsifies');
+  // pass_on_baseline：基线绿 → guard_holds；基线红 → guard_broken（放行留痕）
+  assert.equal(perAcProbeVerdict('pass_on_baseline', 0, false), 'guard_holds');
+  assert.equal(perAcProbeVerdict('pass_on_baseline', 2, false), 'guard_broken');
+  // 超时（exit_code=null）/ spawn error（exit_code=-1）→ error，两方向一致
+  assert.equal(perAcProbeVerdict('fail_on_baseline', null, true), 'error');
+  assert.equal(perAcProbeVerdict('fail_on_baseline', -1, false), 'error');
+  assert.equal(perAcProbeVerdict('pass_on_baseline', null, true), 'error');
+  assert.equal(perAcProbeVerdict('pass_on_baseline', -1, false), 'error');
+});
+
+test('perAcGateVerdict：任一 vacuous → vacuous；guard_broken/unmapped/error 均不 block', () => {
+  assert.equal(perAcGateVerdict([]), 'falsifies');
+  assert.equal(perAcGateVerdict([{ verdict: 'falsifies' }, { verdict: 'guard_holds' }]), 'falsifies');
+  assert.equal(perAcGateVerdict([{ verdict: 'guard_broken' }, { verdict: 'unmapped' }, { verdict: 'error' }]), 'falsifies');
+  assert.equal(perAcGateVerdict([{ verdict: 'falsifies' }, { verdict: 'vacuous' }]), 'vacuous');
 });

@@ -9,12 +9,15 @@ import {
   ensureWorktree, commitAll, diffAgainstBase, diffNameStatusAgainstBase,
   mergeBaseWith, addDetachedWorktree, removeWorktree,
 } from '../lib/git.mjs';
-import { DEFAULT_TEST_GLOBS, classifyTestFileChanges } from '../lib/test-gate.mjs';
+import { DEFAULT_TEST_GLOBS, classifyTestFileChanges, AC_TESTS_MAPPING_PATH, validateAcTestsMapping } from '../lib/test-gate.mjs';
 import { readApprovedSetupProfile, setupProfilePaths } from '../lib/profile.mjs';
 import * as state from '../lib/state.mjs';
 import { addRunCost, canStartSpawn } from '../lib/scheduler.mjs';
 import { SPEC_DOC_CONTRACT, validateSpecDoc } from '../lib/spec-contract.mjs';
-import { overBudget, testGateVerdict, SPEC_VERIFIER_CONTRACT, VERIFIER_VERDICT_CONTRACT } from './decisions.mjs';
+import {
+  overBudget, testGateVerdict, perAcProbeVerdict, perAcGateVerdict,
+  SPEC_VERIFIER_CONTRACT, VERIFIER_VERDICT_CONTRACT,
+} from './decisions.mjs';
 
 export function worktreePath(cfg, id) {
   return path.join(cfg.worktreesDir, id);
@@ -170,14 +173,40 @@ export function writeGreenGateResult(cfg, id, round, fields, tailBytes) {
 }
 
 // ---- test gate（基线空转测试探针，docs/features/test-gate/tech-spec.md）----
-// green gate 之后的第二道确定性闸：基线代码 + 当前测试（改动的测试文件叠加/删除）复跑
-// testCommand。基线仍 exit 0 ⇒ 测试空转（vacuous），没钉住 spec 要求的新行为。
-// 单侧闸门：只有 vacuous 会 block；基线红/超时/探针基建失败（verdict=error）一律放行进 VERIFY。
+// green gate 之后的第二道确定性闸：基线代码 + 当前测试（改动的测试文件叠加/删除）。
+// suite 模式（v1，映射缺失/非法时的降级）：复跑 testCommand，基线仍 exit 0 ⇒ vacuous。
+// per-ac 模式（映射有效）：按 maker 交付的 AC→测试映射逐条定向复跑，方向裁决
+// （fail_on_baseline 基线必须红 / pass_on_baseline 基线必须绿），跳过 v1 全量复跑。
+// 单侧闸门不变：只有 vacuous 会 block；guard_broken / unmapped / error 一律放行进 VERIFY。
+
+/**
+ * 读 maker 交付的 AC→测试映射（约定 2）。返回 { status:'valid'|'missing'|'invalid', errors, entries }。
+ * 文件缺失 → missing；JSON 解析失败或校验不过 → invalid（唯一裁判 validateAcTestsMapping）。
+ * 任何情况都不抛错、不 block（降级 suite 模式 + 留痕）。
+ */
+function readAcTestsMapping(wt, expectedAcIds) {
+  let rawText;
+  try {
+    rawText = fs.readFileSync(path.join(wt, AC_TESTS_MAPPING_PATH), 'utf8');
+  } catch {
+    return { status: 'missing', errors: [], entries: [] };
+  }
+  let raw;
+  try {
+    raw = JSON.parse(rawText);
+  } catch (e) {
+    return { status: 'invalid', errors: [`JSON 解析失败：${e.message}`], entries: [] };
+  }
+  const check = validateAcTestsMapping(raw, expectedAcIds);
+  if (!check.ok) return { status: 'invalid', errors: check.errors, entries: [] };
+  return { status: 'valid', errors: [], entries: check.entries };
+}
 
 /**
  * 跑 test gate 探针并写 dossier/test-gate-r<n>.json。cfg.testGateEnabled===false 时返回 null。
  * 探针在独立 detached worktree（merge-base(baseBranch, HEAD)）内进行，绝不触碰任务
  * worktree 与 target 主 checkout；结束（含异常路径）必移除探针 worktree。
+ * record 增量字段（schema_version 保持 1）：mode / mapping_status / mapping_errors / per_ac。
  */
 export async function runTestGateProbe(ts, cfg, round) {
   if (cfg.testGateEnabled === false) return null;
@@ -187,6 +216,11 @@ export async function runTestGateProbe(ts, cfg, round) {
   const probeDir = path.join(cfg.worktreesDir, `${id}.test-gate`);
   const tail = cfg.greenGateOutputTailBytes;
   const startedAt = new Date().toISOString();
+
+  // AC 枚举与 verifier 校验同源（extractAcceptanceCriteria）；映射校验唯一裁判在 lib/test-gate.mjs。
+  const expectedAcIds = state.extractAcceptanceCriteria(readDossierSpec(ts, cfg)).map((a) => a.ac_id);
+  const mapping = readAcTestsMapping(wt, expectedAcIds);
+  const mode = mapping.status === 'valid' ? 'per-ac' : 'suite';
 
   const finish = (fields) => {
     const record = {
@@ -200,6 +234,10 @@ export async function runTestGateProbe(ts, cfg, round) {
       ...(fields.timedOut ? { timed_out: true } : {}),
       verdict: fields.verdict,
       ...(fields.error ? { error: fields.error } : {}),
+      mode,
+      mapping_status: mapping.status,
+      ...(mapping.status === 'invalid' ? { mapping_errors: mapping.errors } : {}),
+      ...(mode === 'per-ac' ? { per_ac: fields.perAc ?? [] } : {}),
       stdout_tail: tailBytesOf(fields.stdout ?? '', tail),
       stderr_tail: tailBytesOf(fields.stderr ?? '', tail),
       started_at: startedAt,
@@ -207,7 +245,9 @@ export async function runTestGateProbe(ts, cfg, round) {
     };
     state.writeJson(state.dossierPath(cfg, id, `test-gate-r${round}.json`), record);
     state.appendTimeline(cfg, id, `test gate r${round}: ${record.verdict}${
-      fields.error ? `（${fields.error}）` : `（exit ${record.exit_code}${record.timed_out ? ', timed out' : ''}）`
+      fields.error ? `（${fields.error}）`
+        : mode === 'per-ac' ? `（per-ac：${(record.per_ac ?? []).map((e) => `${e.ac_id}=${e.verdict}`).join(', ')}）`
+          : `（exit ${record.exit_code}${record.timed_out ? ', timed out' : ''}）`
     }`);
     return record;
   };
@@ -219,7 +259,7 @@ export async function runTestGateProbe(ts, cfg, round) {
   removeWorktree(cfg.targetRepo, probeDir); // 清掉上次崩溃可能遗留的探针 worktree（幂等）
   const added = addDetachedWorktree(cfg.targetRepo, probeDir, baseCommit);
   if (!added.ok) {
-    // 探针基建失败：不 block（verdict=error），留痕供人工归因。
+    // 探针基建失败：不 block（verdict=error），留痕供人工归因（per-AC 模式同样 fail-open）。
     return finish({ baseCommit, copied: copy, deleted: remove, verdict: 'error', error: `git worktree add failed: ${added.error}` });
   }
   try {
@@ -229,6 +269,31 @@ export async function runTestGateProbe(ts, cfg, round) {
       fs.copyFileSync(path.join(wt, rel), dst);
     }
     for (const rel of remove) fs.rmSync(path.join(probeDir, rel), { force: true });
+
+    if (mode === 'per-ac') {
+      // 逐 AC 定向探测（AC-008）：按冻结 spec 的 AC 枚举顺序执行映射条目；未映射记 unmapped。
+      // 单条超时/spawn error 只判该条 error，其余条目照常执行（AC-011）。
+      const byId = new Map(mapping.entries.map((e) => [e.ac_id, e]));
+      const perAc = [];
+      for (const acId of expectedAcIds) {
+        const entry = byId.get(acId);
+        if (!entry) {
+          perAc.push({ ac_id: acId, verdict: 'unmapped' });
+          continue;
+        }
+        const r = await runGreenGate(entry.command, probeDir, { timeoutMs: cfg.greenGateTimeoutMs });
+        perAc.push({
+          ac_id: acId,
+          expect: entry.expect,
+          exit_code: r.exitCode,
+          timed_out: r.timedOut,
+          verdict: perAcProbeVerdict(entry.expect, r.exitCode, r.timedOut),
+        });
+      }
+      // per-AC 模式跳过 v1 全量基线复跑（省一次全量 suite 时间）：exit_code 留 null。
+      return finish({ baseCommit, copied: copy, deleted: remove, perAc, verdict: perAcGateVerdict(perAc) });
+    }
+
     const gate = await runGreenGate(ts.task.testCommand, probeDir, { timeoutMs: cfg.greenGateTimeoutMs });
     return finish({
       baseCommit,
@@ -253,10 +318,12 @@ export async function runTestGateProbe(ts, cfg, round) {
  *                      green_gate=null；overall='fail'。
  * source==='green_gate'：failed_criteria=[]；存 green_gate_ref，不复制 green-gate tail；
  *                        prompt 层再展开摘要；instruction 改为修测试版。
- * source==='test_gate'：failed_criteria=[]；存 test_gate_ref（同 green_gate_ref 的去重策略）；
+ * source==='test_gate'：存 test_gate_ref（同 green_gate_ref 的去重策略）；per-ac 模式探针
+ *                       （probe.mode==='per-ac'）把 vacuous 条目精确填进 failed_criteria，
+ *                       suite 模式（降级）保持 v1 形态 failed_criteria=[]；
  *                       instruction 要求补/强化在基线上会失败的测试，禁止削弱换绿。
  */
-export function buildRepairContext({ source, round, verdict }) {
+export function buildRepairContext({ source, round, verdict, probe }) {
   if (source === 'green_gate') {
     return {
       schema_version: 1,
@@ -270,12 +337,21 @@ export function buildRepairContext({ source, round, verdict }) {
     };
   }
   if (source === 'test_gate') {
+    const failed = probe?.mode === 'per-ac'
+      ? (probe.per_ac ?? [])
+        .filter((e) => e.verdict === 'vacuous')
+        .map((e) => ({
+          ac_id: e.ac_id,
+          status: 'vacuous',
+          reason: '映射的测试命令在基线代码上仍 exit 0，未钉住该 AC 的新行为',
+        }))
+      : [];
     return {
       schema_version: 1,
       round,
       source: 'test_gate',
       overall: 'fail',
-      failed_criteria: [],
+      failed_criteria: failed,
       green_gate: null,
       test_gate: null,
       test_gate_ref: `test-gate-r${round}.json`,
@@ -756,6 +832,10 @@ function repairContextForPrompt(ts, cfg, ctx) {
         base_commit: tg.base_commit,
         exit_code: tg.exit_code,
         overlay: tg.overlay,
+        // per-AC 模式增量摘要（记录缺这些字段时展开为 undefined，JSON 序列化自然省略）
+        mode: tg.mode,
+        mapping_status: tg.mapping_status,
+        per_ac: tg.per_ac,
         stdout_tail: tg.stdout_tail,
         stderr_tail: tg.stderr_tail,
       },
@@ -806,12 +886,22 @@ export function buildVerifierPrompt(ts, cfg, round, acList) {
     : `# Worktree diff（未内嵌：diff 共 ${diffBytes} 字节，超过上限 ${cfg.verifierDiffMaxBytes} 字节，降级为变更文件清单）\n\n` +
       `变更文件清单（git diff --name-status ${base}...HEAD）：\n\n\`\`\`\n${diffNameStatusAgainstBase(wt, base)}\`\`\`\n\n` +
       `请对清单中每个文件用 \`git diff ${base}...HEAD -- <file>\` 只读自查其改动，再逐条裁决验收标准。`;
+  // 当轮 test gate 探针记录存在时嵌入机械事实段（去 stdout/stderr tail，防 prompt 膨胀）；
+  // 缺失（testGateEnabled=false / 探针未跑）时不加该段。
+  const probe = state.readJsonIf(state.dossierPath(cfg, id, `test-gate-r${round}.json`));
+  let probeSection = null;
+  if (probe) {
+    const { stdout_tail: _stdout, stderr_tail: _stderr, ...mechanical } = probe;
+    probeSection = '# Test gate 探针结果（conductor 机械事实，审计测试证明力时以此为锚）\n\n' +
+      `\`\`\`json\n${JSON.stringify(mechanical, null, 2)}\n\`\`\``;
+  }
   return [
     readAgentPrompt(cfg, 'verifier-agent.md'),
     `# 任务 ${id} 验收（第 ${round} 轮）`,
     `# Spec（唯一契约）\n\n${readDossierSpec(ts, cfg)}`,
     `# 验收标准枚举（必须逐条裁决，ac_id 必须与此处完全一致，无缺无多）\n\n${acEnum}`,
     diffSection,
+    probeSection,
     `# Verdict contract\n${VERIFIER_VERDICT_CONTRACT.id} ` +
     `(schema_version=${VERIFIER_VERDICT_CONTRACT.schemaVersion})；唯一程序级校验在 ` +
     '`conductor/stages/decisions.mjs::validateVerifierVerdict`，本 prompt 不复制 schema。',
