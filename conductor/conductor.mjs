@@ -12,8 +12,11 @@ import { currentBranch, mergeBranch, removeWorktree, deleteBranch } from './lib/
 import { DEFAULT_TEST_GLOBS } from './lib/test-gate.mjs';
 import { hasApprovedSetupProfile } from './lib/profile.mjs';
 import { runCommitterProposal } from './stages/shared.mjs';
+import { validateFeasibilityDoc } from './lib/feasibility-contract.mjs';
 import needsTargetSetupHandler from './stages/needs_target_setup.mjs';
 import awaitSetupApprovalHandler from './stages/await_setup_approval.mjs';
+import needsFeasibilityHandler from './stages/needs_feasibility.mjs';
+import awaitFeasibilityApprovalHandler from './stages/await_feasibility_approval.mjs';
 import needsSpecHandler from './stages/needs_spec.mjs';
 import specVerifyHandler from './stages/spec_verify.mjs';
 import specFixingHandler from './stages/spec_fixing.mjs';
@@ -25,6 +28,8 @@ import fixingHandler from './stages/fixing.mjs';
 const STAGE_HANDLERS = {
   NEEDS_TARGET_SETUP: needsTargetSetupHandler,
   AWAIT_SETUP_APPROVAL: awaitSetupApprovalHandler,
+  NEEDS_FEASIBILITY: needsFeasibilityHandler,
+  AWAIT_FEASIBILITY_APPROVAL: awaitFeasibilityApprovalHandler,
   NEEDS_SPEC: needsSpecHandler,
   SPEC_VERIFY: specVerifyHandler,
   SPEC_FIXING: specFixingHandler,
@@ -57,6 +62,8 @@ export function loadCfg(root = resolveRoot()) {
     maxSpecVerifierInvalidRetries: 2,
     maxSpecContractRetries: 2, // spec-agent 交付契约门（spec-doc/v1）失败重试上限：初始+2=3 次尝试
     maxSpecEpochs: 2,
+    feasibilityEnabled: false, // feature 档默认是否走 feasibility gate（new --feasibility 可逐任务覆盖）
+    maxFeasibilityContractRetries: 2, // feasibility 交付契约门（feasibility-doc/v1）失败重试上限
     greenGateOutputTailBytes: 12000, // green gate stdout/stderr tail 字节上限（契约 §6）
     testGateEnabled: true, // green pass 后的基线空转测试探针（docs/features/test-gate/tech-spec.md）
     testGateTestGlobs: DEFAULT_TEST_GLOBS, // 测试文件识别 glob（探针 overlay 用）
@@ -70,7 +77,7 @@ export function loadCfg(root = resolveRoot()) {
     lockHeartbeatMs: 60000,
     maxStepsPerTask: 20,
     runBudgetUsd: null,
-    models: { setup: null, spec: null, specVerifier: null, maker: null, verifier: null, committer: null },
+    models: { setup: null, feasibility: null, spec: null, specVerifier: null, maker: null, verifier: null, committer: null },
   };
   let user = {};
   try {
@@ -205,8 +212,28 @@ function cmdNew(cfg, opts) {
     return;
   }
   const title = opts.title ?? '(untitled)';
+  // --brief <file>：需求原文落盘 <taskdir>/brief.md（喂 feasibility/spec 链，缓解「只有 title」的输入饥饿）。
+  let brief = null;
+  if (opts.brief != null) {
+    if (opts.brief === true) {
+      console.error('--brief 需要一个文件路径（brief 原文所在文件）');
+      process.exitCode = 1;
+      return;
+    }
+    const briefPath = path.resolve(opts.brief);
+    if (!fs.existsSync(briefPath)) {
+      console.error(`--brief 文件不存在：${briefPath}`);
+      process.exitCode = 1;
+      return;
+    }
+    brief = fs.readFileSync(briefPath, 'utf8');
+  }
   const id = nextId(cfg);
-  const naturalStage = kind === 'feature' ? 'NEEDS_SPEC' : 'READY';
+  // feasibility gate：--feasibility 强制开 / --feasibility false 强制关，缺省随 config.feasibilityEnabled；仅 feature 有意义。
+  const feasibility = kind === 'feature' && (
+    opts.feasibility != null ? opts.feasibility !== 'false' : cfg.feasibilityEnabled === true
+  );
+  const naturalStage = kind === 'feature' ? (feasibility ? 'NEEDS_FEASIBILITY' : 'NEEDS_SPEC') : 'READY';
   const stage = hasApprovedSetupProfile(cfg) ? naturalStage : 'NEEDS_TARGET_SETUP';
 
   // task.json 不可变快照（契约 §1）：baseBranch = config.baseBranch ?? currentBranch ?? 'main'。
@@ -220,6 +247,7 @@ function cmdNew(cfg, opts) {
     id,
     kind,
     title,
+    ...(kind === 'feature' ? { feasibility } : {}),
     repo: path.basename(cfg.targetRepo),
     targetRepo: cfg.targetRepo,
     baseBranch,
@@ -235,6 +263,11 @@ function cmdNew(cfg, opts) {
     spec_verifier_invalid_count: 0,
     spec_contract_invalid_count: 0,
     spec_epoch: 1,
+    feasibility_approval: null,
+    feasibility_contract_invalid_count: 0,
+    current_feasibility_round: 0,
+    feasibility_agent_session_id: null,
+    chosen_option: null,
     spent_usd: 0,
     approval: null,
     setup_approval: null,
@@ -250,10 +283,15 @@ function cmdNew(cfg, opts) {
     ? `# ${title}\n\n## 验收标准\n\n- TODO: 填写可机器/人工验证的验收标准\n`
     : undefined;
   const dir = state.writeNewTask(cfg.queueDir, task, runtime, { specDraft });
-  state.appendTimeline(cfg, id, `created (kind=${kind}, stage=${stage})`);
+  if (brief != null) {
+    state.writeFileEnsured(path.join(dir, 'brief.md'), brief);
+  }
+  state.appendTimeline(cfg, id, `created (kind=${kind}, stage=${stage}${brief != null ? ', brief 已落盘' : ''})`);
   console.log(`已创建 ${path.relative(cfg.root, dir)}/（kind=${kind}, stage=${stage}）`);
   if (kind === 'bugfix') {
     console.log('提醒：编辑该目录的 spec.md「## 验收标准」段（它就是 bugfix 档的 spec），然后 conductor run');
+  } else if (feasibility) {
+    console.log('feature 档（feasibility gate）：conductor run 会先让 feasibility-agent 产出决策 memo，等你 approve-feasibility --option 点名后再进 spec 链');
   } else {
     console.log('feature 档：conductor run 会先让 spec-agent 产出草稿，经 spec-verifier 后等你 approve/reject');
   }
@@ -335,6 +373,69 @@ async function cmdReject(cfg, id, notes) {
   });
 }
 
+/**
+ * option 人审闸门（AWAIT_FEASIBILITY_APPROVAL）：approve 必须显式 --option 点名，
+ * 无「默认采纳推荐」的静默通过；所选 option 必须真实存在于草稿枚举（机器锚点校验），
+ * 校验不过拒绝写入、任务保持原状。notes 是人对所选 option 的补充约束（如「选 O-B 但
+ * 去掉缓存部分」），随 decision 冻结进 dossier，成为 spec-agent 的输入。
+ */
+async function cmdApproveFeasibility(cfg, id, option, notes) {
+  return withCliTaskMutation(cfg, id, async () => {
+  const ts = findTask(cfg, id);
+  if (!ts) { console.error(`找不到任务 ${id}`); process.exitCode = 1; return; }
+  if (ts.error) { console.error(`${id} 任务目录损坏：${ts.error}`); process.exitCode = 1; return; }
+  if (typeof option !== 'string' || option === '') {
+    console.error(`用法：conductor approve-feasibility ${id} --option O-X [--notes "…"]（必须显式点名 option）`);
+    process.exitCode = 1;
+    return;
+  }
+  if (ts.runtime.stage !== 'AWAIT_FEASIBILITY_APPROVAL') {
+    console.error(`警告：${id} 当前 stage=${ts.runtime.stage}（非 AWAIT_FEASIBILITY_APPROVAL），仍尝试写入 feasibility_approval=approved`);
+  }
+  // 机器锚点：所选 option 必须存在于草稿的「## 选项对比」枚举。
+  let md = null;
+  try { md = fs.readFileSync(path.join(ts.dir, 'feasibility-study.md'), 'utf8'); } catch { /* 缺失也是校验失败 */ }
+  const check = validateFeasibilityDoc(md);
+  const known = check.options.map((o) => o.option_id);
+  if (!known.includes(option)) {
+    console.error(
+      `approve-feasibility 拒绝：option ${option} 不在草稿枚举 {${known.join(', ') || '(空)'}} 中` +
+      `${check.ok ? '' : `（草稿本身未过契约门：${check.errors.join('; ')}）`}，任务保持原状`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  ts.runtime.feasibility_approval = 'approved';
+  ts.runtime.chosen_option = option;
+  ts.runtime.feasibility_decision_notes = typeof notes === 'string' && notes.trim() !== '' ? notes : null;
+  state.saveRuntime(ts);
+  state.appendTimeline(cfg, id, `human approve feasibility: option=${option}${ts.runtime.feasibility_decision_notes ? `, notes: ${notes}` : ''}`);
+  console.log(`${id} feasibility_approval=approved（option=${option}）。下次 conductor run 冻结 memo + decision 并进入 NEEDS_SPEC`);
+  });
+}
+
+async function cmdRejectFeasibility(cfg, id, notes) {
+  return withCliTaskMutation(cfg, id, async () => {
+  const ts = findTask(cfg, id);
+  if (!ts) { console.error(`找不到任务 ${id}`); process.exitCode = 1; return; }
+  if (ts.error) { console.error(`${id} 任务目录损坏：${ts.error}`); process.exitCode = 1; return; }
+  if (ts.runtime.stage !== 'AWAIT_FEASIBILITY_APPROVAL') {
+    console.error(`警告：${id} 当前 stage=${ts.runtime.stage}（非 AWAIT_FEASIBILITY_APPROVAL），仍写入 feasibility_approval=rejected`);
+  }
+  ts.runtime.feasibility_approval = 'rejected';
+  if (notes) {
+    // 打回意见累加到任务目录的 feasibility_reject_notes.md（喂给 feasibility-agent），不入 runtime。
+    const p = path.join(ts.dir, 'feasibility_reject_notes.md');
+    let existing = '';
+    try { existing = fs.readFileSync(p, 'utf8'); } catch { /* optional */ }
+    state.writeFileEnsured(p, `${existing}- ${new Date().toISOString().slice(0, 10)}: ${notes}\n`);
+  }
+  state.saveRuntime(ts);
+  state.appendTimeline(cfg, id, `human reject feasibility${notes ? `: ${notes}` : ''}`);
+  console.log(`${id} feasibility_approval=rejected。下次 conductor run 时退回 feasibility-agent 重产 memo`);
+  });
+}
+
 // ---- status ----
 
 function cmdStatus(cfg) {
@@ -377,7 +478,7 @@ function latestActiveSpawn(cfg, id) {
   try { names = fs.readdirSync(dir); } catch { return null; }
   const active = [];
   for (const n of names) {
-    const m = n.match(/^(setup|spec-agent|spec-verifier|maker|verifier)-r(\d+)\.json$/);
+    const m = n.match(/^(setup|feasibility-agent|spec-agent|spec-verifier|maker|verifier)-r(\d+)\.json$/);
     if (!m) continue;
     const p = path.join(dir, n);
     const rec = state.readJsonIf(p);
@@ -490,7 +591,7 @@ function archiveArtifactsMatching(cfg, id, pattern) {
 
 /** 把上一攻坚周期的轮次产物移入 attempts/<ts>/（保留案卷，腾出轮次命名空间）。 */
 function archiveRoundArtifacts(cfg, id) {
-  const n = archiveArtifactsMatching(cfg, id, /^((setup|spec-agent|spec-verifier|maker|verifier)-r\d+\.stream\.jsonl|maker-r\d+\.json|maker-r\d+\.settings\.json|verifier-r\d+\.json|setup-r\d+\.json|spec-agent-r\d+\.json|spec-agent-r\d+\.settings\.json|spec-verifier-r\d+\.json|verify-r\d+\.(md|verdict\.json)|verify-r\d+\.invalid-a\d+\.json|spec-verify-r\d+\.(md|verdict\.json)|spec-verify-r\d+\.invalid-a\d+\.json|spec-check-r\d+(\.hook)?\.json|green-gate-r\d+\.json|test-gate-r\d+\.json|repair-context-r\d+\.json|spec-repair-context-r\d+\.json|review-findings\.md)$/);
+  const n = archiveArtifactsMatching(cfg, id, /^((setup|feasibility-agent|spec-agent|spec-verifier|maker|verifier)-r\d+\.stream\.jsonl|maker-r\d+\.json|maker-r\d+\.settings\.json|verifier-r\d+\.json|setup-r\d+\.json|feasibility-agent-r\d+\.json|feasibility-agent-r\d+\.settings\.json|feasibility-check-r\d+(\.hook)?\.json|spec-agent-r\d+\.json|spec-agent-r\d+\.settings\.json|spec-verifier-r\d+\.json|verify-r\d+\.(md|verdict\.json)|verify-r\d+\.invalid-a\d+\.json|spec-verify-r\d+\.(md|verdict\.json)|spec-verify-r\d+\.invalid-a\d+\.json|spec-check-r\d+(\.hook)?\.json|green-gate-r\d+\.json|test-gate-r\d+\.json|repair-context-r\d+\.json|spec-repair-context-r\d+\.json|review-findings\.md)$/);
   if (n > 0) state.appendTimeline(cfg, id, `retry：${n} 个轮次产物移入 attempts/（案卷保留）`);
   return n;
 }
@@ -549,14 +650,19 @@ async function cmdRetry(cfg, id) {
   }
   archiveRoundArtifacts(cfg, id);
   if (ts.box === 'failed') {
-    // reset runtime（契约 §12）。
+    // reset runtime（契约 §12）。复位目标按「冻结产物走到哪」倒推：
+    // feasibility gate 任务缺冻结 memo → NEEDS_FEASIBILITY；缺冻结 spec → NEEDS_SPEC；否则 READY。
+    const retryStage = ts.task.kind !== 'feature' ? 'READY'
+      : ts.task.feasibility === true && !fs.existsSync(state.dossierPath(cfg, id, 'feasibility-study.md')) ? 'NEEDS_FEASIBILITY'
+        : !fs.existsSync(state.dossierPath(cfg, id, 'spec.md')) ? 'NEEDS_SPEC' : 'READY';
     Object.assign(ts.runtime, {
-      stage: ts.task.kind === 'feature' && !fs.existsSync(state.dossierPath(cfg, id, 'spec.md')) ? 'NEEDS_SPEC' : 'READY',
+      stage: retryStage,
       maker_miss_count: 0,
       verifier_invalid_count: 0,
       spec_miss_count: 0,
       spec_verifier_invalid_count: 0,
       spec_contract_invalid_count: 0,
+      feasibility_contract_invalid_count: 0,
       maker_session_id: null,
       last_failure_type: null,
     });
@@ -600,7 +706,12 @@ function parseArgs(argv) {
 
 const USAGE = `用法：conductor <command>
   run                                  drain 一轮：推进所有任务直到无状态变化
-  new --kind bugfix|feature --title "…" 新建任务（无 setup profile 时先 NEEDS_TARGET_SETUP）
+  new --kind bugfix|feature --title "…" [--brief <file>] [--feasibility]
+                                       新建任务（--brief 落盘需求原文；--feasibility 让 feature 先走
+                                       feasibility gate，缺省随 config.feasibilityEnabled）
+  approve-feasibility <id> --option O-X [--notes "…"]
+                                       按 option ID 点名批准 feasibility memo（无静默通过）
+  reject-feasibility <id> [--notes "…"] 打回 feasibility memo，notes 追加进 feasibility_reject_notes.md
   approve <id>                         批准 spec（AWAIT_SPEC_APPROVAL 闸门）
   approve-setup <id>                   批准 target repo setup profile（AWAIT_SETUP_APPROVAL 闸门）
   reject <id> [--notes "…"]            打回 spec，notes 追加进任务目录 reject_notes.md
@@ -618,6 +729,8 @@ export async function main(argv = process.argv.slice(2)) {
     case 'new': cmdNew(cfg, opts); break;
     case 'approve': await cmdApprove(cfg, opts._[0]); break;
     case 'approve-setup': await cmdApproveSetup(cfg, opts._[0]); break;
+    case 'approve-feasibility': await cmdApproveFeasibility(cfg, opts._[0], opts.option, opts.notes); break;
+    case 'reject-feasibility': await cmdRejectFeasibility(cfg, opts._[0], opts.notes); break;
     case 'reject': await cmdReject(cfg, opts._[0], opts.notes); break;
     case 'status': cmdStatus(cfg); break;
     case 'spy': cmdSpy(cfg); break;

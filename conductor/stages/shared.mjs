@@ -14,6 +14,7 @@ import { readApprovedSetupProfile, setupProfilePaths } from '../lib/profile.mjs'
 import * as state from '../lib/state.mjs';
 import { addRunCost, canStartSpawn } from '../lib/scheduler.mjs';
 import { SPEC_DOC_CONTRACT, validateSpecDoc } from '../lib/spec-contract.mjs';
+import { FEASIBILITY_DOC_CONTRACT, validateFeasibilityDoc } from '../lib/feasibility-contract.mjs';
 import {
   overBudget, testGateVerdict, perAcProbeVerdict, perAcGateVerdict,
   parseStrictJson, validateCommitMessage, verifierVerdictSkeleton,
@@ -30,9 +31,18 @@ export const READONLY_TOOLS = ['Read', 'Grep', 'Glob'];
 /** setup/spec-verifier 均是只读探索/审查。 */
 export const SPEC_TOOLS = READONLY_TOOLS;
 
-/** spec-agent：只读探索 + 受限写（直写唯一交付物 specs/<id>.md，
+/** git 历史类只读命令（形式限定，与 VERIFIER_TOOLS 同一模式）：大仓库里理解惯例
+ *  演化与真实约束靠 log/blame；绝不放行写形态 Bash——spec/feasibility agent 的 cwd 是
+ *  共享的 targetRepo 本体（非 worktree），且 spec-write-guard 只拦 Write/Edit 类工具。 */
+const GIT_HISTORY_TOOLS = ['Bash(git log:*)', 'Bash(git blame:*)'];
+
+/** spec-agent：只读探索（含 git 历史）+ 受限写（直写唯一交付物 specs/<id>.md，
  *  路径白名单由 PreToolUse hook 强制，见 writeSpecAgentSettings）。 */
-export const SPEC_AGENT_TOOLS = [...READONLY_TOOLS, 'Write', 'Edit'];
+export const SPEC_AGENT_TOOLS = [...READONLY_TOOLS, ...GIT_HISTORY_TOOLS, 'Write', 'Edit'];
+
+/** feasibility-agent：与 spec-agent 同构——只读探索（含 git 历史）+ 受限写
+ *  （直写唯一交付物 <taskdir>/feasibility-study.md，白名单复用 spec-write-guard）。 */
+export const FEASIBILITY_AGENT_TOOLS = [...READONLY_TOOLS, ...GIT_HISTORY_TOOLS, 'Write', 'Edit'];
 
 /** verifier 工具集：纯只读 + Bash 仅 git diff / git log 形式，不放行测试/写（契约 §10）。
  *  同一集合既作 --tools（硬限制）又作 --allowedTools（免审批放行）。 */
@@ -392,7 +402,8 @@ export function readAgentPrompt(cfg, name) {
 }
 
 export function entryStageAfterSetup(ts) {
-  return ts.task.kind === 'feature' ? 'NEEDS_SPEC' : 'READY';
+  if (ts.task.kind !== 'feature') return 'READY';
+  return ts.task.feasibility === true ? 'NEEDS_FEASIBILITY' : 'NEEDS_SPEC';
 }
 
 export function readSetupProfileMarkdown(cfg) {
@@ -409,23 +420,61 @@ export function readFeasibilityContext(ts, cfg) {
   return '';
 }
 
-/** 注入 spec-agent prompt 的打回意见上限：只保留最近 N 条，防长寿任务 prompt 无限膨胀。 */
+/** 注入 agent prompt 的打回意见上限：只保留最近 N 条，防长寿任务 prompt 无限膨胀。 */
 const REJECT_NOTES_LIMIT = 10;
 
 /**
- * 读任务目录 reject_notes.md（人类打回意见，cmdReject 只追加不清理）。
+ * 读任务目录下的打回意见文件（人类意见，CLI 只追加不清理）。
  * 为防 prompt 无限膨胀，超过 REJECT_NOTES_LIMIT 条 `- ` 列表行时只保留最近 N 条，
  * 并在开头加一行截断说明（完整历史仍在任务目录原文件里）；未超限时原样返回。
  */
-export function readRejectNotes(ts) {
+function readNotesFile(ts, filename) {
   let raw;
-  try { raw = fs.readFileSync(path.join(ts.dir, 'reject_notes.md'), 'utf8'); } catch { return ''; }
+  try { raw = fs.readFileSync(path.join(ts.dir, filename), 'utf8'); } catch { return ''; }
   const notes = raw.split('\n').filter((l) => l.startsWith('- '));
   if (notes.length <= REJECT_NOTES_LIMIT) return raw; // 未超限：原样返回，不动格式
   return [
-    `（仅保留最近 ${REJECT_NOTES_LIMIT} 条打回意见，完整历史见任务目录 reject_notes.md）`,
+    `（仅保留最近 ${REJECT_NOTES_LIMIT} 条打回意见，完整历史见任务目录 ${filename}）`,
     ...notes.slice(-REJECT_NOTES_LIMIT),
   ].join('\n');
+}
+
+/** spec 打回意见（cmdReject 追加）。 */
+export function readRejectNotes(ts) {
+  return readNotesFile(ts, 'reject_notes.md');
+}
+
+/** feasibility 打回意见（cmdRejectFeasibility 追加）。 */
+export function readFeasibilityRejectNotes(ts) {
+  return readNotesFile(ts, 'feasibility_reject_notes.md');
+}
+
+/** 任务 brief（cmdNew --brief 落盘的需求原文），无则空串。 */
+export function readBrief(ts) {
+  try { return fs.readFileSync(path.join(ts.dir, 'brief.md'), 'utf8'); } catch { return ''; }
+}
+
+/** feasibility-agent 唯一交付文件（人审前草稿）的绝对路径：随任务目录走（对齐 reject_notes）。 */
+export function feasibilityDraftPath(ts) {
+  return path.join(ts.dir, 'feasibility-study.md');
+}
+
+/**
+ * 归档 feasibility 草稿 → <taskdir>/feasibility-archive/<label>-<ts>.md（与 archiveSpecDraft
+ * 同语义：approve 冻结后 / reject 后 / 契约门废稿，绝不留双份平行文档）。无草稿返回 null。
+ */
+export function archiveFeasibilityDraft(ts, label = 'archived') {
+  const draft = feasibilityDraftPath(ts);
+  if (!fs.existsSync(draft)) return null;
+  const archived = path.join(ts.dir, 'feasibility-archive', `${label}-${Date.now()}.md`);
+  fs.mkdirSync(path.dirname(archived), { recursive: true });
+  fs.renameSync(draft, archived);
+  return archived;
+}
+
+/** 人审裁决记录（chosen option），冻结于 dossier；无则 null。 */
+export function readFeasibilityDecision(ts, cfg) {
+  return state.readJsonIf(state.dossierPath(cfg, ts.id, 'feasibility-decision.json'));
 }
 
 /** spec-agent 唯一交付文件（feature 人审前草稿）的绝对路径。 */
@@ -509,6 +558,73 @@ export function runSpecContractGate(ts, cfg, round) {
   return check;
 }
 
+// ---- feasibility 交付契约（feasibility-doc/v1）：hook 护栏 + conductor 终审共用 validateFeasibilityDoc ----
+
+/**
+ * 生成 feasibility-agent 逐轮 settings 文件（hook 护栏），落盘 dossier 留档，返回路径。
+ * PreToolUse：写路径白名单复用 spec-write-guard（只放行 <taskdir>/feasibility-study.md）；
+ * Stop：契约预检（check-feasibility.mjs，同一份裁判代码），结果写
+ * feasibility-check-r<n>.hook.json。显式 --settings 注入，不依赖 target 仓库自带设置。
+ */
+export function writeFeasibilityAgentSettings(ts, cfg, round) {
+  const q = (s) => JSON.stringify(s); // 路径含空格时 shell 安全
+  const docPath = feasibilityDraftPath(ts);
+  const guard = path.join(cfg.root, 'conductor', 'hooks', 'spec-write-guard.mjs');
+  const check = path.join(cfg.root, 'conductor', 'hooks', 'check-feasibility.mjs');
+  const hookReport = state.dossierPath(cfg, ts.id, `feasibility-check-r${round}.hook.json`);
+  const settings = {
+    hooks: {
+      PreToolUse: [{
+        matcher: 'Write|Edit|MultiEdit|NotebookEdit',
+        hooks: [{ type: 'command', command: `${q(process.execPath)} ${q(guard)} --allow ${q(docPath)}` }],
+      }],
+      Stop: [{
+        hooks: [{ type: 'command', command: `${q(process.execPath)} ${q(check)} --doc ${q(docPath)} --report ${q(hookReport)}` }],
+      }],
+    },
+  };
+  const p = state.dossierPath(cfg, ts.id, `feasibility-agent-r${round}.settings.json`);
+  state.writeJson(p, settings);
+  return p;
+}
+
+/**
+ * conductor 契约门（权威终审）：读 feasibility-agent 直写的草稿，跑 validateFeasibilityDoc，
+ * 结果落盘 feasibility-check-r<n>.json（source=conductor）。返回 { ok, errors, options }。
+ * Stop hook 只是快反馈层——是否真跑过、跑的结果如何，conductor 一律不采信，这里重新裁。
+ */
+export function runFeasibilityContractGate(ts, cfg, round) {
+  let md = null;
+  try { md = fs.readFileSync(feasibilityDraftPath(ts), 'utf8'); } catch { /* 未写入也是契约失败 */ }
+  const check = validateFeasibilityDoc(md);
+  state.writeJson(state.dossierPath(cfg, ts.id, `feasibility-check-r${round}.json`), {
+    schema_version: 1,
+    contract: FEASIBILITY_DOC_CONTRACT.id,
+    round,
+    source: 'conductor',
+    ok: check.ok,
+    errors: check.errors,
+    options: check.options,
+  });
+  return check;
+}
+
+/** 最近一次 feasibility 契约门失败记录（喂给下一轮 feasibility-agent prompt），无则 null。 */
+export function readLatestFeasibilityContractErrors(ts, cfg) {
+  const dir = state.dossierPath(cfg, ts.id);
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch { return null; }
+  let maxN = 0;
+  for (const n of names) {
+    const m = n.match(/^feasibility-check-r(\d+)\.json$/);
+    if (m) maxN = Math.max(maxN, Number(m[1]));
+  }
+  if (maxN === 0) return null;
+  const rec = state.readJsonIf(state.dossierPath(cfg, ts.id, `feasibility-check-r${maxN}.json`));
+  if (!rec || rec.ok !== false) return null;
+  return { round: rec.round, errors: rec.errors };
+}
+
 /** 最近一次 conductor 契约门失败记录（喂给下一轮 spec-agent prompt），无则 null。 */
 export function readLatestSpecContractErrors(ts, cfg) {
   const dir = state.dossierPath(cfg, ts.id);
@@ -562,9 +678,64 @@ export function buildSetupPrompt(ts, cfg) {
   ].filter(Boolean).join('\n\n');
 }
 
+/**
+ * feasibility-agent prompt：角色前導 + brief + profile + 打回意见/契约错误 + 交付契约。
+ * 与 spec-agent 同模式：直写唯一交付物，hook 快反馈 + conductor 契约门终审。
+ */
+export function buildFeasibilityPrompt(ts, cfg, round) {
+  const setup = readSetupProfileMarkdown(cfg) || '(no approved setup profile found)';
+  const brief = readBrief(ts);
+  const rejectNotes = readFeasibilityRejectNotes(ts);
+  const contractFail = readLatestFeasibilityContractErrors(ts, cfg);
+  const docPath = feasibilityDraftPath(ts);
+  const parts = [
+    readAgentPrompt(cfg, 'feasibility-agent.md'),
+    `# 任务 ${ts.id}（feasibility-agent r${round}）`,
+    `标题：${ts.task.title ?? '(untitled)'}\nkind：${ts.task.kind}`,
+    `# 任务 brief\n\n${brief.trim() || '(无 brief：需求仅有上面的标题；未知项如实写进开放问题段，不要脑补需求)'}`,
+    `# Approved setup profile\n\n${setup}`,
+  ];
+  if (rejectNotes.trim()) {
+    parts.push(`# Human reject notes（上一稿被人审打回的原因，本稿必须逐条回应）\n\n${rejectNotes}`);
+  }
+  if (contractFail) {
+    parts.push(
+      `# Feasibility 契约门失败反馈（r${contractFail.round}，上一轮交付未过 ${FEASIBILITY_DOC_CONTRACT.id}，必须全部修复）\n\n` +
+      `\`\`\`json\n${JSON.stringify(contractFail, null, 2)}\n\`\`\``,
+    );
+  }
+  parts.push(
+    `# 交付方式（${FEASIBILITY_DOC_CONTRACT.id}）\n` +
+    `用 Write 工具把完整 feasibility 决策 memo 写入唯一交付文件（绝对路径）：${docPath}\n` +
+    `必须包含逐字标题的三段：「## ${FEASIBILITY_DOC_CONTRACT.optionSectionTitle}」` +
+    '（每个 option 以稳定 ID 开头，形如 `O-A`/`O-B`，表格行首格或列表项皆可，至少 ' +
+    `${FEASIBILITY_DOC_CONTRACT.minOptions} 个、编号不得重复）、` +
+    `「## ${FEASIBILITY_DOC_CONTRACT.recommendationSectionTitle}」（必须点名已枚举的 option ID）、` +
+    `「## ${FEASIBILITY_DOC_CONTRACT.openQuestionsSectionTitle}」（每条带 safe default，确实没有时写「（无）」）。` +
+    ' Stop hook 会用与 conductor 终审同一份脚本校验该文件，不合格会被要求当场修复；' +
+    'conductor 收货时会再次终审，不采信口头汇报。最终回复只需一句话确认，不要粘贴 memo 全文。',
+  );
+  parts.push(
+    '# 指令\n实地探索 target 仓库后，把完整决策 memo 写入上面的交付文件。' +
+    ' 人审会按 option ID 点名选择；你的证据质量与 option 划分直接决定后续 spec 的方向正确性。',
+  );
+  return parts.filter(Boolean).join('\n\n');
+}
+
+/** 渲染人审 option 裁决段（spec-agent / spec-verifier prompt 共用）。 */
+function renderFeasibilityDecisionSection(decision) {
+  return [
+    `chosen_option: ${decision.chosen_option}`,
+    decision.notes ? `人审补充约束：${decision.notes}` : null,
+    '（完整 option 定义见上面的 Feasibility context；spec 不得偏离已选 option 及其约束。）',
+  ].filter(Boolean).join('\n');
+}
+
 export function buildSpecAgentPrompt(ts, cfg, round, { mode = 'draft' } = {}) {
   const setup = readSetupProfileMarkdown(cfg) || '(no approved setup profile found)';
   const feasibility = readFeasibilityContext(ts, cfg) || '(no feasibility-study context yet; placeholder for future feasibility-study agent)';
+  const brief = readBrief(ts);
+  const decision = readFeasibilityDecision(ts, cfg);
   const rejectNotes = readRejectNotes(ts);
   const history = readSpecReviewHistory(ts, cfg);
   const ctx = readLatestSpecRepairContext(ts, cfg);
@@ -574,8 +745,10 @@ export function buildSpecAgentPrompt(ts, cfg, round, { mode = 'draft' } = {}) {
     readAgentPrompt(cfg, 'spec-agent.md'),
     `# 任务 ${ts.id}（spec-agent r${round}, mode=${mode}, epoch=${ts.runtime.spec_epoch ?? 1})`,
     `标题：${ts.task.title ?? '(untitled)'}\nkind：${ts.task.kind}`,
+    brief.trim() ? `# 任务 brief\n\n${brief}` : '',
     `# Approved setup profile\n\n${setup}`,
     `# Feasibility context\n\n${feasibility}`,
+    decision ? `# 已选 option（人审裁决，spec 必须与之一致）\n\n${renderFeasibilityDecisionSection(decision)}` : '',
   ];
   if (rejectNotes.trim()) parts.push(`# Human reject notes\n\n${rejectNotes}`);
   if (ctx) {
@@ -609,13 +782,17 @@ export function buildSpecAgentPrompt(ts, cfg, round, { mode = 'draft' } = {}) {
 export function buildSpecVerifierPrompt(ts, cfg, round) {
   const setup = readSetupProfileMarkdown(cfg) || '(no approved setup profile found)';
   const feasibility = readFeasibilityContext(ts, cfg) || '(no feasibility-study context yet; placeholder for future feasibility-study agent)';
+  const brief = readBrief(ts);
+  const decision = readFeasibilityDecision(ts, cfg);
   const spec = readSpecDraft(ts, cfg);
   const history = readSpecReviewHistory(ts, cfg);
   return [
     readAgentPrompt(cfg, 'spec-verifier-agent.md'),
     `# 任务 ${ts.id} spec 审查（spec round ${round}）`,
+    brief.trim() ? `# 任务 brief\n\n${brief}` : '',
     `# Approved setup profile\n\n${setup}`,
     `# Feasibility context\n\n${feasibility}`,
+    decision ? `# 已选 option（人审裁决，spec 偏离即 blocker）\n\n${renderFeasibilityDecisionSection(decision)}` : '',
     history.trim() ? `# Prior spec-verifier reports\n\n${history}` : '',
     `# Spec draft under review\n\n${spec}`,
     `# Verdict contract\n${SPEC_VERIFIER_CONTRACT.id} ` +

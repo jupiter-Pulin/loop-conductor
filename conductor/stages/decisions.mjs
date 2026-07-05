@@ -4,6 +4,8 @@
 export const STAGES = [
   'NEEDS_TARGET_SETUP',
   'AWAIT_SETUP_APPROVAL',
+  'NEEDS_FEASIBILITY',
+  'AWAIT_FEASIBILITY_APPROVAL',
   'NEEDS_SPEC',
   'SPEC_VERIFY',
   'SPEC_FIXING',
@@ -216,6 +218,34 @@ export function approvalNext(approval) {
 /** NEEDS_SPEC 幂等保证：spec 草稿已存在且未被打回 → 跳过 spawn。 */
 export function needsSpecAction(specExists, approval) {
   return specExists && approval === null ? 'skip-spawn' : 'spawn';
+}
+
+/** NEEDS_FEASIBILITY 幂等保证（与 needsSpecAction 同构，独立命名以便两路各自演化）。 */
+export function needsFeasibilityAction(draftExists, approval) {
+  return draftExists && approval === null ? 'skip-spawn' : 'spawn';
+}
+
+/**
+ * AWAIT_FEASIBILITY_APPROVAL：纯读字段。null = 闸门未动，停住。
+ * approved（人已 --option 点名选项）→ NEEDS_SPEC；rejected → NEEDS_FEASIBILITY 重产。
+ */
+export function feasibilityApprovalNext(approval) {
+  if (approval === 'approved') return 'NEEDS_SPEC';
+  if (approval === 'rejected') return 'NEEDS_FEASIBILITY';
+  return null;
+}
+
+/**
+ * feasibility-agent 交付产物契约门失败（feasibility-doc/v1：缺选项对比/推荐/开放问题段、
+ * option 不足或重复）：留在 NEEDS_FEASIBILITY 重试，超额收箱。与 specContractInvalidNext
+ * 同构：这是交付协议失败，不是内容质量问题（后者归人审闸门）。
+ */
+export function feasibilityContractInvalidNext(invalidCount, maxInvalid) {
+  const c = (invalidCount ?? 0) + 1;
+  if (c > maxInvalid) {
+    return { exhausted: true, invalidCount: c, failureType: 'feasibility_contract_exhausted' };
+  }
+  return { exhausted: false, invalidCount: c, failureType: null };
 }
 
 /** FIXING 阶梯：miss==1 续原 maker（有 session 才行），其余冷启动。 */

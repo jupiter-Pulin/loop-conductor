@@ -48,8 +48,9 @@ test('feature 档：spec-agent → spec-verifier → 闸门停住 → approve �
   assert.equal(env.calls().length, 2, '闸门未批，不得 spawn maker');
   // spec-agent：只读探索 + 受限写（写白名单由 hook 强制），--settings 注入护栏；cwd 是 target 仓库
   const specCall = env.calls()[0];
-  assert.equal(specCall.argv[specCall.argv.indexOf('--tools') + 1], 'Read,Grep,Glob,Write,Edit');
-  assert.equal(specCall.argv[specCall.argv.indexOf('--allowedTools') + 1], 'Read,Grep,Glob,Write,Edit');
+  const SPEC_TOOLSET = 'Read,Grep,Glob,Bash(git log:*),Bash(git blame:*),Write,Edit';
+  assert.equal(specCall.argv[specCall.argv.indexOf('--tools') + 1], SPEC_TOOLSET);
+  assert.equal(specCall.argv[specCall.argv.indexOf('--allowedTools') + 1], SPEC_TOOLSET);
   assert.ok(specCall.argv.includes('--settings'), 'spec-agent spawn 带 --settings hook 护栏');
   assert.ok(specCall.argv.includes('--max-turns'), 'spec spawn 带 --max-turns');
   assert.ok(specCall.cwd.endsWith('target'));
