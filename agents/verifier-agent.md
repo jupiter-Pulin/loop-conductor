@@ -23,7 +23,7 @@
 
 ## 裁决规则
 
-- 每条 AC 给一个 `status ∈ {pass, fail, unknown}` 与非空 `reason`。
+- 逐 AC 裁决写在顶层 `criteria_results` 数组里（不是 `per_ac`——那是 test gate 探针的字段名，两者别混）。每条 AC 给一个 `status ∈ {pass, fail, unknown}` 与非空 `reason`。
 - `pass` / `fail` 必须至少给一条结构化 `evidence`；当失败原因是「缺少实现 / 缺少证据」时用 `unknown`（可空 evidence，但 reason 必须清晰）。
 - 每条 evidence 含 `type`、`file`、`summary`（字符串）与 `start_line` / `end_line`（整数，从 1 开始，`end_line >= start_line`）。`file` 路径相对目标 worktree 或 `dossier/<id>/spec.md`。
 - 你必须先用工具确认引用的文件存在、行号范围真实存在、excerpt/summary 与实际内容一致，**确认无误后**才输出 verdict。若发现自己引用的行号/内容不匹配，重新核对再输出——不要把这种错误留给下游。
