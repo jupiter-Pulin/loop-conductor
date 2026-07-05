@@ -143,6 +143,36 @@ test('buildBoard：needsHuman 仅人审 stage 为 true，working 仅非人审推
   assert.deepEqual(Object.keys(spec).sort(), ['box', 'id', 'kind', 'lane', 'needsHuman', 'spentUsd', 'stage', 'title', 'working'].sort());
 });
 
+// ---- 详情抽屉误显示 working 回归守卫：GET /api/task/<id> 载荷与看板同口径 ----
+
+test('buildTaskDetail：working/needsHuman 与 buildBoard 同口径——done/failed 恒 false，queue 人审 stage 只 needsHuman，queue 推进 stage 只 working', (t) => {
+  const root = mkroot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cfg = baseCfg(root);
+  ensureDirs(cfg);
+
+  writeNewTask(cfg.queueDir, baseTask('task-20260705-201'), baseRuntime('AWAIT_SPEC_APPROVAL'));
+  writeNewTask(cfg.queueDir, baseTask('task-20260705-202'), baseRuntime('READY'));
+  writeNewTask(cfg.doneDir, baseTask('task-20260705-203'), baseRuntime('DONE'));
+  writeNewTask(cfg.failedDir, baseTask('task-20260705-204'), baseRuntime('FAILED_BOX', { last_failure_type: 'crashed' }));
+
+  const humanStage = buildTaskDetail(cfg, 'task-20260705-201');
+  assert.equal(humanStage.needsHuman, true);
+  assert.equal(humanStage.working, false);
+
+  const advancingStage = buildTaskDetail(cfg, 'task-20260705-202');
+  assert.equal(advancingStage.needsHuman, false);
+  assert.equal(advancingStage.working, true);
+
+  const done = buildTaskDetail(cfg, 'task-20260705-203');
+  assert.equal(done.needsHuman, false);
+  assert.equal(done.working, false);
+
+  const failed = buildTaskDetail(cfg, 'task-20260705-204');
+  assert.equal(failed.needsHuman, false);
+  assert.equal(failed.working, false);
+});
+
 // ---- AC-008：坏任务目录降级 ----
 
 test('buildBoard：坏任务目录不抛错，降级进 broken；queue 中 lane 不可判定的残留任务同样进 broken（AC-008）', (t) => {
