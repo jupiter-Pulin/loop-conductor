@@ -128,3 +128,10 @@ export function diffNameStatusAgainstBase(wtPath, baseBranch) {
   if (r.status === 0) return r.stdout;
   return git(['diff', '--name-status', 'HEAD'], wtPath).stdout ?? '';
 }
+
+/** 同上的 --stat 摘要（committer 起草 merge commit 文案时的变更规模输入）。 */
+export function diffStatAgainstBase(wtPath, baseBranch) {
+  const r = git(['diff', '--stat', `${baseBranch}...HEAD`], wtPath);
+  if (r.status === 0) return r.stdout;
+  return git(['diff', '--stat', 'HEAD'], wtPath).stdout ?? '';
+}

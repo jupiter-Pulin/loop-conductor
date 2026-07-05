@@ -11,6 +11,7 @@ import { withTaskLock, TaskLockBusyError } from './lib/task-lock.mjs';
 import { currentBranch, mergeBranch, removeWorktree, deleteBranch } from './lib/git.mjs';
 import { DEFAULT_TEST_GLOBS } from './lib/test-gate.mjs';
 import { hasApprovedSetupProfile } from './lib/profile.mjs';
+import { runCommitterProposal } from './stages/shared.mjs';
 import needsTargetSetupHandler from './stages/needs_target_setup.mjs';
 import awaitSetupApprovalHandler from './stages/await_setup_approval.mjs';
 import needsSpecHandler from './stages/needs_spec.mjs';
@@ -69,7 +70,7 @@ export function loadCfg(root = resolveRoot()) {
     lockHeartbeatMs: 60000,
     maxStepsPerTask: 20,
     runBudgetUsd: null,
-    models: { setup: null, spec: null, specVerifier: null, maker: null, verifier: null },
+    models: { setup: null, spec: null, specVerifier: null, maker: null, verifier: null, committer: null },
   };
   let user = {};
   try {
@@ -440,8 +441,12 @@ async function cmdMerge(cfg, id) {
   }
   const branch = `task/${id}`;
   const wt = path.join(cfg.worktreesDir, id);
+  // merge commit 文案：committer 提案 + validateCommitMessage 裁决，两次不过 / 预算超限
+  // 降级机器文案（fail-open，绝不 block merge）。轮次 commit 颗粒度不丢：merge 保持
+  // --no-ff，任务分支上的 maker r<n> commit 原样保留在历史里。
+  const proposal = await runCommitterProposal(ts, cfg);
   try {
-    mergeBranch(cfg.targetRepo, branch, `merge ${branch} (conductor)`);
+    mergeBranch(cfg.targetRepo, branch, proposal ?? `merge ${branch} (conductor)`);
   } catch (err) {
     console.error(`merge 失败（任务保持原状）：${err.message}`);
     process.exitCode = 1;
