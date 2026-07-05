@@ -250,10 +250,9 @@ export function makeEnv(t, { config = {}, trackedHarness = false } = {}) {
   return api;
 }
 
-/** 从 fake-claude 日志条目取 -p 后面的 prompt。 */
+/** 从 fake-claude 日志条目取 prompt 正文（经 stdin 传入，fake-claude 原样记录）。 */
 export function promptOf(call) {
-  const i = call.argv.indexOf('-p');
-  return i === -1 ? '' : call.argv[i + 1];
+  return call.prompt ?? '';
 }
 
 /** 日志条目是否为 resume 调用（带 -r <sid>）。 */
