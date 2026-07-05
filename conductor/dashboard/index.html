@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loop Conductor Dashboard</title>
+<style>
+  :root {
+    --bg: #faf6ee;
+    --card-bg: #ffffff;
+    --border: #e4ddd0;
+    --text: #2b2a28;
+    --muted: #8a8378;
+    --blue: #2b6cb0;
+    --blue-dark: #1d4e82;
+    --red: #c0392b;
+    --orange: #d97e1f;
+    --orange-bg: #fdf1e2;
+    --green: #2f7d4f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  h1, h2, h3, .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; }
+  header.top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 20px 28px;
+  }
+  header.top h1 { margin: 0; font-size: 20px; letter-spacing: 0.02em; }
+  button { font: inherit; cursor: pointer; }
+  .btn { border: none; border-radius: 8px; padding: 8px 16px; font-weight: 600; }
+  .btn-primary { background: var(--blue); color: #fff; }
+  .btn-primary:hover { background: var(--blue-dark); }
+  .btn-primary:disabled { background: #a9c3dd; cursor: not-allowed; }
+  .btn-danger { background: #fff; color: var(--red); border: 1px solid var(--red); }
+  .btn-danger:disabled { color: #d9a9a2; border-color: #eccfc9; cursor: not-allowed; }
+  .btn-ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+
+  .boxes { display: flex; gap: 12px; padding: 0 28px 12px; }
+  .box-toggle {
+    border: 1px solid var(--border); background: #fff; border-radius: 20px;
+    padding: 6px 14px; font-size: 13px; font-weight: 600;
+  }
+  .box-toggle.done { color: var(--green); }
+  .box-toggle.failed { color: var(--red); }
+  .collapsible { padding: 0 28px 12px; display: flex; flex-direction: column; gap: 6px; }
+  .collapsible[hidden] { display: none; }
+  .box-row {
+    display: flex; gap: 10px; align-items: center; background: #fff; border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 12px; font-size: 13px; cursor: pointer;
+  }
+  .box-row:hover { border-color: var(--muted); }
+
+  main { padding: 0 28px 40px; }
+  .lane { margin-bottom: 22px; }
+  .lane-header {
+    display: flex; align-items: center; gap: 8px; text-transform: uppercase;
+    font-size: 12px; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 8px;
+  }
+  .lane-header .you-label { color: var(--muted); text-transform: none; font-size: 11px; }
+  .lane-flag { color: var(--orange); }
+  .lane-row { display: flex; gap: 12px; flex-wrap: wrap; }
+
+  .card {
+    background: var(--card-bg); border: 1px solid var(--border); border-left: 4px solid transparent;
+    border-radius: 10px; padding: 10px 14px; min-width: 230px; max-width: 280px;
+    box-shadow: 0 1px 2px rgba(0,0,0,.05); cursor: pointer;
+  }
+  .card:hover { border-color: var(--muted); }
+  .card.needs-human { border-left-color: var(--orange); background: var(--orange-bg); }
+  .card .top-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .badge { font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 5px; letter-spacing: .03em; }
+  .badge-kind.feature { background: #dbe9f8; color: var(--blue-dark); }
+  .badge-kind.bugfix { background: #f8dbd8; color: var(--red); }
+  .card .spent { font-size: 12px; color: var(--muted); }
+  .card .task-id { font-family: monospace; font-size: 11px; color: var(--muted); }
+  .card .title { font-size: 13px; margin-top: 6px; }
+  .card .needs-you {
+    display: inline-flex; align-items: center; gap: 4px; margin-top: 8px; font-size: 11px; font-weight: 700;
+    color: #fff; background: var(--orange); padding: 2px 8px; border-radius: 6px;
+  }
+  .card .review-btn { margin-top: 8px; display: inline-block; font-size: 12px; font-weight: 700; color: var(--orange); }
+  .card .working { margin-top: 8px; font-size: 12px; color: var(--muted); }
+  .idle-card {
+    border: 1px dashed var(--border); border-radius: 10px; padding: 14px; color: var(--muted);
+    font-size: 12px; min-width: 230px;
+  }
+
+  .overlay { position: fixed; inset: 0; background: rgba(30,26,20,.35); display: flex; z-index: 50; }
+  .overlay[hidden] { display: none; }
+  .overlay.align-right { justify-content: flex-end; }
+  .overlay.align-center { justify-content: center; align-items: center; }
+
+  .drawer { width: 680px; max-width: 95vw; height: 100%; background: #fff; overflow-y: auto; padding: 24px; }
+  .panel {
+    width: 560px; max-width: 95vw; max-height: 90vh; overflow-y: auto; background: #fff;
+    border-radius: 12px; padding: 24px;
+  }
+  .drawer-header, .panel-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+  .close-x { background: none; border: none; font-size: 20px; color: var(--muted); }
+
+  .stage-dots { display: flex; align-items: center; gap: 4px; margin: 16px 0 20px; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--border); background: #fff; flex-shrink: 0; }
+  .dot.done { background: var(--muted); border-color: var(--muted); }
+  .dot.current { background: var(--orange); border-color: var(--orange); }
+  .dot-line { flex: 1; height: 2px; background: var(--border); }
+
+  .drawer-body { display: flex; gap: 24px; }
+  .main-col { flex: 1; min-width: 0; }
+  .timeline-col { width: 220px; flex-shrink: 0; border-left: 1px solid var(--border); padding-left: 16px; }
+  .timeline-item { font-size: 12px; margin-bottom: 12px; color: var(--muted); }
+
+  pre.readonly {
+    white-space: pre-wrap; word-break: break-word; background: #faf8f4; border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px; font-size: 12px; max-height: 45vh; overflow-y: auto;
+  }
+  .option-card { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; cursor: pointer; }
+  .option-card.selected { border-color: var(--blue); background: #eef4fb; }
+  .option-card .option-id { font-weight: 700; font-family: monospace; margin-right: 8px; }
+  textarea, input[type=text] { width: 100%; border: 1px solid var(--border); border-radius: 8px; padding: 8px; font: inherit; }
+  .field { margin-bottom: 14px; }
+  .field label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin-bottom: 4px; }
+  .action-row { display: flex; gap: 10px; margin-top: 16px; }
+  .kind-cards { display: flex; gap: 12px; margin-bottom: 16px; }
+  .kind-card { flex: 1; border: 1px solid var(--border); border-radius: 10px; padding: 16px; text-align: center; cursor: pointer; }
+  .kind-card.selected { border-color: var(--blue); background: #eef4fb; }
+  details.advanced { margin: 16px 0; font-size: 13px; }
+  details.advanced summary { cursor: pointer; color: var(--muted); }
+  .advanced-field { display: flex; justify-content: space-between; padding: 4px 0; font-size: 12px; color: var(--muted); }
+  .result-box { margin-top: 16px; }
+  .broken-banner {
+    background: #fdeceb; border: 1px solid #f3c8c3; color: var(--red); padding: 10px 14px;
+    border-radius: 8px; font-size: 12px; margin-bottom: 16px;
+  }
+</style>
+</head>
+<body>
+<header class="top">
+  <h1>Tasks · by agent</h1>
+  <button class="btn btn-primary" id="btn-new-task">+ 新建任务</button>
+</header>
+
+<div class="boxes">
+  <button class="box-toggle done" id="toggle-done">✓ Done · <span id="done-count">0</span></button>
+  <button class="box-toggle failed" id="toggle-failed">✕ Failed · <span id="failed-count">0</span></button>
+</div>
+<div class="collapsible" id="done-list" hidden></div>
+<div class="collapsible" id="failed-list" hidden></div>
+
+<main>
+  <div id="broken-banner-slot"></div>
+  <div id="lanes"></div>
+</main>
+
+<div class="overlay align-right" id="drawer-overlay" hidden>
+  <div class="drawer" id="drawer"></div>
+</div>
+
+<div class="overlay align-center" id="panel-overlay" hidden>
+  <div class="panel" id="new-task-panel"></div>
+</div>
+
+<script>
+const LANES = [
+  { key: 'setup', label: 'setup' },
+  { key: 'feasibility', label: 'feasibility' },
+  { key: 'spec', label: 'spec' },
+  { key: 'maker', label: 'maker' },
+  { key: 'verify', label: 'verify' },
+  { key: 'merge', label: 'merge', you: true },
+];
+
+let latestBoard = null;
+let drawerTaskId = null;
+let lastDetail = null;
+let selectedOption = null;
+let pendingActionMessage = null;
+
+function el(tag, attrs, children) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k === 'class') e.className = v;
+    else if (k === 'text') e.textContent = v;
+    else if (k.startsWith('on') && typeof v === 'function') e.addEventListener(k.slice(2), v);
+    else e.setAttribute(k, v);
+  }
+  for (const c of [].concat(children || [])) {
+    if (c == null) continue;
+    e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+  }
+  return e;
+}
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  let body = null;
+  try { body = await res.json(); } catch { body = null; }
+  return { status: res.status, body };
+}
+
+function fmtUsd(n) { return `$${Number(n || 0).toFixed(2)}`; }
+
+// ---- 屏 1：看板 ----
+
+function taskCard(entry) {
+  const card = el('div', {
+    class: 'card' + (entry.needsHuman ? ' needs-human' : ''),
+    onclick: () => openDrawer(entry.id),
+  }, [
+    el('div', { class: 'top-row' }, [
+      el('span', { class: 'task-id', text: entry.id }),
+      el('span', { class: 'spent', text: fmtUsd(entry.spentUsd) }),
+    ]),
+    el('div', {}, [
+      el('span', { class: `badge badge-kind ${entry.kind}`, text: String(entry.kind || '?').toUpperCase() }),
+    ]),
+    el('div', { class: 'title', text: entry.title || '(无标题)' }),
+  ]);
+  if (entry.needsHuman) {
+    card.appendChild(el('div', { class: 'needs-you', text: '⚑ needs you' }));
+    card.appendChild(el('div', { class: 'review-btn', text: 'Review →' }));
+  } else if (entry.working) {
+    card.appendChild(el('div', { class: 'working', text: '↻ working…' }));
+  }
+  return card;
+}
+
+function renderLanes(board) {
+  const container = document.getElementById('lanes');
+  container.innerHTML = '';
+  for (const laneDef of LANES) {
+    const laneData = board.lanes.find((l) => l.lane === laneDef.key) || { tasks: [] };
+    const hasHuman = laneData.tasks.some((t) => t.needsHuman);
+    const header = el('div', { class: 'lane-header' }, [
+      el('span', { text: laneDef.label }),
+      hasHuman ? el('span', { class: 'lane-flag', text: '⚑' }) : null,
+      laneDef.you ? el('span', { class: 'you-label', text: 'you · merge' }) : null,
+    ]);
+    const row = el('div', { class: 'lane-row' });
+    if (laneData.tasks.length === 0) {
+      row.appendChild(el('div', { class: 'idle-card', text: 'idle · 无任务' }));
+    } else {
+      for (const entry of laneData.tasks) row.appendChild(taskCard(entry));
+    }
+    container.appendChild(el('div', { class: 'lane' }, [header, row]));
+  }
+}
+
+function renderBoxList(containerId, tasks) {
+  const container = document.getElementById(containerId);
+  container.innerHTML = '';
+  for (const entry of tasks) {
+    container.appendChild(el('div', { class: 'box-row', onclick: () => openDrawer(entry.id) }, [
+      el('span', { class: 'task-id', text: entry.id }),
+      el('span', { class: `badge badge-kind ${entry.kind}`, text: String(entry.kind || '?').toUpperCase() }),
+      el('span', { text: entry.title || '' }),
+      el('span', { class: 'spent', text: fmtUsd(entry.spentUsd) }),
+    ]));
+  }
+}
+
+function renderBrokenBanner(broken) {
+  const slot = document.getElementById('broken-banner-slot');
+  slot.innerHTML = '';
+  if (!broken || broken.length === 0) return;
+  slot.appendChild(el('div', {
+    class: 'broken-banner',
+    text: `⚠ ${broken.length} 个任务目录状态异常：${broken.map((b) => b.id).join(', ')}`,
+  }));
+}
+
+async function loadBoard() {
+  const { status, body } = await api('/api/board');
+  if (status !== 200 || !body) return;
+  latestBoard = body;
+  document.getElementById('done-count').textContent = body.done.length;
+  document.getElementById('failed-count').textContent = body.failed.length;
+  renderLanes(body);
+  renderBoxList('done-list', body.done);
+  renderBoxList('failed-list', body.failed);
+  renderBrokenBanner(body.broken);
+}
+
+document.getElementById('toggle-done').addEventListener('click', () => {
+  const list = document.getElementById('done-list');
+  list.hidden = !list.hidden;
+});
+document.getElementById('toggle-failed').addEventListener('click', () => {
+  const list = document.getElementById('failed-list');
+  list.hidden = !list.hidden;
+});
+
+// ---- 屏 2：详情抽屉 ----
+
+function closeDrawer() {
+  drawerTaskId = null;
+  lastDetail = null;
+  selectedOption = null;
+  pendingActionMessage = null;
+  document.getElementById('drawer-overlay').hidden = true;
+}
+
+async function openDrawer(id) {
+  drawerTaskId = id;
+  selectedOption = null;
+  pendingActionMessage = null;
+  document.getElementById('drawer-overlay').hidden = false;
+  await refreshDrawer();
+}
+
+async function refreshDrawer() {
+  if (!drawerTaskId) return;
+  const { status, body } = await api(`/api/task/${encodeURIComponent(drawerTaskId)}`);
+  lastDetail = status === 200 ? body : null;
+  renderDrawerFromCache();
+}
+
+function renderDrawerFromCache() {
+  const drawer = document.getElementById('drawer');
+  drawer.innerHTML = '';
+  if (!lastDetail) { drawer.appendChild(el('div', { text: '任务未找到或已归档' })); return; }
+  renderDrawer(drawer, drawerTaskId, lastDetail);
+}
+
+function stageDots(lane, box) {
+  const wrap = el('div', { class: 'stage-dots' });
+  const curIdx = lane != null ? LANES.findIndex((l) => l.key === lane) : -1;
+  LANES.forEach((laneDef, i) => {
+    let state = 'future';
+    if (box === 'done') state = 'done';
+    else if (curIdx >= 0) {
+      if (i < curIdx) state = 'done';
+      else if (i === curIdx) state = 'current';
+    }
+    wrap.appendChild(el('span', {
+      class: 'dot' + (state === 'done' ? ' done' : state === 'current' ? ' current' : ''),
+      title: laneDef.label,
+    }));
+    if (i < LANES.length - 1) wrap.appendChild(el('span', { class: 'dot-line' }));
+  });
+  return wrap;
+}
+
+async function doAction(id, action, body) {
+  const { body: resBody } = await api(`/api/task/${encodeURIComponent(id)}/${action}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  });
+  return resBody;
+}
+
+async function submitAction(id, action, body) {
+  pendingActionMessage = await doAction(id, action, body);
+  loadBoard();
+  await refreshDrawer();
+}
+
+function renderDrawer(drawer, id, detail) {
+  const task = detail.task;
+  const runtime = detail.runtime;
+  const review = detail.review;
+  const needsHuman = ['setup', 'feasibility', 'spec', 'merge'].includes(review.kind);
+
+  drawer.appendChild(el('div', { class: 'drawer-header' }, [
+    el('div', {}, [
+      el('div', { class: 'mono', text: id }),
+      task ? el('span', { class: `badge badge-kind ${task.kind}`, text: String(task.kind).toUpperCase() }) : null,
+      el('h2', { text: task ? task.title : '(损坏任务目录)' }),
+      el('div', { text: `stage: ${runtime ? runtime.stage : '(unknown)'}` }),
+      needsHuman ? el('span', { class: 'needs-you', text: '⚑ needs you' }) : null,
+    ]),
+    el('button', { class: 'close-x', text: '×', onclick: closeDrawer }),
+  ]));
+  drawer.appendChild(stageDots(detail.lane, detail.box));
+
+  const body = el('div', { class: 'drawer-body' });
+  const mainCol = el('div', { class: 'main-col' });
+  const resultSlot = el('div', { class: 'result-box' });
+  if (pendingActionMessage) {
+    resultSlot.appendChild(el('pre', {
+      class: 'readonly',
+      text: pendingActionMessage.message || (pendingActionMessage.ok ? 'ok' : 'failed'),
+    }));
+  }
+
+  if (review.kind === 'feasibility') {
+    mainCol.appendChild(el('h3', { text: 'Feasibility memo' }));
+    mainCol.appendChild(el('pre', { class: 'readonly', text: review.missing ? review.message : review.markdown }));
+    mainCol.appendChild(el('h3', { text: 'YOUR DECISION · PICK AN OPTION' }));
+    const optionsWrap = el('div', {});
+    for (const opt of review.options || []) {
+      optionsWrap.appendChild(el('div', {
+        class: 'option-card' + (selectedOption === opt.option_id ? ' selected' : ''),
+        onclick: () => { selectedOption = opt.option_id; renderDrawerFromCache(); },
+      }, [
+        el('span', { class: 'option-id', text: opt.option_id }),
+        el('span', { text: opt.text }),
+      ]));
+    }
+    mainCol.appendChild(optionsWrap);
+    const notes = el('textarea', { id: 'fb-notes', rows: 3 });
+    mainCol.appendChild(el('div', { class: 'field' }, [el('label', { text: '备注（可选）' }), notes]));
+    const approveLabel = selectedOption ? `Approve · 选 ${selectedOption} 继续` : 'Approve · 请先选择一个 option';
+    const approveBtn = el('button', {
+      class: 'btn btn-primary', text: approveLabel,
+      onclick: () => submitAction(id, 'approve-feasibility', { option: selectedOption, notes: notes.value }),
+    });
+    approveBtn.disabled = !selectedOption;
+    const rejectBtn = el('button', {
+      class: 'btn btn-danger', text: 'Reject',
+      onclick: () => submitAction(id, 'reject-feasibility', { notes: notes.value }),
+    });
+    mainCol.appendChild(el('div', { class: 'action-row' }, [approveBtn, rejectBtn]));
+  } else if (review.kind === 'setup') {
+    mainCol.appendChild(el('h3', { text: 'Setup profile 草稿' }));
+    mainCol.appendChild(el('pre', { class: 'readonly', text: review.missing ? review.message : review.markdown }));
+    const approveBtn = el('button', {
+      class: 'btn btn-primary', text: 'Approve',
+      onclick: () => submitAction(id, 'approve-setup', {}),
+    });
+    mainCol.appendChild(el('div', { class: 'action-row' }, [approveBtn]));
+  } else if (review.kind === 'spec') {
+    mainCol.appendChild(el('h3', { text: 'Spec 草稿' }));
+    mainCol.appendChild(el('pre', { class: 'readonly', text: review.missing ? review.message : review.markdown }));
+    const notes = el('textarea', { id: 'spec-notes', rows: 3 });
+    mainCol.appendChild(el('div', { class: 'field' }, [el('label', { text: 'Reject 备注（必填）' }), notes]));
+    const approveBtn = el('button', {
+      class: 'btn btn-primary', text: 'Approve',
+      onclick: () => submitAction(id, 'approve', {}),
+    });
+    const rejectBtn = el('button', {
+      class: 'btn btn-danger', text: 'Reject',
+      onclick: () => submitAction(id, 'reject', { notes: notes.value }),
+    });
+    rejectBtn.disabled = true;
+    notes.addEventListener('input', () => { rejectBtn.disabled = notes.value.trim() === ''; });
+    mainCol.appendChild(el('div', { class: 'action-row' }, [approveBtn, rejectBtn]));
+  } else if (review.kind === 'merge') {
+    mainCol.appendChild(el('h3', { text: 'Diff 摘要' }));
+    mainCol.appendChild(el('pre', { class: 'readonly', text: review.error ? review.error : review.diffShortstat }));
+    const mergeBtn = el('button', {
+      class: 'btn btn-primary', text: 'Merge',
+      onclick: () => submitAction(id, 'merge', {}),
+    });
+    mainCol.appendChild(el('div', { class: 'action-row' }, [mergeBtn]));
+  } else if (review.kind === 'failed') {
+    mainCol.appendChild(el('h3', { text: '失败信息' }));
+    mainCol.appendChild(el('div', { text: review.lastFailureType || '(未知失败类型)' }));
+    const retryBtn = el('button', {
+      class: 'btn btn-danger', text: '↻ Retry',
+      onclick: () => submitAction(id, 'retry', {}),
+    });
+    mainCol.appendChild(el('div', { class: 'action-row' }, [retryBtn]));
+  } else if (review.kind === 'broken') {
+    mainCol.appendChild(el('div', { class: 'broken-banner', text: review.error }));
+  } else {
+    mainCol.appendChild(el('div', { text: `当前 stage：${runtime ? runtime.stage : '?'}` }));
+    mainCol.appendChild(el('div', { class: 'working', text: '↻ working…' }));
+  }
+
+  mainCol.appendChild(resultSlot);
+  body.appendChild(mainCol);
+
+  const timelineCol = el('div', { class: 'timeline-col' }, [el('h3', { text: 'Timeline' })]);
+  const lines = (detail.timeline || '').split('\n').map((l) => l.trim()).filter((l) => l.startsWith('- '));
+  if (lines.length === 0) {
+    timelineCol.appendChild(el('div', { class: 'timeline-item', text: '(无记录)' }));
+  } else {
+    for (const line of lines) timelineCol.appendChild(el('div', { class: 'timeline-item', text: line.slice(2) }));
+  }
+  body.appendChild(timelineCol);
+  drawer.appendChild(body);
+}
+
+document.getElementById('drawer-overlay').addEventListener('click', (e) => {
+  if (e.target.id === 'drawer-overlay') closeDrawer();
+});
+
+// ---- 屏 3：新建任务面板 ----
+
+let newTaskState = { kind: null, feasibility: null };
+
+document.getElementById('btn-new-task').addEventListener('click', () => {
+  newTaskState = { kind: null, feasibility: null };
+  document.getElementById('panel-overlay').hidden = false;
+  renderNewTaskPanel();
+});
+document.getElementById('panel-overlay').addEventListener('click', (e) => {
+  if (e.target.id === 'panel-overlay') document.getElementById('panel-overlay').hidden = true;
+});
+
+function renderNewTaskPanel(resultBody) {
+  const panel = document.getElementById('new-task-panel');
+  panel.innerHTML = '';
+  panel.appendChild(el('div', { class: 'panel-header' }, [
+    el('h2', { text: '新建任务' }),
+    el('button', { class: 'close-x', text: '×', onclick: () => { document.getElementById('panel-overlay').hidden = true; } }),
+  ]));
+
+  const kindWrap = el('div', { class: 'kind-cards' });
+  for (const k of ['bugfix', 'feature']) {
+    kindWrap.appendChild(el('div', {
+      class: 'kind-card' + (newTaskState.kind === k ? ' selected' : ''),
+      onclick: () => { newTaskState.kind = k; renderNewTaskPanel(); },
+      text: k === 'bugfix' ? 'bugfix 修 bug' : 'feature 加功能',
+    }));
+  }
+  panel.appendChild(kindWrap);
+
+  if (newTaskState.kind === 'feature') {
+    const fWrap = el('div', { class: 'field' }, [el('label', { text: 'Feasibility gate' })]);
+    fWrap.appendChild(el('div', {
+      class: 'option-card' + (newTaskState.feasibility === false ? ' selected' : ''),
+      onclick: () => { newTaskState.feasibility = false; renderNewTaskPanel(); },
+      text: 'Skip feasibility → 直接产出 spec',
+    }));
+    fWrap.appendChild(el('div', {
+      class: 'option-card' + (newTaskState.feasibility === true ? ' selected' : ''),
+      onclick: () => { newTaskState.feasibility = true; renderNewTaskPanel(); },
+      text: 'Run feasibility gate first',
+    }));
+    panel.appendChild(fWrap);
+  }
+
+  panel.appendChild(el('div', { class: 'field' }, [el('label', { text: 'Title' }), el('input', { type: 'text', id: 'nt-title' })]));
+  panel.appendChild(el('div', { class: 'field' }, [
+    el('label', { text: 'Brief（原始需求描述，创建后随任务保存）' }),
+    el('textarea', { id: 'nt-brief', rows: 5 }),
+  ]));
+
+  const cfg = (latestBoard && latestBoard.config) || {};
+  panel.appendChild(el('details', { class: 'advanced' }, [
+    el('summary', { text: '高级参数（只读）' }),
+    el('div', { class: 'advanced-field' }, [el('span', { text: 'target repo' }), el('span', { text: cfg.targetRepo || '' })]),
+    el('div', { class: 'advanced-field' }, [el('span', { text: 'base branch' }), el('span', { text: cfg.baseBranch || '(currentBranch)' })]),
+    el('div', { class: 'advanced-field' }, [el('span', { text: 'test command' }), el('span', { text: cfg.testCommand || '' })]),
+  ]));
+
+  const resultSlot = el('div', { class: 'result-box' });
+  if (resultBody) {
+    resultSlot.appendChild(el('pre', { class: 'readonly', text: resultBody.message || (resultBody.ok ? 'ok' : 'failed') }));
+  }
+
+  const submitBtn = el('button', {
+    class: 'btn btn-primary', text: '创建并运行 · Create & Run',
+    onclick: async () => {
+      const title = document.getElementById('nt-title').value;
+      const brief = document.getElementById('nt-brief').value;
+      const reqBody = { kind: newTaskState.kind, title, brief };
+      if (newTaskState.kind === 'feature') reqBody.feasibility = newTaskState.feasibility === true;
+      const { body: resBody } = await api('/api/new-task', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(reqBody),
+      });
+      loadBoard();
+      renderNewTaskPanel(resBody);
+    },
+  });
+  submitBtn.disabled = !newTaskState.kind;
+  const cancelBtn = el('button', {
+    class: 'btn btn-ghost', text: '取消',
+    onclick: () => { document.getElementById('panel-overlay').hidden = true; },
+  });
+  panel.appendChild(el('div', { class: 'action-row' }, [submitBtn, cancelBtn]));
+  panel.appendChild(resultSlot);
+}
+
+loadBoard();
+setInterval(loadBoard, 1500);
+</script>
+</body>
+</html>

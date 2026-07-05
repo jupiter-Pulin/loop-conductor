@@ -2,6 +2,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test tests/",
-    "conductor": "node conductor/conductor.mjs"
+    "conductor": "node conductor/conductor.mjs",
+    "dashboard": "node conductor/dashboard/server.mjs"
   }
 }
