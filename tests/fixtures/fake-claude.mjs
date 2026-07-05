@@ -17,6 +17,8 @@ if (!scriptPath) {
   console.error('fake-claude: FAKE_CLAUDE_SCRIPT not set');
   process.exit(2);
 }
+// prompt 正文不再经 argv 传入（MAX_ARG_STRLEN 红线），改从 stdin 读（对齐 lib/claude.mjs::runClaudeStream）。
+const prompt = fs.readFileSync(0, 'utf8');
 const counterPath = `${scriptPath}.counter`;
 const scenario = JSON.parse(fs.readFileSync(scriptPath, 'utf8'));
 const n = fs.existsSync(counterPath) ? Number(fs.readFileSync(counterPath, 'utf8')) : 0;
@@ -25,7 +27,7 @@ fs.writeFileSync(counterPath, String(n + 1));
 if (process.env.FAKE_CLAUDE_LOG) {
   fs.appendFileSync(
     process.env.FAKE_CLAUDE_LOG,
-    `${JSON.stringify({ call: n, argv: process.argv.slice(2), cwd: process.cwd(), started_at_ms: Date.now() })}\n`,
+    `${JSON.stringify({ call: n, argv: process.argv.slice(2), prompt, cwd: process.cwd(), started_at_ms: Date.now() })}\n`,
   );
 }
 

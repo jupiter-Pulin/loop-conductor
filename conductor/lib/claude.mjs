@@ -18,7 +18,6 @@ export function claudeBin() {
  * 两者语义不同：--tools 决定 agent 能看见哪些工具，--allowedTools 决定哪些调用免人工审批。
  */
 export function buildClaudeArgs({
-  prompt,
   resume = null,
   outputFormat = 'stream-json',
   maxTurns = null,
@@ -30,7 +29,7 @@ export function buildClaudeArgs({
 }) {
   const args = [];
   if (resume) args.push('-r', String(resume));
-  args.push('-p', prompt, '--output-format', outputFormat);
+  args.push('-p', '--output-format', outputFormat); // prompt 正文不进 argv，改由 runClaudeStream 写子进程 stdin（避免超长 diff 撑爆 MAX_ARG_STRLEN）
   if (outputFormat === 'stream-json') args.push('--verbose');
   if (maxTurns != null) args.push('--max-turns', String(maxTurns));
   if (tools && tools.length > 0) args.push('--tools', tools.join(','));
@@ -70,7 +69,7 @@ export function runClaudeStream(opts) {
         cwd: opts.cwd,
         env: process.env,
         detached: true,
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: ['pipe', 'pipe', 'pipe'],
       });
     } catch (err) {
       resolve({
@@ -79,6 +78,9 @@ export function runClaudeStream(opts) {
       });
       return;
     }
+    child.stdin.on('error', () => { /* 子进程未消费即退出（如启动失败）时忽略 EPIPE */ });
+    child.stdin.write(String(opts.prompt ?? ''));
+    child.stdin.end();
 
     const stdoutChunks = [];
     const stderrChunks = [];
