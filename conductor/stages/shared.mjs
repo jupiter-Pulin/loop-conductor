@@ -542,9 +542,14 @@ export function buildSpecVerifierPrompt(ts, cfg, round) {
     history.trim() ? `# Prior spec-verifier reports\n\n${history}` : '',
     `# Spec draft under review\n\n${spec}`,
     `# Verdict contract\n${SPEC_VERIFIER_CONTRACT.id} ` +
-    `(schema_version=${SPEC_VERIFIER_CONTRACT.schemaVersion})；最终回复必须是严格 JSON，不要 Markdown 围栏。`,
+    `(schema_version=${SPEC_VERIFIER_CONTRACT.schemaVersion})。`,
     '# JSON 字段\n必须包含 schema_version、round、overall、summary、human_report、spec_agent_feedback、findings。' +
     ' findings 每项含 severity(blocker|major|minor)、audience(human|spec-agent|both)、issue、recommendation。',
+    '# 输出纪律（协议要求，机械校验，不可违反）\n' +
+    '最终回复的第一个字符必须是 `{`，最后一个字符必须是 `}`；`{` 之前与 `}` 之后不得有任何字符——' +
+    '不要输出解释文字、总结、Markdown 代码围栏（包括 ```json）、空行或提示语。' +
+    '探索与推理过程留在工具调用轮次里，不要出现在最终回复中。' +
+    '不合规输出会被机械拒收，并烧掉一次重试预算。',
   ].filter(Boolean).join('\n\n');
 }
 
@@ -822,7 +827,11 @@ export function buildVerifierPrompt(ts, cfg, round, acList) {
     '`conductor/stages/decisions.mjs::validateVerifierVerdict`，本 prompt 不复制 schema。',
     '# 指令\n只做静态对照：diff 是否满足上面每一条验收标准。可用 Read/Grep/Glob 与 `git diff` / `git log`' +
     ' 进一步只读检查；不许跑测试，不许改文件。\n' +
-    '最终回复必须是且仅是符合 verdict contract 的严格 JSON；不要输出解释文字、不要 Markdown 围栏。\n' +
+    '# 输出纪律（协议要求，机械校验，不可违反）\n' +
+    '最终回复的第一个字符必须是 `{`，最后一个字符必须是 `}`；`{` 之前与 `}` 之后不得有任何字符——' +
+    '不要输出任何说明、总结、Markdown 代码围栏（包括 ```json）、空行或提示语。' +
+    '探索、推理、自我核对都必须留在工具调用轮次里，不要出现在最终回复中；最终回复只能是符合 verdict contract 的严格 JSON。' +
+    '不合规输出会被机械拒收，并烧掉一次重试预算。\n' +
     `conductor 会把合法 verdict 落盘为 dossier/${id}/verify-r${round}.verdict.json，并且只信该文件。`,
   ].filter(Boolean).join('\n\n');
 }
