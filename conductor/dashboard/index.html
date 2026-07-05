@@ -367,7 +367,7 @@ function renderDrawer(drawer, id, detail) {
   const task = detail.task;
   const runtime = detail.runtime;
   const review = detail.review;
-  const needsHuman = ['setup', 'feasibility', 'spec', 'merge'].includes(review.kind);
+  const needsHuman = detail.needsHuman;
 
   drawer.appendChild(el('div', { class: 'drawer-header' }, [
     el('div', {}, [
@@ -463,7 +463,7 @@ function renderDrawer(drawer, id, detail) {
     mainCol.appendChild(el('div', { class: 'broken-banner', text: review.error }));
   } else {
     mainCol.appendChild(el('div', { text: `当前 stage：${runtime ? runtime.stage : '?'}` }));
-    mainCol.appendChild(el('div', { class: 'working', text: '↻ working…' }));
+    if (detail.working === true) mainCol.appendChild(el('div', { class: 'working', text: '↻ working…' }));
   }
 
   mainCol.appendChild(resultSlot);
