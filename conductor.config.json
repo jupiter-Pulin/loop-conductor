@@ -3,8 +3,10 @@
   "maxTurns": 30,
   "testCommand": "node --test",
   "targetRepo": "./target",
+  "feasibilityEnabled": false,
   "models": {
     "setup": null,
+    "feasibility": null,
     "spec": null,
     "specVerifier": null,
     "maker": null,

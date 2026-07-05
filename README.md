@@ -13,6 +13,7 @@
 | worktree、diff、commit、merge | `conductor/lib/git.mjs` |
 | setup profile 存储 | `conductor/lib/profile.mjs` |
 | spec 交付契约（spec-doc/v1，AC 枚举/校验） | `conductor/lib/spec-contract.mjs` |
+| feasibility 交付契约（feasibility-doc/v1，option 枚举/校验） | `conductor/lib/feasibility-contract.mjs` |
 | test gate 纯函数（测试 glob / 变更分类 / AC→测试映射校验） | `conductor/lib/test-gate.mjs` |
 | agent hook 脚本（spec 写白名单、Stop 契约预检、maker git 护栏） | `conductor/hooks/` |
 | 纯路由和 schema 判断 | `conductor/stages/decisions.mjs` |
@@ -27,7 +28,8 @@
 | 角色 | Prompt | Spawn 位置 | 职责 |
 | --- | --- | --- | --- |
 | setup | `agents/setup-agent.md` | `conductor/stages/needs_target_setup.mjs` | 只读探索 target repo，产出可复用 setup profile。 |
-| spec | `agents/spec-agent.md` | `conductor/stages/needs_spec.mjs`, `conductor/stages/spec_fixing.mjs` | 直写 `specs/<id>.md`（唯一交付物，hook 写白名单 + Stop 预检 + conductor 契约门终审）。 |
+| feasibility | `agents/feasibility-agent.md` | `conductor/stages/needs_feasibility.mjs` | 直写任务目录 feasibility-study.md（决策 memo：证据 + O-X option 对比 + 推荐 + 开放问题；hook 写白名单 + Stop 预检 + conductor 契约门终审），人按 option ID 点名裁决。 |
+| spec | `agents/spec-agent.md` | `conductor/stages/needs_spec.mjs`, `conductor/stages/spec_fixing.mjs` | 直写 `specs/<id>.md`（唯一交付物，hook 写白名单 + Stop 预检 + conductor 契约门终审）；吃 brief / 冻结 feasibility memo / 已选 option。 |
 | spec-verifier | `agents/spec-verifier-agent.md` | `conductor/stages/spec_verify.mjs` | 用严格 JSON 审查 spec 质量。 |
 | maker | `agents/maker-agent.md` | `conductor/stages/ready.mjs`, `conductor/stages/fixing.mjs` | 修改任务 worktree，使冻结 spec 全部满足（git 破坏性操作由逐轮 settings hook 拦截）。 |
 | verifier | `agents/verifier-agent.md` | `conductor/stages/verify.mjs` | 冷读 spec + diff，逐条裁决 AC。 |
@@ -38,6 +40,11 @@
 ```text
 可选 setup gate:
 NEEDS_TARGET_SETUP -> AWAIT_SETUP_APPROVAL -> natural task stage
+
+可选 feasibility gate（feature + task.feasibility，new --feasibility / config.feasibilityEnabled）:
+NEEDS_FEASIBILITY -> AWAIT_FEASIBILITY_APPROVAL --approve-feasibility --option O-X--> NEEDS_SPEC
+feasibility 契约门（feasibility-doc/v1）fail -> 原地重试 feasibility-agent，耗尽 -> FAILED_BOX
+reject-feasibility -> NEEDS_FEASIBILITY 重产（notes 进下轮 prompt）
 
 feature:
 NEEDS_SPEC -> SPEC_VERIFY -> SPEC_FIXING -> SPEC_VERIFY -> AWAIT_SPEC_APPROVAL -> READY
@@ -62,9 +69,11 @@ FAILED_BOX --retry--> READY or NEEDS_SPEC
 npm test
 npm run conductor -- status
 npm run conductor -- new --kind bugfix --title "..."
-npm run conductor -- new --kind feature --title "..."
+npm run conductor -- new --kind feature --title "..." [--brief <file>] [--feasibility]
 npm run conductor -- run
 npm run conductor -- approve-setup <id>
+npm run conductor -- approve-feasibility <id> --option O-X [--notes "..."]
+npm run conductor -- reject-feasibility <id> --notes "..."
 npm run conductor -- approve <id>
 npm run conductor -- reject <id> --notes "..."
 npm run conductor -- merge <id>
@@ -78,9 +87,11 @@ npm run conductor -- retry <id>
 | `state/queue|failed|done/<id>/task.json` | 不可变任务快照。 |
 | `state/queue|failed|done/<id>/runtime.json` | 可变状态机记录。 |
 | `state/queue/<id>/spec.md` | bugfix 冻结前的 spec 草稿。 |
+| `state/queue/<id>/brief.md` | `new --brief` 落盘的需求原文（喂 feasibility/spec 链）。 |
+| `state/queue/<id>/feasibility-study.md` | 人审前的 feasibility 决策 memo 草稿（归档进同目录 feasibility-archive/）。 |
 | `target-profiles/<repo>/` | setup profile 草稿/批准稿。 |
 | `specs/<id>.md` | feature 人审前的 spec 草稿。 |
-| `dossier/<id>/` | 唯一 agent 交接媒介：冻结 spec、spawn 记录、verdict、repair context、契约门结果（spec-check-r\<n\>.json 为 conductor 终审、.hook.json 为沙箱内预检证据）、test gate 探针结果（test-gate-r\<n\>.json）、逐轮 hook settings、timeline。 |
+| `dossier/<id>/` | 唯一 agent 交接媒介：冻结 spec、冻结 feasibility memo + 人审 decision（feasibility-study.md / feasibility-decision.json）、spawn 记录、verdict、repair context、契约门结果（spec-check-r\<n\>.json / feasibility-check-r\<n\>.json 为 conductor 终审、.hook.json 为沙箱内预检证据）、test gate 探针结果（test-gate-r\<n\>.json）、逐轮 hook settings、timeline。 |
 | `worktrees/<id>/` | target repo 的任务 worktree。 |
 | `target/` | demo target repo。不要在仓库根裸跑 `node --test`；用 `npm test`。 |
 
@@ -91,6 +102,7 @@ npm run conductor -- retry <id>
 | bugfix happy path + merge | `tests/integration/happy-path.test.mjs` |
 | feature spec 审批路径 | `tests/integration/feature-flow.test.mjs` |
 | setup gate + spec repair loop | `tests/integration/setup-spec-loop.test.mjs` |
+| feasibility gate（option 人审 + 契约门 + brief 注入） | `tests/integration/feasibility-flow.test.mjs` |
 | spec 直写交付 + 契约门（hook 护栏） | `tests/integration/spec-contract-gate.test.mjs` |
 | maker git 护栏（--settings 注入形态） | `tests/integration/maker-git-guard.test.mjs` |
 | green gate 修复路径 | `tests/integration/green-gate.test.mjs` |

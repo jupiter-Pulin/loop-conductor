@@ -15,6 +15,7 @@ export const FAKE_CLAUDE = path.join(REPO_ROOT, 'tests', 'fixtures', 'fake-claud
 
 const AGENT_STUBS = {
   'setup-agent.md': '# setup stub\n',
+  'feasibility-agent.md': '# feasibility stub\n',
   'spec-agent.md': '# spec stub\n',
   'spec-verifier-agent.md': '# spec verifier stub\n',
   'maker-agent.md': '# maker stub\n',

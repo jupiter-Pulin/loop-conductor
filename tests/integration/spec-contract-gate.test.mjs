@@ -27,7 +27,7 @@ const GOOD_SPEC_V2 = GOOD_SPEC.replace('# 功能 spec', '# 功能 spec v2');
 // 同义标题：契约门必须拒绝（标题不逐字）。
 const BAD_SPEC_TITLE = '# spec\n\n## Acceptance Criteria\n\n- AC-001: whatever\n';
 
-const SPEC_TOOLS_ARGV = 'Read,Grep,Glob,Write,Edit';
+const SPEC_TOOLS_ARGV = 'Read,Grep,Glob,Bash(git log:*),Bash(git blame:*),Write,Edit';
 
 function newFeature(env, title) {
   const created = env.run('new', '--kind', 'feature', '--title', title);
