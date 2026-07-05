@@ -438,6 +438,12 @@ async function cmdMerge(cfg, id) {
     process.exitCode = 1;
     return;
   }
+  const cur = currentBranch(cfg.targetRepo);
+  if (cur !== ts.task.baseBranch) {
+    console.error(`merge 拒绝：target 仓库当前分支 ${cur} ≠ 任务 baseBranch ${ts.task.baseBranch}（任务保持原状）`);
+    process.exitCode = 1;
+    return;
+  }
   const branch = `task/${id}`;
   const wt = path.join(cfg.worktreesDir, id);
   try {
