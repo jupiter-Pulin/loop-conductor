@@ -47,6 +47,15 @@ export function isValidTaskId(id) {
 
 // ---- board 聚合（AC-005/006/007/008） ----
 
+/** box+stage → { needsHuman, working } 判定（唯一口径，board 与详情抽屉共用）。 */
+function computeWorkingFlags(box, stage) {
+  const lane = laneForStage(stage);
+  return {
+    needsHuman: box === 'queue' && HUMAN_STAGES.includes(stage),
+    working: box === 'queue' && lane != null && !HUMAN_STAGES.includes(stage),
+  };
+}
+
 function taskEntry(ts) {
   const stage = ts.runtime.stage;
   const lane = laneForStage(stage);
@@ -57,8 +66,7 @@ function taskEntry(ts) {
     stage,
     box: ts.box,
     lane,
-    needsHuman: ts.box === 'queue' && HUMAN_STAGES.includes(stage),
-    working: ts.box === 'queue' && lane != null && !HUMAN_STAGES.includes(stage),
+    ...computeWorkingFlags(ts.box, stage),
     spentUsd: ts.runtime.spent_usd ?? 0,
   };
 }
@@ -173,7 +181,10 @@ export function buildTaskDetail(cfg, id) {
     dossierDir: state.dossierPath(cfg, id),
   };
   if (ts.error) {
-    return { task: null, runtime: null, box: ts.box, lane: null, timeline, paths, review: { kind: 'broken', error: ts.error } };
+    return {
+      task: null, runtime: null, box: ts.box, lane: null, needsHuman: false, working: false,
+      timeline, paths, review: { kind: 'broken', error: ts.error },
+    };
   }
   const stage = ts.runtime.stage;
   return {
@@ -181,6 +192,7 @@ export function buildTaskDetail(cfg, id) {
     runtime: ts.runtime,
     box: ts.box,
     lane: laneForStage(stage),
+    ...computeWorkingFlags(ts.box, stage),
     timeline,
     paths,
     review: buildReview(cfg, ts, stage),
