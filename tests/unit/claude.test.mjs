@@ -1,10 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildClaudeArgs, parseClaudeJson, claudeBin } from '../../conductor/lib/claude.mjs';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { buildClaudeArgs, parseClaudeJson, claudeBin, runClaudeStream } from '../../conductor/lib/claude.mjs';
+import { FAKE_CLAUDE } from '../helpers/env.mjs';
 
-test('buildClaudeArgs：冷启动', () => {
+test('buildClaudeArgs：冷启动（prompt 不进 argv，走 stdin）', () => {
   const args = buildClaudeArgs({ prompt: 'do it', maxTurns: 30 });
-  assert.deepEqual(args, ['-p', 'do it', '--output-format', 'stream-json', '--verbose', '--max-turns', '30']);
+  assert.deepEqual(args, ['-p', '--output-format', 'stream-json', '--verbose', '--max-turns', '30']);
 });
 
 test('buildClaudeArgs：resume 带 -r 前置', () => {
@@ -47,6 +51,40 @@ test('parseClaudeJson：标准/带噪音/坏输出', () => {
   assert.equal(parseClaudeJson(''), null);
   assert.equal(parseClaudeJson('not json'), null);
   assert.equal(parseClaudeJson(null), null);
+});
+
+test('runClaudeStream：超长 prompt（≥300KB）经 stdin 传递，argv 不含 prompt 正文', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-stdin-it-'));
+  const scenarioPath = path.join(dir, 'scenario.json');
+  const logPath = path.join(dir, 'log.jsonl');
+  fs.writeFileSync(scenarioPath, JSON.stringify([{ session_id: 'sess-big', cost: 0.01, result: 'ok' }]));
+  const bigPrompt = `${'A'.repeat(300 * 1024)}\n末尾标记END`;
+
+  const prevEnv = {
+    CLAUDE_BIN: process.env.CLAUDE_BIN,
+    FAKE_CLAUDE_SCRIPT: process.env.FAKE_CLAUDE_SCRIPT,
+    FAKE_CLAUDE_LOG: process.env.FAKE_CLAUDE_LOG,
+  };
+  process.env.CLAUDE_BIN = FAKE_CLAUDE;
+  process.env.FAKE_CLAUDE_SCRIPT = scenarioPath;
+  process.env.FAKE_CLAUDE_LOG = logPath;
+  try {
+    const res = await runClaudeStream({ prompt: bigPrompt, cwd: dir, maxTurns: 5 });
+    assert.equal(res.ok, true, res.error);
+    assert.equal(res.sessionId, 'sess-big');
+
+    const call = JSON.parse(fs.readFileSync(logPath, 'utf8').trim());
+    assert.equal(call.prompt, bigPrompt, 'fake-claude 收到的 prompt 与发送内容完全一致');
+    for (const a of call.argv) {
+      assert.equal(a.includes('END'), false, 'argv 不含 prompt 正文');
+      assert.ok(a.length < 1024, `argv 元素不应携带大段 prompt 正文：len=${a.length}`);
+    }
+  } finally {
+    for (const [k, v] of Object.entries(prevEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('claudeBin：CLAUDE_BIN 环境变量覆盖（fake-claude 挂载点）', () => {

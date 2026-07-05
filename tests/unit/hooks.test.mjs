@@ -188,6 +188,38 @@ test('git-guard：引号内字面 "git push" 不误报（commit message）', () 
   assert.equal(r.status, 0, r.stderr);
 });
 
+test('git-guard：命令替换 $(...) / 反引号内的 git 调用被拦截（含双引号内替换）', () => {
+  const denied = [
+    'echo $(git push)',
+    'echo `git push origin main`',
+    'git commit -m "$(git push)"',
+  ];
+  for (const command of denied) {
+    const r = runHook(GIT_GUARD, [], bashCall(command));
+    assert.equal(r.status, 2, `应拦截：${command}`);
+    assert.match(r.stderr, /maker-git-guard 拦截/, command);
+  }
+});
+
+test('git-guard：单引号内的 $(...) 是字面量，不展开不误报', () => {
+  const r = runHook(GIT_GUARD, [], bashCall("git commit -m '$(git push)'"));
+  assert.equal(r.status, 0, r.stderr);
+});
+
+test('git-guard：checkout -f/--force 变体被拦截；-b 建分支与普通切换分支放行', () => {
+  const denied = ['git checkout -f', 'git checkout --force main', 'git checkout -xf'];
+  for (const command of denied) {
+    const r = runHook(GIT_GUARD, [], bashCall(command));
+    assert.equal(r.status, 2, `应拦截：${command}`);
+    assert.match(r.stderr, /maker-git-guard 拦截/, command);
+  }
+  const allowed = ['git checkout -b feature', 'git checkout main'];
+  for (const command of allowed) {
+    const r = runHook(GIT_GUARD, [], bashCall(command));
+    assert.equal(r.status, 0, `不应拦截：${command}（stderr: ${r.stderr}）`);
+  }
+});
+
 test('git-guard：非 Bash 工具与空命令不拦', () => {
   for (const input of [
     { tool_name: 'Write', tool_input: { file_path: '/x' } },
