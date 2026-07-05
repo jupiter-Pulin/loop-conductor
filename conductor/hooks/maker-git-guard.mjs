@@ -44,6 +44,7 @@ function judge({ subcommand, rest }) {
     case 'clean':
       return hasForceFlag ? 'git clean -f（删除未追踪文件）' : null;
     case 'checkout':
+      if (hasForceFlag) return 'git checkout -f / --force（强制丢弃 worktree 改动）';
       return rest.includes('--') || rest.includes('.')
         ? 'git checkout -- <path> / git checkout .（丢弃 worktree 改动）'
         : null;
@@ -87,12 +88,56 @@ function quotedContents(command) {
   return contents;
 }
 
+/**
+ * 抽取命令替换 `$(...)` / 反引号内部会被 shell 展开执行的内容（双引号内、无引号处都展开；
+ * 单引号内是字面量，跳过不展开，如 `git commit -m '$(git push)'`）。
+ */
+function extractSubstitutions(command) {
+  const results = [];
+  let inSingle = false;
+  let i = 0;
+  while (i < command.length) {
+    const ch = command[i];
+    if (inSingle) {
+      if (ch === "'") inSingle = false;
+      i += 1;
+      continue;
+    }
+    if (ch === "'") {
+      inSingle = true;
+      i += 1;
+      continue;
+    }
+    if (ch === '$' && command[i + 1] === '(') {
+      let depth = 1;
+      let j = i + 2;
+      while (j < command.length && depth > 0) {
+        if (command[j] === '(') depth += 1;
+        else if (command[j] === ')') depth -= 1;
+        j += 1;
+      }
+      results.push(command.slice(i + 2, depth === 0 ? j - 1 : j));
+      i = j;
+      continue;
+    }
+    if (ch === '`') {
+      const end = command.indexOf('`', i + 1);
+      results.push(command.slice(i + 1, end === -1 ? command.length : end));
+      i = end === -1 ? command.length : end + 1;
+      continue;
+    }
+    i += 1;
+  }
+  return results;
+}
+
 function findDanger(command) {
   let segments = stripQuoted(command).split(/[;|&\n]+/);
   // sh -c '<payload>' 的引号内容是真要执行的命令，单独展开判定。
   if (/\b(?:sh|bash|zsh|dash)\s+(?:-[A-Za-z]+\s+)*-c\b/.test(command)) {
     segments = segments.concat(quotedContents(command).flatMap((inner) => inner.split(/[;|&\n]+/)));
   }
+  segments = segments.concat(extractSubstitutions(command).flatMap((inner) => inner.split(/[;|&\n]+/)));
   for (const segment of segments) {
     const invocation = gitInvocation(segment);
     if (!invocation) continue;
