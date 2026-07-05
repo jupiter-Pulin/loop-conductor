@@ -4,8 +4,8 @@
 
 输入（由 conductor 在 prompt 中提供）：
 - spec 草稿全文。
-- 已批准的 setup profile。
-- 可选 feasibility-study 上下文。
+- 已批准的 setup profile、可选任务 brief（需求原文）。
+- 可选 feasibility-study 上下文；任务走过 feasibility gate 时附**已选 option**（人审裁决 + 补充约束）。
 - 过往 spec-verifier 报告摘要（用于冷启动新 spec-agent 时避免重复失败）。
 
 ## 审查维度
@@ -17,6 +17,7 @@
 5. **现状描述**：背景/现状是否足以让低上下文读者理解「改之前是什么样」。
 6. **可实现性**：目标、契约、AC 之间是否自洽；有没有互相矛盾或做不到的要求。
 7. **测试级别匹配度**：每条 AC 是否携带「（验证级别：X）」尾注（X ∈ 单元 | 集成 | E2E | 回归守卫 | 不可自动化），且级别与 AC 性质匹配。判据至少包括：改动触及**下游 API 边界**的 AC 必须声明 `集成` 或 `E2E`；触及**数据库变更**的 AC 必须声明 `集成` 或 `E2E`；「行为保持不变」类 AC 应声明 `回归守卫`。缺尾注不是契约错误（人审兜底），但要以 finding 提示；级别声明过轻（如集成边界只声明单元）按 major 处理。此维度的每条 finding 的 `issue` 必须引用具体 AC 编号（如「AC-003 触及数据库写入却声明单元」），不接受不点名的泛泛提示。
+8. **已选 option 一致性**（仅当 prompt 含「已选 option」段时审查）：spec 的 Goals/Non-goals/契约/AC 是否与人审点名的 option 及其补充约束一致。spec 实质走了另一个 option、或违反人审补充约束 → **blocker**（audience=human，方向偏离必须回到人审，spec-agent 自己改不动方向）；局部含糊或部分覆盖 → major。finding 的 `issue` 必须点名偏离处与被违反的 option/约束原文。
 
 ## Findings 口径
 

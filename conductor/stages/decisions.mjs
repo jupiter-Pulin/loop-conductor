@@ -4,6 +4,8 @@
 export const STAGES = [
   'NEEDS_TARGET_SETUP',
   'AWAIT_SETUP_APPROVAL',
+  'NEEDS_FEASIBILITY',
+  'AWAIT_FEASIBILITY_APPROVAL',
   'NEEDS_SPEC',
   'SPEC_VERIFY',
   'SPEC_FIXING',
@@ -24,6 +26,31 @@ export const VERIFIER_VERDICT_CONTRACT = Object.freeze({
   overallValues: Object.freeze(['pass', 'fail']),
   criterionStatuses: Object.freeze(['pass', 'fail', 'unknown']),
 });
+
+/**
+ * verdict 字段骨架（喂 verifier prompt 用）：字段名与 validateVerifierVerdict 逐字一致。
+ * verifier 的 cwd 是 target worktree，读不到本文件，prompt 必须自带字段形态；
+ * 从契约常量生成而非手写复制，保证 prompt 与裁判不漂移。`a|b` 表示枚举取值。
+ */
+export function verifierVerdictSkeleton(round = 1) {
+  const { schemaVersion, overallValues, criterionStatuses } = VERIFIER_VERDICT_CONTRACT;
+  return {
+    schema_version: schemaVersion,
+    round,
+    overall: overallValues.join('|'),
+    criteria_results: [
+      {
+        ac_id: 'AC-###（与枚举清单逐字一致，无缺无多）',
+        status: criterionStatuses.join('|'),
+        reason: '非空字符串',
+        evidence: [
+          { type: 'code', file: '相对路径', summary: '非空字符串', start_line: 1, end_line: 1 },
+        ],
+      },
+    ],
+    non_ac_findings: [],
+  };
+}
 
 /** spec-verifier 的程序级契约：包含机器路由字段 + 人类/spec-agent 可读报告字段。 */
 export const SPEC_VERIFIER_CONTRACT = Object.freeze({
@@ -191,6 +218,34 @@ export function approvalNext(approval) {
 /** NEEDS_SPEC 幂等保证：spec 草稿已存在且未被打回 → 跳过 spawn。 */
 export function needsSpecAction(specExists, approval) {
   return specExists && approval === null ? 'skip-spawn' : 'spawn';
+}
+
+/** NEEDS_FEASIBILITY 幂等保证（与 needsSpecAction 同构，独立命名以便两路各自演化）。 */
+export function needsFeasibilityAction(draftExists, approval) {
+  return draftExists && approval === null ? 'skip-spawn' : 'spawn';
+}
+
+/**
+ * AWAIT_FEASIBILITY_APPROVAL：纯读字段。null = 闸门未动，停住。
+ * approved（人已 --option 点名选项）→ NEEDS_SPEC；rejected → NEEDS_FEASIBILITY 重产。
+ */
+export function feasibilityApprovalNext(approval) {
+  if (approval === 'approved') return 'NEEDS_SPEC';
+  if (approval === 'rejected') return 'NEEDS_FEASIBILITY';
+  return null;
+}
+
+/**
+ * feasibility-agent 交付产物契约门失败（feasibility-doc/v1：缺选项对比/推荐/开放问题段、
+ * option 不足或重复）：留在 NEEDS_FEASIBILITY 重试，超额收箱。与 specContractInvalidNext
+ * 同构：这是交付协议失败，不是内容质量问题（后者归人审闸门）。
+ */
+export function feasibilityContractInvalidNext(invalidCount, maxInvalid) {
+  const c = (invalidCount ?? 0) + 1;
+  if (c > maxInvalid) {
+    return { exhausted: true, invalidCount: c, failureType: 'feasibility_contract_exhausted' };
+  }
+  return { exhausted: false, invalidCount: c, failureType: null };
 }
 
 /** FIXING 阶梯：miss==1 续原 maker（有 session 才行），其余冷启动。 */
