@@ -70,6 +70,16 @@ test('buildVerifierPrompt：输出纪律明确首字符 { / 尾字符 }，禁止
   assert.match(prompt, /机械拒收/, '必须说明违规输出会被机械拒收');
 });
 
+test('buildVerifierPrompt：内嵌契约生成的 verdict 字段骨架（verifier 读不到裁判代码，字段名必须随 prompt 下发）', (t) => {
+  const { cfg, ts } = makeFixture(t);
+  const prompt = buildVerifierPrompt(ts, cfg, 2, [{ ac_id: 'AC-001', text: 'stub ac' }]);
+  assert.match(prompt, /"criteria_results"/, '骨架必须点名 criteria_results 容器字段');
+  assert.match(prompt, /"ac_id"/);
+  assert.match(prompt, /"evidence"/);
+  assert.match(prompt, /"non_ac_findings"/);
+  assert.match(prompt, /"round": 2/, '骨架 round 必须钉死为本轮轮次');
+});
+
 test('buildSpecVerifierPrompt：输出纪律明确首字符 { / 尾字符 }，禁止前后缀与围栏', (t) => {
   const { cfg, ts } = makeFixture(t);
   const prompt = buildSpecVerifierPrompt(ts, cfg, 1);

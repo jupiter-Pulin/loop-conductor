@@ -25,6 +25,31 @@ export const VERIFIER_VERDICT_CONTRACT = Object.freeze({
   criterionStatuses: Object.freeze(['pass', 'fail', 'unknown']),
 });
 
+/**
+ * verdict 字段骨架（喂 verifier prompt 用）：字段名与 validateVerifierVerdict 逐字一致。
+ * verifier 的 cwd 是 target worktree，读不到本文件，prompt 必须自带字段形态；
+ * 从契约常量生成而非手写复制，保证 prompt 与裁判不漂移。`a|b` 表示枚举取值。
+ */
+export function verifierVerdictSkeleton(round = 1) {
+  const { schemaVersion, overallValues, criterionStatuses } = VERIFIER_VERDICT_CONTRACT;
+  return {
+    schema_version: schemaVersion,
+    round,
+    overall: overallValues.join('|'),
+    criteria_results: [
+      {
+        ac_id: 'AC-###（与枚举清单逐字一致，无缺无多）',
+        status: criterionStatuses.join('|'),
+        reason: '非空字符串',
+        evidence: [
+          { type: 'code', file: '相对路径', summary: '非空字符串', start_line: 1, end_line: 1 },
+        ],
+      },
+    ],
+    non_ac_findings: [],
+  };
+}
+
 /** spec-verifier 的程序级契约：包含机器路由字段 + 人类/spec-agent 可读报告字段。 */
 export const SPEC_VERIFIER_CONTRACT = Object.freeze({
   id: 'spec-verifier-verdict/v1',

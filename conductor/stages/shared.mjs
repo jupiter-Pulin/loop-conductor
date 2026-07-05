@@ -16,7 +16,7 @@ import { addRunCost, canStartSpawn } from '../lib/scheduler.mjs';
 import { SPEC_DOC_CONTRACT, validateSpecDoc } from '../lib/spec-contract.mjs';
 import {
   overBudget, testGateVerdict, perAcProbeVerdict, perAcGateVerdict,
-  parseStrictJson, validateCommitMessage,
+  parseStrictJson, validateCommitMessage, verifierVerdictSkeleton,
   SPEC_VERIFIER_CONTRACT, VERIFIER_VERDICT_CONTRACT, COMMIT_MESSAGE_CONTRACT,
 } from './decisions.mjs';
 
@@ -915,7 +915,9 @@ export function buildVerifierPrompt(ts, cfg, round, acList) {
     probeSection,
     `# Verdict contract\n${VERIFIER_VERDICT_CONTRACT.id} ` +
     `(schema_version=${VERIFIER_VERDICT_CONTRACT.schemaVersion})；唯一程序级校验在 ` +
-    '`conductor/stages/decisions.mjs::validateVerifierVerdict`，本 prompt 不复制 schema。',
+    '`conductor/stages/decisions.mjs::validateVerifierVerdict`（该文件不在你的 worktree 内，' +
+    '以下字段骨架由该契约生成，字段名必须逐字一致；`a|b` 表示枚举取值，round 固定为本轮）：\n\n' +
+    `\`\`\`json\n${JSON.stringify(verifierVerdictSkeleton(round), null, 2)}\n\`\`\``,
     '# 指令\n只做静态对照：diff 是否满足上面每一条验收标准。可用 Read/Grep/Glob 与 `git diff` / `git log`' +
     ' 进一步只读检查；不许跑测试，不许改文件。\n' +
     '# 输出纪律（协议要求，机械校验，不可违反）\n' +
