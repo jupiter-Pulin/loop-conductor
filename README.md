@@ -122,6 +122,7 @@ npm run conductor -- retry <id>
 | setup race | `tests/integration/setup-race.test.mjs` |
 | worktree harness exclude | `tests/integration/worktree-harness.test.mjs` |
 | verifier diff 上限降级 | `tests/integration/verifier-diff-cap.test.mjs` |
+| web dashboard（看板聚合 + 详情 review + CLI 透传闸门） | `tests/integration/dashboard-server.test.mjs` |
 
 ## 索引规则
 
