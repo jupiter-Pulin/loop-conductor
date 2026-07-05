@@ -34,6 +34,11 @@ export const SPEC_AGENT_TOOLS = [...READONLY_TOOLS, 'Write', 'Edit'];
  *  同一集合既作 --tools（硬限制）又作 --allowedTools（免审批放行）。 */
 export const VERIFIER_TOOLS = ['Read', 'Grep', 'Glob', 'Bash(git diff:*)', 'Bash(git log:*)'];
 
+/** maker 不做 --tools 硬限制（全工具可见），只补 --allowedTools 免审批放行 Bash
+ *  （headless 下无人审批，需要能跑测试命令与本地 git add/commit）；
+ *  破坏性 git 操作已由逐轮注入的 maker-git-guard hook（见 writeMakerSettings）拦截。 */
+export const MAKER_ALLOWED_TOOLS = ['Bash'];
+
 /** worktree harness 排除（契约 §8）。exclude patterns 与 tracked 检测名分开。 */
 export const HARNESS_ARTIFACTS = {
   // 写进 worktree-local .git/info/exclude 的 gitignore pattern。
@@ -843,6 +848,7 @@ export async function runMakerRound(ts, cfg, round, { mode, prompt, coldPrompt, 
   const common = {
     cwd: wt,
     permissionMode: 'acceptEdits',
+    allowedTools: MAKER_ALLOWED_TOOLS,
     maxTurns: cfg.maxTurns,
     model: cfg.models?.maker ?? null,
     settings,

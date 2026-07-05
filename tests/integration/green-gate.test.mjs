@@ -46,6 +46,12 @@ test('green gate 失败 → repair-context(green_gate) → FIXING → 修复 →
   const calls = env.calls();
   assert.equal(calls.length, 3, 'maker r1 + maker r2(resume) + verifier r2');
   assert.equal(resumeIdOf(calls[1]), 'sess-m1', 'FIXING 第一档 resume 原 maker');
+
+  // maker resume 调用同样要带 --allowedTools（含 Bash）：headless 下无人审批，
+  // resume 修复轮同样需要跑测试命令 / 本地 git commit。
+  const resumeAllowedTools = calls[1].argv[calls[1].argv.indexOf('--allowedTools') + 1];
+  assert.ok(resumeAllowedTools, 'maker resume spawn 带 --allowedTools');
+  assert.ok(resumeAllowedTools.split(',').includes('Bash'), 'maker resume --allowedTools 含 Bash');
   const repairPrompt = promptOf(calls[1]);
   assert.ok(repairPrompt.includes('"green_gate_ref": "green-gate-r1.json"'), 'repair prompt 保留 green_gate_ref');
   assert.ok(repairPrompt.includes('"green_gate"'), 'repair prompt 展开 green_gate 摘要给 maker');

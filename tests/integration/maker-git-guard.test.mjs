@@ -29,6 +29,13 @@ test('maker spawn：--settings 指向 dossier 逐轮 git 护栏 settings，内�
   const settingsPath = makerCall.argv[makerCall.argv.indexOf('--settings') + 1];
   assert.equal(settingsPath, env.dossier(id, 'maker-r1.settings.json'), '--settings 指向逐轮 git 护栏文件');
 
+  // maker（cold）：headless 无人审批，--allowedTools 须放行 Bash（跑测试/本地 git commit），
+  // 且仍不带 --tools（全工具可见，spec §3.3 只对 plan/verifier 等只读角色做硬限制）。
+  assert.equal(makerCall.argv.includes('--tools'), false, 'maker 不做 --tools 硬限制');
+  const allowedTools = makerCall.argv[makerCall.argv.indexOf('--allowedTools') + 1];
+  assert.ok(allowedTools, 'maker cold spawn 带 --allowedTools');
+  assert.ok(allowedTools.split(',').includes('Bash'), 'maker --allowedTools 含 Bash');
+
   // settings 内容：PreToolUse 只匹配 Bash，hook 命令锚到 maker-git-guard.mjs
   const settings = env.readJson(settingsPath);
   const pre = settings.hooks.PreToolUse[0];
