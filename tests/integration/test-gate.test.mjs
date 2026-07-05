@@ -54,6 +54,8 @@ test('削弱测试骗过 green gate → test gate 判 vacuous → FIXING → 真
   assert.equal(tg1.round, 1);
   assert.equal(tg1.exit_code, 0);
   assert.equal(tg1.verdict, 'vacuous');
+  assert.equal(tg1.mode, 'suite', '映射缺失 → 降级 v1 全量模式（AC-010）');
+  assert.equal(tg1.mapping_status, 'missing');
   assert.ok(tg1.overlay.copied.includes('test/stats.test.mjs'), '削弱的测试文件被叠加到基线');
   assert.ok(tg1.base_commit, '记录基线 commit（merge-base）');
 
@@ -137,6 +139,10 @@ test('testGateEnabled=false：完全跳过探针，行为与现状一致（AC-00
   const after = env.findTask(id);
   assert.equal(after.runtime.stage, 'AWAIT_HUMAN_MERGE');
   assert.equal(after.runtime.maker_miss_count, 0);
+
+  // AC-004（A 批）：探针记录缺失 → verifier prompt 无探针段
+  const verifierPrompt = promptOf(env.calls()[1]);
+  assert.ok(!verifierPrompt.includes('# Test gate 探针结果'), '无探针记录时 prompt 不得有探针段');
 });
 
 test('默认开启：真修复轮（无测试改动）探针 falsifies 放行，产物完备（AC-001/004）', (t) => {
@@ -159,6 +165,18 @@ test('默认开启：真修复轮（无测试改动）探针 falsifies 放行，
   assert.equal(tg.command, 'node --test');
   assert.equal(tg.base_branch, 'main');
   assert.ok(typeof tg.stdout_tail === 'string', '基线运行输出留 tail');
+  assert.equal(tg.mode, 'suite', '无映射时保持 v1 全量模式');
+  assert.equal(tg.mapping_status, 'missing');
+
+  // AC-004（A 批）：探针记录存在 → verifier prompt 嵌固定标题机械事实段（去 stdout/stderr tail）
+  const verifierPrompt = promptOf(env.calls()[1]);
+  assert.ok(
+    verifierPrompt.includes('# Test gate 探针结果（conductor 机械事实，审计测试证明力时以此为锚）'),
+    'verifier prompt 应嵌探针段固定标题',
+  );
+  assert.ok(verifierPrompt.includes('"verdict": "falsifies"'), '探针段含机械 verdict');
+  assert.ok(!verifierPrompt.includes('stdout_tail'), '探针段不得带 stdout_tail');
+  assert.ok(!verifierPrompt.includes('stderr_tail'), '探针段不得带 stderr_tail');
 
   const after = env.findTask(id);
   assert.equal(after.runtime.stage, 'AWAIT_HUMAN_MERGE');

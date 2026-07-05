@@ -13,13 +13,13 @@
 | worktree、diff、commit、merge | `conductor/lib/git.mjs` |
 | setup profile 存储 | `conductor/lib/profile.mjs` |
 | spec 交付契约（spec-doc/v1，AC 枚举/校验） | `conductor/lib/spec-contract.mjs` |
-| test gate 纯函数（测试 glob / 变更分类） | `conductor/lib/test-gate.mjs` |
+| test gate 纯函数（测试 glob / 变更分类 / AC→测试映射校验） | `conductor/lib/test-gate.mjs` |
 | agent hook 脚本（spec 写白名单、Stop 契约预检、maker git 护栏） | `conductor/hooks/` |
 | 纯路由和 schema 判断 | `conductor/stages/decisions.mjs` |
 | agent 角色 prompt | `agents/*.md` |
 | 行为 case | `tests/integration/*.test.mjs` |
 | 单元级不变量 | `tests/unit/*.test.mjs` |
-| 最近一次实现证据 | `docs/features/setup-spec-loop/request-log.md` |
+| 最近一次实现证据 | `docs/features/test-evidence-chain/request-log.md` |
 
 ## 当前角色
 
@@ -93,6 +93,7 @@ npm run conductor -- retry <id>
 | maker git 护栏（--settings 注入形态） | `tests/integration/maker-git-guard.test.mjs` |
 | green gate 修复路径 | `tests/integration/green-gate.test.mjs` |
 | test gate 空转测试拦截 | `tests/integration/test-gate.test.mjs` |
+| test gate per-AC 定向探针（AC→测试映射） | `tests/integration/test-gate-per-ac.test.mjs` |
 | verifier fail repair context | `tests/integration/verifier-fail.test.mjs` |
 | verifier invalid 重试 | `tests/integration/verifier-invalid.test.mjs` |
 | maker retry ladder | `tests/integration/retry-ladder.test.mjs` |
