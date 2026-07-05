@@ -11,7 +11,7 @@ import { writeNewTask } from '../../conductor/lib/state.mjs';
 import { validateFeasibilityDoc } from '../../conductor/lib/feasibility-contract.mjs';
 import {
   LANE_ORDER, laneForStage, isValidTaskId,
-  buildBoard, buildTaskDetail,
+  buildBoard, buildTaskDetail, parseTimeline,
   SYNC_ACTIONS, buildSyncActionArgv, formatCliMessage, parseNewTaskId, buildNewTaskArgv,
 } from '../../conductor/dashboard/model.mjs';
 
@@ -259,6 +259,61 @@ test('buildTaskDetail：id 不存在返回 null（供 server 404）', (t) => {
   const cfg = baseCfg(root);
   ensureDirs(cfg);
   assert.equal(buildTaskDetail(cfg, 'task-20260705-999'), null);
+});
+
+// ---- parseTimeline：timeline 原文 → 结构化条目（AC-001） ----
+
+test('parseTimeline：合法行解析出 ts 与正文', () => {
+  const text = [
+    '- 2026-07-05T00:00:00.000Z stage → READY',
+    '- 2026-07-05T01:23:45.678Z stage → VERIFY (第 1 轮)',
+  ].join('\n');
+  assert.deepEqual(parseTimeline(text), [
+    { ts: '2026-07-05T00:00:00.000Z', text: 'stage → READY' },
+    { ts: '2026-07-05T01:23:45.678Z', text: 'stage → VERIFY (第 1 轮)' },
+  ]);
+});
+
+test('parseTimeline：非法行不丢弃、不抛错，以 ts:null + 原文形态保留', () => {
+  const text = [
+    '- 2026-07-05T00:00:00.000Z stage → READY',
+    '不是 timeline 格式的一行',
+    '- 不是有效ISO时间戳 正文',
+  ].join('\n');
+  assert.deepEqual(parseTimeline(text), [
+    { ts: '2026-07-05T00:00:00.000Z', text: 'stage → READY' },
+    { ts: null, text: '不是 timeline 格式的一行' },
+    { ts: null, text: '- 不是有效ISO时间戳 正文' },
+  ]);
+});
+
+test('parseTimeline：空串/缺失输入返回空数组', () => {
+  assert.deepEqual(parseTimeline(''), []);
+  assert.deepEqual(parseTimeline(null), []);
+  assert.deepEqual(parseTimeline(undefined), []);
+});
+
+// ---- buildTaskDetail：timelineEntries 字段（AC-002） ----
+
+test('buildTaskDetail：timelineEntries 与 timeline 原文字段并存，timelineEntries 为 parseTimeline(timeline) 结构', (t) => {
+  const root = mkroot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cfg = baseCfg(root);
+  ensureDirs(cfg);
+  const id = 'task-20260705-040';
+  writeNewTask(cfg.queueDir, baseTask(id), baseRuntime('READY'));
+  const dossierDir = path.join(cfg.dossierDir, id);
+  fs.mkdirSync(dossierDir, { recursive: true });
+  const timelineText = '- 2026-07-05T00:00:00.000Z stage → READY\n非法行\n';
+  fs.writeFileSync(path.join(dossierDir, 'timeline.md'), timelineText);
+
+  const detail = buildTaskDetail(cfg, id);
+  assert.equal(detail.timeline, timelineText);
+  assert.deepEqual(detail.timelineEntries, parseTimeline(timelineText));
+  assert.deepEqual(detail.timelineEntries, [
+    { ts: '2026-07-05T00:00:00.000Z', text: 'stage → READY' },
+    { ts: null, text: '非法行' },
+  ]);
 });
 
 // ---- isValidTaskId（AC-018 支撑） ----

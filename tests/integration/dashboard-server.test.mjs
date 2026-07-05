@@ -214,6 +214,28 @@ test('AC-009/AC-010: GET /api/task/<id> 结构完整；setup/spec review 全文�
   assert.ok(notFound.body.error);
 });
 
+test('AC-002: GET /api/task/<id> 载荷 timeline 与 timelineEntries 字段并存', async (t) => {
+  const env = makeEnv(t);
+  const cfg = loadCfg(env.root);
+
+  const id = 'task-20260705-115';
+  env.writeTask(id, { stage: 'READY' });
+  const dossierDir = path.join(cfg.dossierDir, id);
+  fs.mkdirSync(dossierDir, { recursive: true });
+  const timelineText = '- 2026-07-05T00:00:00.000Z stage → READY\n非法行\n';
+  fs.writeFileSync(path.join(dossierDir, 'timeline.md'), timelineText);
+
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+
+  const detail = await getJson(srv.baseUrl, `/api/task/${id}`);
+  assert.equal(detail.status, 200);
+  assert.equal(detail.body.timeline, timelineText);
+  assert.deepEqual(detail.body.timelineEntries, [
+    { ts: '2026-07-05T00:00:00.000Z', text: 'stage → READY' },
+    { ts: null, text: '非法行' },
+  ]);
+});
+
 test('AC-010: setup profile 草稿缺失时 review 给出缺失提示，接口仍 200', async (t) => {
   const env = makeEnv(t);
   const id = 'task-20260705-120';
