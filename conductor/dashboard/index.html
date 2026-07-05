@@ -105,11 +105,15 @@
   .drawer-header, .panel-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
   .close-x { background: none; border: none; font-size: 20px; color: var(--muted); }
 
-  .stage-dots { display: flex; align-items: center; gap: 4px; margin: 16px 0 20px; }
+  .stage-dots { display: flex; align-items: flex-start; gap: 4px; margin: 16px 0 20px; }
+  .dot-group { display: flex; flex-direction: column; align-items: center; gap: 4px; flex-shrink: 0; }
   .dot { width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--border); background: #fff; flex-shrink: 0; }
   .dot.done { background: var(--muted); border-color: var(--muted); }
   .dot.current { background: var(--orange); border-color: var(--orange); }
-  .dot-line { flex: 1; height: 2px; background: var(--border); }
+  .dot-label { font-size: 10px; color: var(--muted); white-space: nowrap; }
+  .dot-label.done { color: var(--text); }
+  .dot-label.current { color: var(--orange); font-weight: 700; }
+  .dot-line { flex: 1; height: 2px; background: var(--border); margin-top: 5px; }
 
   .drawer-body { display: flex; gap: 24px; }
   .main-col { flex: 1; min-width: 0; }
@@ -329,6 +333,16 @@ function renderDrawerFromCache() {
   renderDrawer(drawer, drawerTaskId, lastDetail);
 }
 
+/** ISO 字符串 → 浏览器本地时间 `HH:MM`；与当日不同天时前缀 `MM-DD `。 */
+function formatLocalTimestamp(iso) {
+  const d = new Date(iso);
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const sameDay = d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+  return sameDay ? hm : `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hm}`;
+}
+
 function stageDots(lane, box) {
   const wrap = el('div', { class: 'stage-dots' });
   const curIdx = lane != null ? LANES.findIndex((l) => l.key === lane) : -1;
@@ -339,10 +353,11 @@ function stageDots(lane, box) {
       if (i < curIdx) state = 'done';
       else if (i === curIdx) state = 'current';
     }
-    wrap.appendChild(el('span', {
-      class: 'dot' + (state === 'done' ? ' done' : state === 'current' ? ' current' : ''),
-      title: laneDef.label,
-    }));
+    const dotClass = state === 'done' ? ' done' : state === 'current' ? ' current' : '';
+    wrap.appendChild(el('div', { class: 'dot-group' }, [
+      el('span', { class: 'dot' + dotClass, title: laneDef.label }),
+      el('span', { class: 'dot-label' + dotClass, text: laneDef.label }),
+    ]));
     if (i < LANES.length - 1) wrap.appendChild(el('span', { class: 'dot-line' }));
   });
   return wrap;
@@ -470,11 +485,14 @@ function renderDrawer(drawer, id, detail) {
   body.appendChild(mainCol);
 
   const timelineCol = el('div', { class: 'timeline-col' }, [el('h3', { text: 'Timeline' })]);
-  const lines = (detail.timeline || '').split('\n').map((l) => l.trim()).filter((l) => l.startsWith('- '));
-  if (lines.length === 0) {
+  const entries = detail.timelineEntries || [];
+  if (entries.length === 0) {
     timelineCol.appendChild(el('div', { class: 'timeline-item', text: '(无记录)' }));
   } else {
-    for (const line of lines) timelineCol.appendChild(el('div', { class: 'timeline-item', text: line.slice(2) }));
+    for (const entry of entries) {
+      const prefix = entry.ts == null ? '' : `${formatLocalTimestamp(entry.ts)} `;
+      timelineCol.appendChild(el('div', { class: 'timeline-item', text: `${prefix}${entry.text}` }));
+    }
   }
   body.appendChild(timelineCol);
   drawer.appendChild(body);
