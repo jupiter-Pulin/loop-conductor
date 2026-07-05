@@ -5,7 +5,8 @@ import {
   markerStatus, overBudget, greenGatePassed, approvalNext, setupApprovalNext,
   needsSpecAction, makerMissNext, makerRound, verdictNext, verifierInvalidNext,
   fixingMode, parseStrictJson, specMissNext, specVerifierInvalidNext,
-  validateSpecVerifierVerdict, validateVerifierVerdict, MAX_MISS,
+  needsFeasibilityAction, feasibilityApprovalNext, feasibilityContractInvalidNext,
+  validateSpecVerifierVerdict, validateVerifierVerdict, MAX_MISS, STAGES,
 } from '../../conductor/stages/decisions.mjs';
 
 test('markerStatus：双标记四态', () => {
@@ -107,6 +108,36 @@ test('needsSpecAction：spec 已存在且未打回 → 跳过 spawn', () => {
   assert.equal(needsSpecAction(false, null), 'spawn');
   assert.equal(needsSpecAction(true, 'rejected'), 'spawn');
   assert.equal(needsSpecAction(false, 'rejected'), 'spawn');
+});
+
+test('STAGES：feasibility stage 对插在 setup 闸门与 NEEDS_SPEC 之间', () => {
+  const i = STAGES.indexOf('NEEDS_FEASIBILITY');
+  assert.ok(i > STAGES.indexOf('AWAIT_SETUP_APPROVAL'));
+  assert.equal(STAGES[i + 1], 'AWAIT_FEASIBILITY_APPROVAL');
+  assert.equal(STAGES[i + 2], 'NEEDS_SPEC');
+});
+
+test('feasibilityApprovalNext：option 人类闸门三分支', () => {
+  assert.equal(feasibilityApprovalNext('approved'), 'NEEDS_SPEC');
+  assert.equal(feasibilityApprovalNext('rejected'), 'NEEDS_FEASIBILITY');
+  assert.equal(feasibilityApprovalNext(null), null);
+  assert.equal(feasibilityApprovalNext('garbage'), null);
+});
+
+test('needsFeasibilityAction：草稿已存在且未打回 → 跳过 spawn', () => {
+  assert.equal(needsFeasibilityAction(true, null), 'skip-spawn');
+  assert.equal(needsFeasibilityAction(false, null), 'spawn');
+  assert.equal(needsFeasibilityAction(true, 'rejected'), 'spawn');
+});
+
+test('feasibilityContractInvalidNext：交付契约失败阶梯（maxInvalid=2：初始+2 重试后耗尽）', () => {
+  assert.deepEqual(feasibilityContractInvalidNext(0, 2), { exhausted: false, invalidCount: 1, failureType: null });
+  assert.deepEqual(feasibilityContractInvalidNext(1, 2), { exhausted: false, invalidCount: 2, failureType: null });
+  assert.deepEqual(
+    feasibilityContractInvalidNext(2, 2),
+    { exhausted: true, invalidCount: 3, failureType: 'feasibility_contract_exhausted' },
+  );
+  assert.deepEqual(feasibilityContractInvalidNext(null, 2), { exhausted: false, invalidCount: 1, failureType: null });
 });
 
 test('fixingMode：miss==1 且有 session 才 resume', () => {
