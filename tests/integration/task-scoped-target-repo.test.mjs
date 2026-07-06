@@ -40,7 +40,7 @@ function gitOut(dir, ...args) {
 
 test('READY 失败→FIXING 修复：worktree 与 test-gate 探针都作用于任务级 targetRepo，不是 cfg.targetRepo（AC-002）', (t) => {
   const env = makeEnv(t); // cfg.targetRepo 指向 env.targetDir，两个任务都不该碰它
-  const repoB = initSecondTargetRepo(path.join(env.root, 'target-b'));
+  const repoB = initSecondTargetRepo(path.join(env.root, 'repo-b'));
   const id = 'task-20260706-201';
   env.writeTask(id, { targetRepo: repoB });
   env.setScenario([
@@ -67,7 +67,7 @@ test('READY 失败→FIXING 修复：worktree 与 test-gate 探针都作用于�
 
 test('cmdMerge 全程落在任务级 targetRepo；cfg.targetRepo 指向的仓库全程不受影响（AC-004）', (t) => {
   const env = makeEnv(t);
-  const repoB = initSecondTargetRepo(path.join(env.root, 'target-b'));
+  const repoB = initSecondTargetRepo(path.join(env.root, 'repo-b'));
   const id = 'task-20260706-202';
   env.writeTask(id, { targetRepo: repoB });
   env.setScenario([
@@ -105,8 +105,8 @@ test('cmdMerge 全程落在任务级 targetRepo；cfg.targetRepo 指向的仓库
 
 test('多仓共存：一次 drain 中两个任务各自在自己的仓库完成 worktree 创建与 green gate，互不误触对方或 cfg 仓库（AC-006）', (t) => {
   const env = makeEnv(t); // cfg.targetRepo（env.targetDir）两个任务都不用，充当第三方哨兵仓库
-  const repoA2 = initSecondTargetRepo(path.join(env.root, 'target-a2'));
-  const repoB = initSecondTargetRepo(path.join(env.root, 'target-b'));
+  const repoA2 = initSecondTargetRepo(path.join(env.root, 'repo-a2'));
+  const repoB = initSecondTargetRepo(path.join(env.root, 'repo-b'));
   const idA = 'task-20260706-203';
   const idB = 'task-20260706-204';
   env.writeTask(idA, { targetRepo: repoA2 });
@@ -164,7 +164,7 @@ test('task.json 缺 targetRepo 字段（旧任务）：整个生命周期回退 
 
 test('new --repo 覆盖快照 targetRepo（含该仓库 baseBranch 解析）；setup-agent 的 cwd/prompt 落在该仓库（AC-010，AC-003 needs_target_setup）', (t) => {
   const env = makeEnv(t, { config: { baseBranch: null } }); // 不给 cfg.baseBranch，逼 cmdNew 去解析仓库的 currentBranch
-  const repoB = initSecondTargetRepo(path.join(env.root, 'target-b'));
+  const repoB = initSecondTargetRepo(path.join(env.root, 'repo-b'));
   execFileSync('git', ['-C', repoB, 'checkout', '-b', 'develop'], { encoding: 'utf8' });
 
   const created = env.run('new', '--kind', 'bugfix', '--title', 'x', '--repo', repoB);
@@ -182,14 +182,14 @@ test('new --repo 覆盖快照 targetRepo（含该仓库 baseBranch 解析）；s
   assert.equal(run.status, 0, run.stderr);
   assert.equal(env.findTask(id).runtime.stage, 'AWAIT_SETUP_APPROVAL');
   const setupCall = env.calls()[0];
-  assert.ok(setupCall.cwd.endsWith('target-b'), 'setup-agent cwd 应是任务的 targetRepo(repoB)，不是 cfg.targetRepo');
+  assert.ok(setupCall.cwd.endsWith('repo-b'), 'setup-agent cwd 应是任务的 targetRepo(repoB)，不是 cfg.targetRepo');
   assert.ok(promptOf(setupCall).includes(repoB), 'prompt 的 Target repo 行应含 repoB 路径');
   assert.ok(!promptOf(setupCall).includes(env.targetDir), 'prompt 不应含 cfg.targetRepo(默认 target) 路径');
 });
 
 test('feature 任务 feasibility gate：feasibility-agent 的 cwd 与 prompt 均为任务级 targetRepo（AC-003）', (t) => {
   const env = makeEnv(t, { config: { feasibilityEnabled: true } });
-  const repoB = initSecondTargetRepo(path.join(env.root, 'target-b'));
+  const repoB = initSecondTargetRepo(path.join(env.root, 'repo-b'));
   const id = 'task-20260706-206';
   env.writeTask(id, { kind: 'feature', stage: 'NEEDS_FEASIBILITY', targetRepo: repoB });
   const draftAbs = path.join(env.root, 'state', 'queue', id, 'feasibility-study.md');
@@ -201,14 +201,14 @@ test('feature 任务 feasibility gate：feasibility-agent 的 cwd 与 prompt 均
   assert.equal(run.status, 0, run.stderr);
   assert.equal(env.findTask(id).runtime.stage, 'AWAIT_FEASIBILITY_APPROVAL');
   const call = env.calls()[0];
-  assert.ok(call.cwd.endsWith('target-b'), 'feasibility-agent cwd 应是任务级 targetRepo');
+  assert.ok(call.cwd.endsWith('repo-b'), 'feasibility-agent cwd 应是任务级 targetRepo');
   assert.ok(promptOf(call).includes(repoB), 'prompt 应含任务级 targetRepo 路径');
   assert.ok(!promptOf(call).includes(env.targetDir), 'prompt 不应含 cfg.targetRepo(默认 target) 路径');
 });
 
 test('feature 任务的 spec 链路（needs_spec → spec_verify(fail) → spec_fixing → spec_verify(pass)）全程作用于任务级 targetRepo（AC-003）', (t) => {
   const env = makeEnv(t);
-  const repoB = initSecondTargetRepo(path.join(env.root, 'target-b'));
+  const repoB = initSecondTargetRepo(path.join(env.root, 'repo-b'));
   env.writeApprovedSetupProfile(SETUP_PROFILE, { targetRepo: repoB });
   const created = env.run('new', '--kind', 'feature', '--title', 'spec 链路', '--repo', repoB);
   assert.equal(created.status, 0, created.stderr);
@@ -231,7 +231,32 @@ test('feature 任务的 spec 链路（needs_spec → spec_verify(fail) → spec_
   assert.equal(calls.length, 4, 'spec-agent r1 + spec-verifier r1 + spec-agent r2(修复) + spec-verifier r2');
   const labels = ['needs_spec', 'spec_verify r1', 'spec_fixing', 'spec_verify r2'];
   calls.forEach((call, i) => {
-    assert.ok(call.cwd.endsWith('target-b'), `${labels[i]} 的 cwd 应是任务级 targetRepo`);
+    assert.ok(call.cwd.endsWith('repo-b'), `${labels[i]} 的 cwd 应是任务级 targetRepo`);
     assert.ok(promptOf(call).includes(repoB), `${labels[i]} 的 prompt 应含任务级 targetRepo 路径`);
   });
+});
+
+test('nextId：state/parked/ 存在当日撞号任务时，新建任务发号 +1，不与其撞号（AC-008）', (t) => {
+  const env = makeEnv(t);
+  const today = new Date();
+  const ymd = [
+    today.getFullYear(),
+    String(today.getMonth() + 1).padStart(2, '0'),
+    String(today.getDate()).padStart(2, '0'),
+  ].join('');
+  // queue 里已有 today-001（旧发号器能看到的最大号），parked 里停着 today-002（旧发号器看不见）。
+  env.writeTask(`task-${ymd}-001`);
+  fs.mkdirSync(path.join(env.root, 'state', 'parked', `task-${ymd}-002`), { recursive: true });
+
+  const created = env.run('new', '--kind', 'bugfix', '--title', 'x');
+  assert.equal(created.status, 0, created.stderr);
+  const id = created.stdout.match(/task-\d{8}-\d{3}/)?.[0];
+  assert.equal(id, `task-${ymd}-003`, 'nextId 应看到 parked 里的 002，发出 003 而不是与其撞号的 002');
+});
+
+test('nextId：state/parked/ 目录不存在时 new 不报错（AC-008）', (t) => {
+  const env = makeEnv(t);
+  assert.ok(!fs.existsSync(path.join(env.root, 'state', 'parked')));
+  const created = env.run('new', '--kind', 'bugfix', '--title', 'x');
+  assert.equal(created.status, 0, created.stderr);
 });
