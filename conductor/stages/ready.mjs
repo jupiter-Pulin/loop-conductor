@@ -6,6 +6,7 @@
 //       有 done → 跳过 spawn，仅复跑 green gate 完成转移。
 import * as state from '../lib/state.mjs';
 import { ensureWorktree, checkTrackedHarness } from '../lib/git.mjs';
+import { taskCfg } from '../lib/task-cfg.mjs';
 import { markerStatus, greenGatePassed, makerMissNext, makerRound } from './decisions.mjs';
 import {
   worktreePath, runGreenGate, writeGreenGateResult, runTestGateProbe,
@@ -16,6 +17,7 @@ import {
 
 export default async function readyHandler(ts, cfg) {
   const id = ts.id;
+  const tRepo = taskCfg(ts, cfg).targetRepo;
   const round = makerRound(ts.runtime.maker_miss_count); // READY 时 miss 恒为 0 → r1
   const marker = state.readJsonIf(state.dossierPath(cfg, id, `maker-r${round}.json`));
   const status = markerStatus(marker);
