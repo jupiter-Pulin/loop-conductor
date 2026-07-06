@@ -19,6 +19,24 @@ export const STAGES = [
 
 export const MAX_MISS = 3;
 
+/**
+ * 绿门失败签名的尾部连续相等 run 长度（本攻坚周期的 green-gate-r1..rN 签名 hash 数组）。
+ * `[A,A]→2`、`[A,A,B]→1`、`[A,B,A]→1`、`[]→0`；undefined（旧记录/无签名）不与任何值相等，
+ * 打断连续——conductor 无状态哲学：不新增计数器，每次从 dossier 现读派生。
+ */
+export function sameSignatureStreak(signatures) {
+  const arr = signatures ?? [];
+  if (arr.length === 0) return 0;
+  let streak = 1;
+  for (let i = arr.length - 1; i > 0; i--) {
+    const cur = arr[i];
+    const prev = arr[i - 1];
+    if (cur === undefined || prev === undefined || cur !== prev) break;
+    streak++;
+  }
+  return streak;
+}
+
 /** verifier verdict 的程序级契约：prompt/agent 只引用它，真正裁判仍是 validateVerifierVerdict。 */
 export const VERIFIER_VERDICT_CONTRACT = Object.freeze({
   id: 'verifier-verdict/v1',

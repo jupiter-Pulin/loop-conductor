@@ -6,7 +6,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { readRejectNotes, buildRepairContext } from '../../conductor/stages/shared.mjs';
+import {
+  readRejectNotes, buildRepairContext, writeGreenGateResult, readGreenGateSignatures,
+} from '../../conductor/stages/shared.mjs';
 
 /** 造一个含 reject_notes.md 的临时任务目录，返回 { dir } 形态的 ts。 */
 function makeTaskDir(t, notesContent) {
@@ -17,6 +19,22 @@ function makeTaskDir(t, notesContent) {
   }
   return { dir };
 }
+
+/** 造一个只含 dossierDir 的最小 cfg，供 writeGreenGateResult / readGreenGateSignatures 用。 */
+function makeGreenGateCfg(t) {
+  const dossierDir = fs.mkdtempSync(path.join(os.tmpdir(), 'shared-test-dossier-'));
+  t.after(() => fs.rmSync(dossierDir, { recursive: true, force: true }));
+  return { dossierDir, greenGateOutputTailBytes: 12000 };
+}
+
+const FAILING_STDOUT = [
+  '✖ failing tests:', '',
+  'test at test/foo.test.mjs:1:1',
+  '✖ some test (1.234ms)',
+  '  Error: boom',
+  '      at Object.<anonymous> (/abs/path/test/foo.test.mjs:2:1)',
+  '',
+].join('\n');
 
 test('readRejectNotes：15 条 note 只保留最近 10 条 + 截断说明行', (t) => {
   const notes = Array.from({ length: 15 }, (_, i) => `- 2026-06-${String(i + 1).padStart(2, '0')}: 打回意见 ${i + 1}`);
@@ -63,4 +81,70 @@ test('buildRepairContext(test_gate)：suite 模式（降级）保持 v1 形态 f
   assert.equal(ctx.test_gate_ref, 'test-gate-r2.json');
   // probe 缺省（旧调用形态）也不抛错
   assert.deepEqual(buildRepairContext({ source: 'test_gate', round: 3 }).failed_criteria, []);
+});
+
+test('buildRepairContext(green_gate)：sameSignatureStreak>=2 时注入 same_signature_streak 与人类可读提示（AC-007）', () => {
+  const ctx = buildRepairContext({
+    source: 'green_gate', round: 3, sameSignatureStreak: 2, failingTests: ['foo.test.mjs :: some test'],
+  });
+  assert.equal(ctx.same_signature_streak, 2);
+  assert.match(ctx.same_signature_hint, /失败签名完全未变/);
+  assert.match(ctx.same_signature_hint, /foo\.test\.mjs :: some test/);
+});
+
+test('buildRepairContext(green_gate)：streak<2 或缺省时不含 same_signature 字段', () => {
+  const ctxNoStreak = buildRepairContext({ source: 'green_gate', round: 1 });
+  assert.equal(ctxNoStreak.same_signature_streak, undefined);
+  assert.equal(ctxNoStreak.same_signature_hint, undefined);
+  const ctxStreak1 = buildRepairContext({ source: 'green_gate', round: 1, sameSignatureStreak: 1 });
+  assert.equal(ctxStreak1.same_signature_streak, undefined);
+});
+
+test('writeGreenGateResult：绿门失败落盘时新增 signature 字段，READY/FIXING 两路径共用同一函数（AC-003）', (t) => {
+  const cfg = makeGreenGateCfg(t);
+  const rec = writeGreenGateResult(cfg, 'task-x', 1, {
+    command: 'npm test',
+    exitCode: 1,
+    timedOut: false,
+    stdout: FAILING_STDOUT,
+    stderr: '',
+    startedAt: '2026-01-01T00:00:00.000Z',
+    finishedAt: '2026-01-01T00:00:01.000Z',
+  });
+  assert.ok(rec.signature, '失败记录返回值应带 signature');
+  assert.equal(typeof rec.signature.hash, 'string');
+  assert.deepEqual(rec.signature.failingTests, ['foo.test.mjs :: some test']);
+  const onDisk = JSON.parse(fs.readFileSync(path.join(cfg.dossierDir, 'task-x', 'green-gate-r1.json'), 'utf8'));
+  assert.ok(onDisk.signature, '落盘文件同样含 signature 字段');
+  assert.equal(onDisk.signature.hash, rec.signature.hash);
+});
+
+test('writeGreenGateResult：绿门通过（exit 0）不写 signature', (t) => {
+  const cfg = makeGreenGateCfg(t);
+  const rec = writeGreenGateResult(cfg, 'task-x', 1, {
+    command: 'npm test', exitCode: 0, timedOut: false, stdout: 'all good', stderr: '',
+    startedAt: '2026-01-01T00:00:00.000Z', finishedAt: '2026-01-01T00:00:01.000Z',
+  });
+  assert.equal(rec.signature, undefined);
+  const onDisk = JSON.parse(fs.readFileSync(path.join(cfg.dossierDir, 'task-x', 'green-gate-r1.json'), 'utf8'));
+  assert.equal(onDisk.signature, undefined);
+});
+
+test('readGreenGateSignatures：无 signature 字段的旧记录/缺失记录读取不报错，记为 undefined（AC-003）', (t) => {
+  const cfg = makeGreenGateCfg(t);
+  const dir = path.join(cfg.dossierDir, 'task-y');
+  fs.mkdirSync(dir, { recursive: true });
+  // round1：旧记录形态（迁移前落盘，无 signature 字段）
+  fs.writeFileSync(path.join(dir, 'green-gate-r1.json'), JSON.stringify({ schema_version: 1, round: 1, exit_code: 1 }));
+  // round2：新代码路径写入，含 signature
+  writeGreenGateResult(cfg, 'task-y', 2, {
+    command: 'npm test', exitCode: 1, timedOut: false, stdout: FAILING_STDOUT, stderr: '',
+    startedAt: '2026-01-01T00:00:00.000Z', finishedAt: '2026-01-01T00:00:01.000Z',
+  });
+  // round3：文件不存在
+  const sigs = readGreenGateSignatures(cfg, 'task-y', 3);
+  assert.equal(sigs.length, 3);
+  assert.equal(sigs[0], undefined, '旧记录无 signature 字段 → undefined，不参与 streak');
+  assert.equal(typeof sigs[1], 'string');
+  assert.equal(sigs[2], undefined, '记录缺失 → undefined');
 });
