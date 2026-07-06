@@ -1,0 +1,737 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loop Conductor Dashboard</title>
+<style>
+  :root {
+    --bg: #f2ecdf;
+    --card-bg: #ffffff;
+    --shell-bg: #fbf8f1;
+    --border: #d9cfbc;
+    --text: #2b2a28;
+    --muted: #7a7264;
+    --blue: #2b6cb0;
+    --blue-dark: #1d4e82;
+    --red: #c0392b;
+    --orange: #d97e1f;
+    --orange-bg: #fdf1e2;
+    --green: #2f7d4f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 28px 20px 56px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  .board-shell {
+    max-width: 1080px; margin: 0 auto; background: var(--shell-bg);
+    border: 1px solid var(--border); border-radius: 16px;
+    box-shadow: 0 2px 12px rgba(60,50,30,.06); padding: 6px 0 20px;
+  }
+  h1, h2, h3, .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; }
+  header.top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 20px 28px;
+  }
+  header.top h1 { margin: 0; font-size: 20px; letter-spacing: 0.02em; }
+  button { font: inherit; cursor: pointer; }
+  .btn {
+    border: none; border-radius: 8px; padding: 8px 16px; font-weight: 600;
+    transition: background .15s ease, color .15s ease, transform .1s ease, box-shadow .15s ease;
+  }
+  .btn:active { transform: scale(.97); }
+  .btn-primary { background: var(--blue); color: #fff; }
+  .btn-primary:hover { background: var(--blue-dark); }
+  .btn-primary:disabled { background: #a9c3dd; cursor: not-allowed; }
+  .btn-danger { background: #fff; color: var(--red); border: 1px solid var(--red); }
+  .btn-danger:disabled { color: #d9a9a2; border-color: #eccfc9; cursor: not-allowed; }
+  .btn-ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+
+  .boxes { display: flex; gap: 12px; padding: 0 28px 12px; }
+  .box-toggle {
+    border: 1px solid var(--border); background: #fff; border-radius: 20px;
+    padding: 6px 14px; font-size: 13px; font-weight: 600;
+    transition: transform .12s ease, box-shadow .15s ease;
+  }
+  .box-toggle:hover { transform: translateY(-1px); box-shadow: 0 2px 6px rgba(60,50,30,.10); }
+  .box-toggle.done { color: var(--green); background: #e7f2ea; border-color: #bedccb; }
+  .box-toggle.failed { color: var(--red); background: #faeae6; border-color: #eac9c1; }
+  .collapsible {
+    display: grid; grid-template-rows: 0fr; transition: grid-template-rows .28s ease;
+    padding: 0 28px;
+  }
+  .collapsible.open { grid-template-rows: 1fr; padding-bottom: 12px; }
+  .collapsible-inner { overflow: hidden; min-height: 0; display: flex; flex-direction: column; gap: 6px; }
+  .box-row {
+    display: flex; gap: 10px; align-items: center; background: #fff; border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 12px; font-size: 13px; cursor: pointer;
+    transition: border-color .15s ease, transform .12s ease;
+  }
+  .box-row:hover { border-color: var(--muted); transform: translateX(2px); }
+
+  main { padding: 0 28px 8px; }
+  .lane {
+    padding: 16px 0 20px; border-top: 1px solid var(--border); margin: 0;
+    animation: fade-up .4s ease both; animation-delay: calc(var(--lane-i, 0) * 50ms);
+  }
+  .lane-header {
+    display: flex; align-items: baseline; gap: 10px;
+    margin-bottom: 10px;
+  }
+  .lane-name {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 15px; font-weight: 700; color: var(--text);
+  }
+  .lane-sub { font-size: 12px; color: var(--muted); }
+  .lane-header .you-label { color: var(--muted); font-size: 12px; }
+  .lane-flag { color: var(--orange); }
+  .lane-row { display: flex; gap: 12px; flex-wrap: wrap; }
+
+  .card {
+    background: var(--card-bg); border: 1px solid var(--border); border-left: 4px solid transparent;
+    border-radius: 10px; padding: 10px 14px; min-width: 230px; max-width: 280px;
+    box-shadow: 0 1px 3px rgba(60,50,30,.10); cursor: pointer;
+    transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease;
+  }
+  .card:hover { border-color: var(--muted); transform: translateY(-2px); box-shadow: 0 4px 12px rgba(60,50,30,.14); }
+  .card.needs-human { border-left-color: var(--orange); background: var(--orange-bg); animation: beacon 2.6s ease-in-out infinite; }
+  .card.card-enter { animation: fade-up .35s ease both; }
+  .card.needs-human.card-enter { animation: fade-up .35s ease both, beacon 2.6s ease-in-out .35s infinite; }
+  .card.card-updated { animation: update-flash .8s ease both; }
+  .card.needs-human.card-updated { animation: beacon 2.6s ease-in-out infinite; }
+  .card .top-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .badge { font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 5px; letter-spacing: .03em; }
+  .badge-kind.feature { background: #dbe9f8; color: var(--blue-dark); }
+  .badge-kind.bugfix { background: #f8dbd8; color: var(--red); }
+  .card .spent { font-size: 12px; color: var(--muted); }
+  .card .task-id { font-family: monospace; font-size: 11px; color: var(--muted); }
+  .card .title { font-size: 13px; margin-top: 6px; }
+  .card .needs-you {
+    display: inline-flex; align-items: center; gap: 4px; margin-top: 8px; font-size: 11px; font-weight: 700;
+    color: #fff; background: var(--orange); padding: 2px 8px; border-radius: 6px;
+  }
+  .card .review-btn { margin-top: 8px; display: inline-block; font-size: 12px; font-weight: 700; color: var(--orange); }
+  .card .working { margin-top: 8px; font-size: 12px; color: var(--muted); }
+  .spin { display: inline-block; animation: spin 1.4s linear infinite; }
+  .idle-card {
+    border: 1px dashed var(--border); border-radius: 10px; padding: 14px; color: var(--muted);
+    font-size: 12px; min-width: 230px;
+  }
+
+  .overlay { position: fixed; inset: 0; background: rgba(30,26,20,0); display: flex; z-index: 50; transition: background .22s ease; }
+  .overlay.open { background: rgba(30,26,20,.35); }
+  .overlay[hidden] { display: none; }
+  .overlay.align-right { justify-content: flex-end; }
+  .overlay.align-center { justify-content: center; align-items: center; }
+
+  .drawer {
+    width: 680px; max-width: 95vw; height: 100%; background: #fff; overflow-y: auto; padding: 24px;
+    transform: translateX(48px); opacity: 0;
+    transition: transform .28s cubic-bezier(.2,.8,.2,1), opacity .22s ease;
+  }
+  .overlay.open .drawer { transform: none; opacity: 1; }
+  .panel {
+    width: 560px; max-width: 95vw; max-height: 90vh; overflow-y: auto; background: #fff;
+    border-radius: 12px; padding: 24px;
+    transform: scale(.96) translateY(8px); opacity: 0;
+    transition: transform .24s cubic-bezier(.2,.8,.2,1), opacity .2s ease;
+  }
+  .overlay.open .panel { transform: none; opacity: 1; }
+  .drawer-header, .panel-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+  .close-x { background: none; border: none; font-size: 20px; color: var(--muted); }
+
+  .stage-dots { display: flex; align-items: flex-start; gap: 4px; margin: 16px 0 20px; }
+  .dot-group { display: flex; flex-direction: column; align-items: center; gap: 4px; flex-shrink: 0; }
+  .dot {
+    width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--border); background: #fff; flex-shrink: 0;
+    transition: background .3s ease, border-color .3s ease;
+  }
+  .dot.done { background: var(--muted); border-color: var(--muted); }
+  .dot.current { background: var(--orange); border-color: var(--orange); animation: dot-ring 2.2s ease-out infinite; }
+  .dot-label { font-size: 10px; color: var(--muted); white-space: nowrap; }
+  .dot-label.done { color: var(--text); }
+  .dot-label.current { color: var(--orange); font-weight: 700; }
+  .dot-line { flex: 1; height: 2px; background: var(--border); margin-top: 5px; }
+
+  .drawer-body { display: flex; gap: 24px; }
+  .main-col { flex: 1; min-width: 0; }
+  .timeline-col { width: 220px; flex-shrink: 0; border-left: 1px solid var(--border); padding-left: 16px; }
+  .timeline-item {
+    font-size: 12px; margin-bottom: 12px; color: var(--muted);
+    animation: fade-up .35s ease both; animation-delay: calc(var(--i, 0) * 30ms);
+  }
+
+  @keyframes fade-up { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes beacon {
+    0%, 100% { box-shadow: 0 1px 3px rgba(60,50,30,.10); }
+    50% { box-shadow: 0 1px 3px rgba(60,50,30,.10), 0 0 0 5px rgba(217,126,31,.12); }
+  }
+  @keyframes dot-ring {
+    0% { box-shadow: 0 0 0 0 rgba(217,126,31,.35); }
+    70%, 100% { box-shadow: 0 0 0 8px rgba(217,126,31,0); }
+  }
+  @keyframes update-flash {
+    0% { background: var(--orange-bg); }
+    100% { background: var(--card-bg); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+  }
+
+  pre.readonly {
+    white-space: pre-wrap; word-break: break-word; background: #faf8f4; border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px; font-size: 12px; max-height: 45vh; overflow-y: auto;
+  }
+  .option-card { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; cursor: pointer; }
+  .option-card.selected { border-color: var(--blue); background: #eef4fb; }
+  .option-card .option-id { font-weight: 700; font-family: monospace; margin-right: 8px; }
+  textarea, input[type=text] { width: 100%; border: 1px solid var(--border); border-radius: 8px; padding: 8px; font: inherit; }
+  .field { margin-bottom: 14px; }
+  .field label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin-bottom: 4px; }
+  .action-row { display: flex; gap: 10px; margin-top: 16px; }
+  .kind-cards { display: flex; gap: 12px; margin-bottom: 16px; }
+  .kind-card { flex: 1; border: 1px solid var(--border); border-radius: 10px; padding: 16px; text-align: center; cursor: pointer; }
+  .kind-card.selected { border-color: var(--blue); background: #eef4fb; }
+  details.advanced { margin: 16px 0; font-size: 13px; }
+  details.advanced summary { cursor: pointer; color: var(--muted); }
+  .advanced-field { display: flex; justify-content: space-between; padding: 4px 0; font-size: 12px; color: var(--muted); }
+  .result-box { margin-top: 16px; }
+  .broken-banner {
+    background: #fdeceb; border: 1px solid #f3c8c3; color: var(--red); padding: 10px 14px;
+    border-radius: 8px; font-size: 12px; margin-bottom: 16px;
+  }
+</style>
+</head>
+<body>
+<div class="board-shell">
+<header class="top">
+  <h1>Tasks · by agent</h1>
+  <button class="btn btn-primary" id="btn-new-task">+ 新建任务</button>
+</header>
+
+<div class="boxes">
+  <button class="box-toggle done" id="toggle-done">✓ Done · <span id="done-count">0</span></button>
+  <button class="box-toggle failed" id="toggle-failed">✕ Failed · <span id="failed-count">0</span></button>
+</div>
+<div class="collapsible" id="done-wrap"><div class="collapsible-inner" id="done-list"></div></div>
+<div class="collapsible" id="failed-wrap"><div class="collapsible-inner" id="failed-list"></div></div>
+
+<main>
+  <div id="broken-banner-slot"></div>
+  <div id="lanes"></div>
+</main>
+</div>
+
+<div class="overlay align-right" id="drawer-overlay" hidden>
+  <div class="drawer" id="drawer"></div>
+</div>
+
+<div class="overlay align-center" id="panel-overlay" hidden>
+  <div class="panel" id="new-task-panel"></div>
+</div>
+
+<script>
+const LANES = [
+  { key: 'setup', label: 'setup' },
+  { key: 'feasibility', label: 'feasibility' },
+  { key: 'spec', label: 'spec' },
+  { key: 'maker', label: 'maker' },
+  { key: 'verify', label: 'verify' },
+  { key: 'merge', label: 'merge', you: true },
+];
+
+let latestBoard = null;
+let drawerTaskId = null;
+let lastDetail = null;
+let selectedOption = null;
+let pendingActionMessage = null;
+
+function el(tag, attrs, children) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k === 'class') e.className = v;
+    else if (k === 'text') e.textContent = v;
+    else if (k.startsWith('on') && typeof v === 'function') e.addEventListener(k.slice(2), v);
+    else e.setAttribute(k, v);
+  }
+  for (const c of [].concat(children || [])) {
+    if (c == null) continue;
+    e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+  }
+  return e;
+}
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  let body = null;
+  try { body = await res.json(); } catch { body = null; }
+  return { status: res.status, body };
+}
+
+function fmtUsd(n) { return `$${Number(n || 0).toFixed(2)}`; }
+
+// ---- 屏 1：看板（keyed 增量渲染：卡片按任务 id 复用节点，签名变化才重建，避免轮询闪烁） ----
+
+const cardCache = new Map(); // id -> { node, sig }
+const laneEls = new Map();   // lane key -> { flag, row }
+
+function workingLabel() {
+  return el('div', { class: 'working' }, [el('span', { class: 'spin', text: '↻' }), ' working…']);
+}
+
+function cardSig(entry) {
+  return [entry.stage, entry.needsHuman, entry.working, entry.spentUsd, entry.kind, entry.title].join('|');
+}
+
+function buildCardNode(entry) {
+  const card = el('div', {
+    class: 'card' + (entry.needsHuman ? ' needs-human' : ''),
+    'data-id': entry.id,
+    onclick: () => openDrawer(entry.id),
+  }, [
+    el('div', { class: 'top-row' }, [
+      el('span', { class: 'task-id', text: entry.id }),
+      el('span', { class: 'spent', text: fmtUsd(entry.spentUsd) }),
+    ]),
+    el('div', {}, [
+      el('span', { class: `badge badge-kind ${entry.kind}`, text: String(entry.kind || '?').toUpperCase() }),
+    ]),
+    el('div', { class: 'title', text: entry.title || '(无标题)' }),
+  ]);
+  if (entry.needsHuman) {
+    card.appendChild(el('div', { class: 'needs-you', text: '⚑ needs you' }));
+    card.appendChild(el('div', { class: 'review-btn', text: 'Review →' }));
+  } else if (entry.working) {
+    card.appendChild(workingLabel());
+  }
+  return card;
+}
+
+/** 泳道骨架只建一次；轮询只做 per-lane 补丁。 */
+function ensureLaneSkeleton() {
+  if (laneEls.size > 0) return;
+  const container = document.getElementById('lanes');
+  LANES.forEach((laneDef, i) => {
+    const flag = el('span', { class: 'lane-flag', text: '⚑' });
+    flag.style.display = 'none';
+    const header = el('div', { class: 'lane-header' }, [
+      el('span', { class: 'lane-name', text: laneDef.label }),
+      flag,
+      el('span', { class: 'lane-sub', text: laneDef.you ? 'you · merge' : `${laneDef.label} agent` }),
+    ]);
+    const row = el('div', { class: 'lane-row' });
+    const lane = el('div', { class: 'lane' }, [header, row]);
+    lane.style.setProperty('--lane-i', i);
+    container.appendChild(lane);
+    laneEls.set(laneDef.key, { flag, row });
+  });
+}
+
+function renderLanes(board) {
+  ensureLaneSkeleton();
+  const seen = new Set();
+  for (const laneDef of LANES) {
+    const { flag, row } = laneEls.get(laneDef.key);
+    const laneData = board.lanes.find((l) => l.lane === laneDef.key) || { tasks: [] };
+    flag.style.display = laneData.tasks.some((t) => t.needsHuman) ? '' : 'none';
+    const idle = row.querySelector('.idle-card');
+    if (laneData.tasks.length > 0 && idle) idle.remove();
+    let anchor = null; // 已就位的前一张卡，用于保序且不打扰未变动节点（DOM 重插会重置 CSS 动画）
+    for (const entry of laneData.tasks) {
+      seen.add(entry.id);
+      const sig = cardSig(entry);
+      let cached = cardCache.get(entry.id);
+      if (!cached) {
+        cached = { node: buildCardNode(entry), sig };
+        cached.node.classList.add('card-enter');
+        cardCache.set(entry.id, cached);
+      } else if (cached.sig !== sig) {
+        const fresh = buildCardNode(entry);
+        fresh.classList.add('card-updated');
+        if (cached.node.parentNode) cached.node.replaceWith(fresh);
+        cached.node = fresh;
+        cached.sig = sig;
+      }
+      const expected = anchor ? anchor.nextSibling : row.firstChild;
+      if (cached.node !== expected) row.insertBefore(cached.node, expected);
+      anchor = cached.node;
+    }
+    if (laneData.tasks.length === 0 && !row.querySelector('.idle-card')) {
+      row.appendChild(el('div', { class: 'idle-card', text: 'idle · 无任务' }));
+    }
+  }
+  for (const [id, cached] of cardCache) {
+    if (!seen.has(id)) { cached.node.remove(); cardCache.delete(id); }
+  }
+}
+
+const boxListSig = new Map(); // containerId -> 上次渲染的内容签名（变化才重建，保住 hover 与动画）
+
+function renderBoxList(containerId, tasks) {
+  const sig = tasks.map((t) => `${t.id}|${t.kind}|${t.title}|${t.spentUsd}`).join(';');
+  if (boxListSig.get(containerId) === sig) return;
+  boxListSig.set(containerId, sig);
+  const container = document.getElementById(containerId);
+  container.innerHTML = '';
+  for (const entry of tasks) {
+    container.appendChild(el('div', { class: 'box-row', onclick: () => openDrawer(entry.id) }, [
+      el('span', { class: 'task-id', text: entry.id }),
+      el('span', { class: `badge badge-kind ${entry.kind}`, text: String(entry.kind || '?').toUpperCase() }),
+      el('span', { text: entry.title || '' }),
+      el('span', { class: 'spent', text: fmtUsd(entry.spentUsd) }),
+    ]));
+  }
+}
+
+function renderBrokenBanner(broken) {
+  const slot = document.getElementById('broken-banner-slot');
+  slot.innerHTML = '';
+  if (!broken || broken.length === 0) return;
+  slot.appendChild(el('div', {
+    class: 'broken-banner',
+    text: `⚠ ${broken.length} 个任务目录状态异常：${broken.map((b) => b.id).join(', ')}`,
+  }));
+}
+
+async function loadBoard() {
+  const { status, body } = await api('/api/board');
+  if (status !== 200 || !body) return;
+  latestBoard = body;
+  document.getElementById('done-count').textContent = body.done.length;
+  document.getElementById('failed-count').textContent = body.failed.length;
+  renderLanes(body);
+  renderBoxList('done-list', body.done);
+  renderBoxList('failed-list', body.failed);
+  renderBrokenBanner(body.broken);
+}
+
+document.getElementById('toggle-done').addEventListener('click', () => {
+  document.getElementById('done-wrap').classList.toggle('open');
+});
+document.getElementById('toggle-failed').addEventListener('click', () => {
+  document.getElementById('failed-wrap').classList.toggle('open');
+});
+
+// ---- overlay 开合（class 驱动过渡；hidden 只负责最终 display） ----
+
+const overlayHideTimers = new Map();
+
+function showOverlay(id) {
+  const ov = document.getElementById(id);
+  clearTimeout(overlayHideTimers.get(id)); // 取消未决的延迟隐藏，避免快速重开被藏掉
+  ov.hidden = false;
+  requestAnimationFrame(() => requestAnimationFrame(() => ov.classList.add('open')));
+}
+
+function hideOverlay(id) {
+  const ov = document.getElementById(id);
+  ov.classList.remove('open');
+  overlayHideTimers.set(id, setTimeout(() => { ov.hidden = true; }, 240));
+}
+
+// ---- 屏 2：详情抽屉 ----
+
+function closeDrawer() {
+  drawerTaskId = null;
+  lastDetail = null;
+  selectedOption = null;
+  pendingActionMessage = null;
+  hideOverlay('drawer-overlay');
+}
+
+async function openDrawer(id) {
+  drawerTaskId = id;
+  selectedOption = null;
+  pendingActionMessage = null;
+  showOverlay('drawer-overlay');
+  await refreshDrawer();
+}
+
+async function refreshDrawer() {
+  if (!drawerTaskId) return;
+  const { status, body } = await api(`/api/task/${encodeURIComponent(drawerTaskId)}`);
+  lastDetail = status === 200 ? body : null;
+  renderDrawerFromCache();
+}
+
+function renderDrawerFromCache() {
+  const drawer = document.getElementById('drawer');
+  drawer.innerHTML = '';
+  if (!lastDetail) { drawer.appendChild(el('div', { text: '任务未找到或已归档' })); return; }
+  renderDrawer(drawer, drawerTaskId, lastDetail);
+}
+
+/** ISO 字符串 → 浏览器本地时间 `HH:MM`；与当日不同天时前缀 `MM-DD `。 */
+function formatLocalTimestamp(iso) {
+  const d = new Date(iso);
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const sameDay = d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+  return sameDay ? hm : `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hm}`;
+}
+
+function stageDots(lane, box) {
+  const wrap = el('div', { class: 'stage-dots' });
+  const curIdx = lane != null ? LANES.findIndex((l) => l.key === lane) : -1;
+  LANES.forEach((laneDef, i) => {
+    let state = 'future';
+    if (box === 'done') state = 'done';
+    else if (curIdx >= 0) {
+      if (i < curIdx) state = 'done';
+      else if (i === curIdx) state = 'current';
+    }
+    const dotClass = state === 'done' ? ' done' : state === 'current' ? ' current' : '';
+    wrap.appendChild(el('div', { class: 'dot-group' }, [
+      el('span', { class: 'dot' + dotClass, title: laneDef.label }),
+      el('span', { class: 'dot-label' + dotClass, text: laneDef.label }),
+    ]));
+    if (i < LANES.length - 1) wrap.appendChild(el('span', { class: 'dot-line' }));
+  });
+  return wrap;
+}
+
+async function doAction(id, action, body) {
+  const { body: resBody } = await api(`/api/task/${encodeURIComponent(id)}/${action}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  });
+  return resBody;
+}
+
+async function submitAction(id, action, body) {
+  pendingActionMessage = await doAction(id, action, body);
+  loadBoard();
+  await refreshDrawer();
+}
+
+function renderDrawer(drawer, id, detail) {
+  const task = detail.task;
+  const runtime = detail.runtime;
+  const review = detail.review;
+  const needsHuman = detail.needsHuman;
+
+  drawer.appendChild(el('div', { class: 'drawer-header' }, [
+    el('div', {}, [
+      el('div', { class: 'mono', text: id }),
+      task ? el('span', { class: `badge badge-kind ${task.kind}`, text: String(task.kind).toUpperCase() }) : null,
+      el('h2', { text: task ? task.title : '(损坏任务目录)' }),
+      el('div', { text: `stage: ${runtime ? runtime.stage : '(unknown)'}` }),
+      needsHuman ? el('span', { class: 'needs-you', text: '⚑ needs you' }) : null,
+    ]),
+    el('button', { class: 'close-x', text: '×', onclick: closeDrawer }),
+  ]));
+  drawer.appendChild(stageDots(detail.lane, detail.box));
+
+  const body = el('div', { class: 'drawer-body' });
+  const mainCol = el('div', { class: 'main-col' });
+  const resultSlot = el('div', { class: 'result-box' });
+  if (pendingActionMessage) {
+    resultSlot.appendChild(el('pre', {
+      class: 'readonly',
+      text: pendingActionMessage.message || (pendingActionMessage.ok ? 'ok' : 'failed'),
+    }));
+  }
+
+  if (review.kind === 'feasibility') {
+    mainCol.appendChild(el('h3', { text: 'Feasibility memo' }));
+    mainCol.appendChild(el('pre', { class: 'readonly', text: review.missing ? review.message : review.markdown }));
+    mainCol.appendChild(el('h3', { text: 'YOUR DECISION · PICK AN OPTION' }));
+    const optionsWrap = el('div', {});
+    for (const opt of review.options || []) {
+      optionsWrap.appendChild(el('div', {
+        class: 'option-card' + (selectedOption === opt.option_id ? ' selected' : ''),
+        onclick: () => { selectedOption = opt.option_id; renderDrawerFromCache(); },
+      }, [
+        el('span', { class: 'option-id', text: opt.option_id }),
+        el('span', { text: opt.text }),
+      ]));
+    }
+    mainCol.appendChild(optionsWrap);
+    const notes = el('textarea', { id: 'fb-notes', rows: 3 });
+    mainCol.appendChild(el('div', { class: 'field' }, [el('label', { text: '备注（可选）' }), notes]));
+    const approveLabel = selectedOption ? `Approve · 选 ${selectedOption} 继续` : 'Approve · 请先选择一个 option';
+    const approveBtn = el('button', {
+      class: 'btn btn-primary', text: approveLabel,
+      onclick: () => submitAction(id, 'approve-feasibility', { option: selectedOption, notes: notes.value }),
+    });
+    approveBtn.disabled = !selectedOption;
+    const rejectBtn = el('button', {
+      class: 'btn btn-danger', text: 'Reject',
+      onclick: () => submitAction(id, 'reject-feasibility', { notes: notes.value }),
+    });
+    mainCol.appendChild(el('div', { class: 'action-row' }, [approveBtn, rejectBtn]));
+  } else if (review.kind === 'setup') {
+    mainCol.appendChild(el('h3', { text: 'Setup profile 草稿' }));
+    mainCol.appendChild(el('pre', { class: 'readonly', text: review.missing ? review.message : review.markdown }));
+    const approveBtn = el('button', {
+      class: 'btn btn-primary', text: 'Approve',
+      onclick: () => submitAction(id, 'approve-setup', {}),
+    });
+    mainCol.appendChild(el('div', { class: 'action-row' }, [approveBtn]));
+  } else if (review.kind === 'spec') {
+    mainCol.appendChild(el('h3', { text: 'Spec 草稿' }));
+    mainCol.appendChild(el('pre', { class: 'readonly', text: review.missing ? review.message : review.markdown }));
+    const notes = el('textarea', { id: 'spec-notes', rows: 3 });
+    mainCol.appendChild(el('div', { class: 'field' }, [el('label', { text: 'Reject 备注（必填）' }), notes]));
+    const approveBtn = el('button', {
+      class: 'btn btn-primary', text: 'Approve',
+      onclick: () => submitAction(id, 'approve', {}),
+    });
+    const rejectBtn = el('button', {
+      class: 'btn btn-danger', text: 'Reject',
+      onclick: () => submitAction(id, 'reject', { notes: notes.value }),
+    });
+    rejectBtn.disabled = true;
+    notes.addEventListener('input', () => { rejectBtn.disabled = notes.value.trim() === ''; });
+    mainCol.appendChild(el('div', { class: 'action-row' }, [approveBtn, rejectBtn]));
+  } else if (review.kind === 'merge') {
+    mainCol.appendChild(el('h3', { text: 'Diff 摘要' }));
+    mainCol.appendChild(el('pre', { class: 'readonly', text: review.error ? review.error : review.diffShortstat }));
+    const mergeBtn = el('button', {
+      class: 'btn btn-primary', text: 'Merge',
+      onclick: () => submitAction(id, 'merge', {}),
+    });
+    mainCol.appendChild(el('div', { class: 'action-row' }, [mergeBtn]));
+  } else if (review.kind === 'failed') {
+    mainCol.appendChild(el('h3', { text: '失败信息' }));
+    mainCol.appendChild(el('div', { text: review.lastFailureType || '(未知失败类型)' }));
+    const retryBtn = el('button', {
+      class: 'btn btn-danger', text: '↻ Retry',
+      onclick: () => submitAction(id, 'retry', {}),
+    });
+    mainCol.appendChild(el('div', { class: 'action-row' }, [retryBtn]));
+  } else if (review.kind === 'broken') {
+    mainCol.appendChild(el('div', { class: 'broken-banner', text: review.error }));
+  } else {
+    mainCol.appendChild(el('div', { text: `当前 stage：${runtime ? runtime.stage : '?'}` }));
+    if (detail.working === true) mainCol.appendChild(workingLabel());
+  }
+
+  mainCol.appendChild(resultSlot);
+  body.appendChild(mainCol);
+
+  const timelineCol = el('div', { class: 'timeline-col' }, [el('h3', { text: 'Timeline' })]);
+  const entries = detail.timelineEntries || [];
+  if (entries.length === 0) {
+    timelineCol.appendChild(el('div', { class: 'timeline-item', text: '(无记录)' }));
+  } else {
+    entries.forEach((entry, i) => {
+      const prefix = entry.ts == null ? '' : `${formatLocalTimestamp(entry.ts)} `;
+      const item = el('div', { class: 'timeline-item', text: `${prefix}${entry.text}` });
+      item.style.setProperty('--i', Math.min(i, 12));
+      timelineCol.appendChild(item);
+    });
+  }
+  body.appendChild(timelineCol);
+  drawer.appendChild(body);
+}
+
+document.getElementById('drawer-overlay').addEventListener('click', (e) => {
+  if (e.target.id === 'drawer-overlay') closeDrawer();
+});
+
+// ---- 屏 3：新建任务面板 ----
+
+let newTaskState = { kind: null, feasibility: null };
+
+document.getElementById('btn-new-task').addEventListener('click', () => {
+  newTaskState = { kind: null, feasibility: null };
+  showOverlay('panel-overlay');
+  renderNewTaskPanel();
+});
+document.getElementById('panel-overlay').addEventListener('click', (e) => {
+  if (e.target.id === 'panel-overlay') hideOverlay('panel-overlay');
+});
+
+function renderNewTaskPanel(resultBody) {
+  const panel = document.getElementById('new-task-panel');
+  panel.innerHTML = '';
+  panel.appendChild(el('div', { class: 'panel-header' }, [
+    el('h2', { text: '新建任务' }),
+    el('button', { class: 'close-x', text: '×', onclick: () => hideOverlay('panel-overlay') }),
+  ]));
+
+  const kindWrap = el('div', { class: 'kind-cards' });
+  for (const k of ['bugfix', 'feature']) {
+    kindWrap.appendChild(el('div', {
+      class: 'kind-card' + (newTaskState.kind === k ? ' selected' : ''),
+      onclick: () => { newTaskState.kind = k; renderNewTaskPanel(); },
+      text: k === 'bugfix' ? 'bugfix 修 bug' : 'feature 加功能',
+    }));
+  }
+  panel.appendChild(kindWrap);
+
+  if (newTaskState.kind === 'feature') {
+    const fWrap = el('div', { class: 'field' }, [el('label', { text: 'Feasibility gate' })]);
+    fWrap.appendChild(el('div', {
+      class: 'option-card' + (newTaskState.feasibility === false ? ' selected' : ''),
+      onclick: () => { newTaskState.feasibility = false; renderNewTaskPanel(); },
+      text: 'Skip feasibility → 直接产出 spec',
+    }));
+    fWrap.appendChild(el('div', {
+      class: 'option-card' + (newTaskState.feasibility === true ? ' selected' : ''),
+      onclick: () => { newTaskState.feasibility = true; renderNewTaskPanel(); },
+      text: 'Run feasibility gate first',
+    }));
+    panel.appendChild(fWrap);
+  }
+
+  panel.appendChild(el('div', { class: 'field' }, [el('label', { text: 'Title' }), el('input', { type: 'text', id: 'nt-title' })]));
+  panel.appendChild(el('div', { class: 'field' }, [
+    el('label', { text: 'Brief（原始需求描述，创建后随任务保存）' }),
+    el('textarea', { id: 'nt-brief', rows: 5 }),
+  ]));
+
+  const cfg = (latestBoard && latestBoard.config) || {};
+  panel.appendChild(el('details', { class: 'advanced' }, [
+    el('summary', { text: '高级参数（只读）' }),
+    el('div', { class: 'advanced-field' }, [el('span', { text: 'target repo' }), el('span', { text: cfg.targetRepo || '' })]),
+    el('div', { class: 'advanced-field' }, [el('span', { text: 'base branch' }), el('span', { text: cfg.baseBranch || '(currentBranch)' })]),
+    el('div', { class: 'advanced-field' }, [el('span', { text: 'test command' }), el('span', { text: cfg.testCommand || '' })]),
+  ]));
+
+  const resultSlot = el('div', { class: 'result-box' });
+  if (resultBody) {
+    resultSlot.appendChild(el('pre', { class: 'readonly', text: resultBody.message || (resultBody.ok ? 'ok' : 'failed') }));
+  }
+
+  const submitBtn = el('button', {
+    class: 'btn btn-primary', text: '创建并运行 · Create & Run',
+    onclick: async () => {
+      const title = document.getElementById('nt-title').value;
+      const brief = document.getElementById('nt-brief').value;
+      const reqBody = { kind: newTaskState.kind, title, brief };
+      if (newTaskState.kind === 'feature') reqBody.feasibility = newTaskState.feasibility === true;
+      const { body: resBody } = await api('/api/new-task', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(reqBody),
+      });
+      loadBoard();
+      renderNewTaskPanel(resBody);
+    },
+  });
+  submitBtn.disabled = !newTaskState.kind;
+  const cancelBtn = el('button', {
+    class: 'btn btn-ghost', text: '取消',
+    onclick: () => hideOverlay('panel-overlay'),
+  });
+  panel.appendChild(el('div', { class: 'action-row' }, [submitBtn, cancelBtn]));
+  panel.appendChild(resultSlot);
+}
+
+loadBoard();
+setInterval(loadBoard, 1500);
+</script>
+</body>
+</html>
