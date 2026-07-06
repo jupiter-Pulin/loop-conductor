@@ -685,6 +685,7 @@ export function buildSetupPrompt(ts, cfg) {
  * 与 spec-agent 同模式：直写唯一交付物，hook 快反馈 + conductor 契约门终审。
  */
 export function buildFeasibilityPrompt(ts, cfg, round) {
+  const tRepo = taskCfg(ts, cfg).targetRepo;
   const setup = readSetupProfileMarkdown(taskCfg(ts, cfg)) || '(no approved setup profile found)';
   const brief = readBrief(ts);
   const rejectNotes = readFeasibilityRejectNotes(ts);
@@ -694,6 +695,7 @@ export function buildFeasibilityPrompt(ts, cfg, round) {
     readAgentPrompt(cfg, 'feasibility-agent.md'),
     `# 任务 ${ts.id}（feasibility-agent r${round}）`,
     `标题：${ts.task.title ?? '(untitled)'}\nkind：${ts.task.kind}`,
+    `# Target repo\n${tRepo}`,
     `# 任务 brief\n\n${brief.trim() || '(无 brief：需求仅有上面的标题；未知项如实写进开放问题段，不要脑补需求)'}`,
     `# Approved setup profile\n\n${setup}`,
   ];
@@ -734,6 +736,7 @@ function renderFeasibilityDecisionSection(decision) {
 }
 
 export function buildSpecAgentPrompt(ts, cfg, round, { mode = 'draft' } = {}) {
+  const tRepo = taskCfg(ts, cfg).targetRepo;
   const setup = readSetupProfileMarkdown(taskCfg(ts, cfg)) || '(no approved setup profile found)';
   const feasibility = readFeasibilityContext(ts, cfg) || '(no feasibility-study context yet; placeholder for future feasibility-study agent)';
   const brief = readBrief(ts);
@@ -747,6 +750,7 @@ export function buildSpecAgentPrompt(ts, cfg, round, { mode = 'draft' } = {}) {
     readAgentPrompt(cfg, 'spec-agent.md'),
     `# 任务 ${ts.id}（spec-agent r${round}, mode=${mode}, epoch=${ts.runtime.spec_epoch ?? 1})`,
     `标题：${ts.task.title ?? '(untitled)'}\nkind：${ts.task.kind}`,
+    `# Target repo\n${tRepo}`,
     brief.trim() ? `# 任务 brief\n\n${brief}` : '',
     `# Approved setup profile\n\n${setup}`,
     `# Feasibility context\n\n${feasibility}`,
@@ -782,6 +786,7 @@ export function buildSpecAgentPrompt(ts, cfg, round, { mode = 'draft' } = {}) {
 }
 
 export function buildSpecVerifierPrompt(ts, cfg, round) {
+  const tRepo = taskCfg(ts, cfg).targetRepo;
   const setup = readSetupProfileMarkdown(taskCfg(ts, cfg)) || '(no approved setup profile found)';
   const feasibility = readFeasibilityContext(ts, cfg) || '(no feasibility-study context yet; placeholder for future feasibility-study agent)';
   const brief = readBrief(ts);
@@ -791,6 +796,7 @@ export function buildSpecVerifierPrompt(ts, cfg, round) {
   return [
     readAgentPrompt(cfg, 'spec-verifier-agent.md'),
     `# 任务 ${ts.id} spec 审查（spec round ${round}）`,
+    `# Target repo\n${tRepo}`,
     brief.trim() ? `# 任务 brief\n\n${brief}` : '',
     `# Approved setup profile\n\n${setup}`,
     `# Feasibility context\n\n${feasibility}`,
