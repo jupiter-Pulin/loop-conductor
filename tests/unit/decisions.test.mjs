@@ -7,6 +7,7 @@ import {
   fixingMode, parseStrictJson, specMissNext, specVerifierInvalidNext,
   needsFeasibilityAction, feasibilityApprovalNext, feasibilityContractInvalidNext,
   validateSpecVerifierVerdict, validateVerifierVerdict, MAX_MISS, STAGES,
+  sameSignatureStreak,
 } from '../../conductor/stages/decisions.mjs';
 
 test('markerStatus：双标记四态', () => {
@@ -371,4 +372,20 @@ test('validateSpecVerifierVerdict：finding 字段枚举与文本校验', () => 
   assert.ok(r.errors.some((e) => /audience/.test(e)));
   assert.ok(r.errors.some((e) => /issue/.test(e)));
   assert.ok(r.errors.some((e) => /recommendation/.test(e)));
+});
+
+test('sameSignatureStreak：尾部连续相等 run 长度', () => {
+  assert.equal(sameSignatureStreak(['A', 'A']), 2);
+  assert.equal(sameSignatureStreak(['A', 'A', 'B']), 1);
+  assert.equal(sameSignatureStreak(['A', 'B', 'A']), 1);
+  assert.equal(sameSignatureStreak([]), 0);
+  assert.equal(sameSignatureStreak(undefined), 0);
+  assert.equal(sameSignatureStreak(['A', 'A', 'A']), 3);
+});
+
+test('sameSignatureStreak：undefined（旧记录/无签名）打断连续', () => {
+  assert.equal(sameSignatureStreak([undefined, 'A', 'A']), 2, '尾部两个仍相等，不受更早的 undefined 影响');
+  assert.equal(sameSignatureStreak(['A', undefined, 'A']), 1, '紧邻的 undefined 打断连续');
+  assert.equal(sameSignatureStreak(['A', 'A', undefined]), 1, '尾元素本身 undefined，只算自身长度 1');
+  assert.equal(sameSignatureStreak([undefined, undefined]), 1, '两个 undefined 不视为彼此相等');
 });

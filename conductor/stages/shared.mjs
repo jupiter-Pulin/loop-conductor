@@ -16,8 +16,9 @@ import * as state from '../lib/state.mjs';
 import { addRunCost, canStartSpawn } from '../lib/scheduler.mjs';
 import { SPEC_DOC_CONTRACT, validateSpecDoc } from '../lib/spec-contract.mjs';
 import { FEASIBILITY_DOC_CONTRACT, validateFeasibilityDoc } from '../lib/feasibility-contract.mjs';
+import { buildSignature } from '../lib/failure-signature.mjs';
 import {
-  overBudget, testGateVerdict, perAcProbeVerdict, perAcGateVerdict,
+  overBudget, testGateVerdict, perAcProbeVerdict, perAcGateVerdict, greenGatePassed,
   parseStrictJson, validateCommitMessage, verifierVerdictSkeleton,
   SPEC_VERIFIER_CONTRACT, VERIFIER_VERDICT_CONTRACT, COMMIT_MESSAGE_CONTRACT,
 } from './decisions.mjs';
@@ -185,8 +186,19 @@ export function writeGreenGateResult(cfg, id, round, fields, tailBytes) {
     started_at: fields.startedAt,
     finished_at: fields.finishedAt,
   };
+  if (!greenGatePassed(record.exit_code)) record.signature = buildSignature(record);
   state.writeJson(state.dossierPath(cfg, id, `green-gate-r${round}.json`), record);
   return record;
+}
+
+/** 本攻坚周期 green-gate-r1..rUptoRound 的签名 hash 数组（缺失/无签名记 undefined），供 sameSignatureStreak 用。 */
+export function readGreenGateSignatures(cfg, id, uptoRound) {
+  const sigs = [];
+  for (let r = 1; r <= uptoRound; r++) {
+    const rec = state.readJsonIf(state.dossierPath(cfg, id, `green-gate-r${r}.json`));
+    sigs.push(rec?.signature?.hash);
+  }
+  return sigs;
 }
 
 // ---- test gate（基线空转测试探针，docs/features/test-gate/tech-spec.md）----
@@ -335,13 +347,15 @@ export async function runTestGateProbe(ts, cfg, round) {
  * source==='verifier'：failed_criteria = verdict.criteria_results 里 status∈{fail,unknown} 的项；
  *                      green_gate=null；overall='fail'。
  * source==='green_gate'：failed_criteria=[]；存 green_gate_ref，不复制 green-gate tail；
- *                        prompt 层再展开摘要；instruction 改为修测试版。
+ *                        prompt 层再展开摘要；instruction 改为修测试版。sameSignatureStreak>=2
+ *                        （代码类同签名连败，见 isEnvFailureSignature 短路分支）时额外注入
+ *                        same_signature_streak 字段 + 人类可读提示（失败签名未变，附失败测试清单）。
  * source==='test_gate'：存 test_gate_ref（同 green_gate_ref 的去重策略）；per-ac 模式探针
  *                       （probe.mode==='per-ac'）把 vacuous 条目精确填进 failed_criteria，
  *                       suite 模式（降级）保持 v1 形态 failed_criteria=[]；
  *                       instruction 要求补/强化在基线上会失败的测试，禁止削弱换绿。
  */
-export function buildRepairContext({ source, round, verdict, probe }) {
+export function buildRepairContext({ source, round, verdict, probe, sameSignatureStreak, failingTests }) {
   if (source === 'green_gate') {
     return {
       schema_version: 1,
@@ -351,6 +365,10 @@ export function buildRepairContext({ source, round, verdict, probe }) {
       failed_criteria: [],
       green_gate: null,
       green_gate_ref: `green-gate-r${round}.json`,
+      ...(sameSignatureStreak >= 2 ? {
+        same_signature_streak: sameSignatureStreak,
+        same_signature_hint: `上一轮修复后失败签名完全未变：${(failingTests ?? []).join(', ') || '(无法解析具体失败测试名)'}——考虑未命中根因或原因在代码之外。`,
+      } : {}),
       instruction: 'Fix the failing tests so the test command exits 0. Keep unrelated code intact.',
     };
   }
