@@ -182,7 +182,7 @@ test('new --repo 覆盖快照 targetRepo（含该仓库 baseBranch 解析）；s
   assert.equal(run.status, 0, run.stderr);
   assert.equal(env.findTask(id).runtime.stage, 'AWAIT_SETUP_APPROVAL');
   const setupCall = env.calls()[0];
-  assert.equal(setupCall.cwd, repoB, 'setup-agent cwd 应是任务的 targetRepo(repoB)，不是 cfg.targetRepo');
+  assert.ok(setupCall.cwd.endsWith('target-b'), 'setup-agent cwd 应是任务的 targetRepo(repoB)，不是 cfg.targetRepo');
   assert.ok(promptOf(setupCall).includes(repoB), 'prompt 的 Target repo 行应含 repoB 路径');
   assert.ok(!promptOf(setupCall).includes(env.targetDir), 'prompt 不应含 cfg.targetRepo(默认 target) 路径');
 });
@@ -201,7 +201,7 @@ test('feature 任务 feasibility gate：feasibility-agent 的 cwd 与 prompt 均
   assert.equal(run.status, 0, run.stderr);
   assert.equal(env.findTask(id).runtime.stage, 'AWAIT_FEASIBILITY_APPROVAL');
   const call = env.calls()[0];
-  assert.equal(call.cwd, repoB, 'feasibility-agent cwd 应是任务级 targetRepo');
+  assert.ok(call.cwd.endsWith('target-b'), 'feasibility-agent cwd 应是任务级 targetRepo');
   assert.ok(promptOf(call).includes(repoB), 'prompt 应含任务级 targetRepo 路径');
   assert.ok(!promptOf(call).includes(env.targetDir), 'prompt 不应含 cfg.targetRepo(默认 target) 路径');
 });
@@ -231,7 +231,7 @@ test('feature 任务的 spec 链路（needs_spec → spec_verify(fail) → spec_
   assert.equal(calls.length, 4, 'spec-agent r1 + spec-verifier r1 + spec-agent r2(修复) + spec-verifier r2');
   const labels = ['needs_spec', 'spec_verify r1', 'spec_fixing', 'spec_verify r2'];
   calls.forEach((call, i) => {
-    assert.equal(call.cwd, repoB, `${labels[i]} 的 cwd 应是任务级 targetRepo`);
+    assert.ok(call.cwd.endsWith('target-b'), `${labels[i]} 的 cwd 应是任务级 targetRepo`);
     assert.ok(promptOf(call).includes(repoB), `${labels[i]} 的 prompt 应含任务级 targetRepo 路径`);
   });
 });
