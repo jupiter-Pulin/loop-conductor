@@ -68,6 +68,20 @@ export function initTargetRepo(dir) {
 }
 
 /**
+ * 独立的第二个 target 仓库：内容与 initTargetRepo 相同，但多落一次提交，
+ * 保证其 HEAD 与其他用 initTargetRepo 建的仓库不同 SHA——多仓 targetRepo 测试若误用了
+ * 别的仓库，跨仓库的 git 操作（如按此仓库 baseCommit 在别处 worktree add）会直接失败，
+ * 而不是「误用了但内容恰好一样看不出来」。
+ */
+export function initSecondTargetRepo(dir) {
+  initTargetRepo(dir);
+  fs.appendFileSync(path.join(dir, 'README.md'), '\n第二个 target 仓库（多一次提交，与其他 target fixture 的 HEAD 不同）。\n');
+  git(dir, 'add', '-A');
+  git(dir, 'commit', '-m', 'second target repo: extra commit to diverge HEAD from sibling fixtures');
+  return dir;
+}
+
+/**
  * 同上，但额外把一个 harness artifact（.claude_review_state.json）预先 commit 进目标仓库，
  * 让它「已被目标仓库追踪」。供 tracked_harness_artifact_conflict 测试用（契约 §8 / AC-016）。
  */
