@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { runClaude } from '../lib/claude.mjs';
 import { hasApprovedSetupProfile, setupProfilePaths } from '../lib/profile.mjs';
+import { taskCfg } from '../lib/task-cfg.mjs';
 import * as state from '../lib/state.mjs';
 import {
   addCost, budgetExceeded, buildSetupPrompt, entryStageAfterSetup, failToBox,
@@ -29,14 +30,15 @@ async function withSetupKey(key, fn) {
 
 export default async function needsTargetSetupHandler(ts, cfg) {
   const id = ts.id;
-  if (hasApprovedSetupProfile(cfg)) {
+  const tcfg = taskCfg(ts, cfg);
+  if (hasApprovedSetupProfile(tcfg)) {
     state.transitionState(ts, cfg, entryStageAfterSetup(ts), 'approved setup profile already exists');
     return { changed: true };
   }
 
-  const paths = setupProfilePaths(cfg);
+  const paths = setupProfilePaths(tcfg);
   return withSetupKey(paths.key, async () => {
-  if (hasApprovedSetupProfile(cfg)) {
+  if (hasApprovedSetupProfile(tcfg)) {
     state.transitionState(ts, cfg, entryStageAfterSetup(ts), 'approved setup profile already exists');
     return { changed: true };
   }
@@ -49,7 +51,7 @@ export default async function needsTargetSetupHandler(ts, cfg) {
     const streamFile = state.dossierPath(cfg, id, `setup-r${round}.stream.jsonl`);
     const rec = startSpawnRecord(cfg, id, 'setup', round, { stream_file: path.relative(cfg.root, streamFile) });
     const res = await runClaude({
-      cwd: cfg.targetRepo,
+      cwd: tcfg.targetRepo,
       prompt: buildSetupPrompt(ts, cfg),
       maxTurns: cfg.maxTurns,
       model: cfg.models?.setup ?? null,
