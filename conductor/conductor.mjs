@@ -622,12 +622,30 @@ function narrowRetryKind(cfg, ts) {
   if (type === 'spec_verifier_protocol_exhausted' && fs.existsSync(path.join(cfg.specsDir, `${ts.id}.md`))) {
     return 'spec_verifier';
   }
+  if (type === 'env_failure_repeated' && fs.existsSync(path.join(cfg.worktreesDir, ts.id))) {
+    return 'env_failure_repeated';
+  }
   return null;
 }
 
 /** 只归档对应协议失败的 invalid 产物，任务回 queue 且 stage 回到失败前的验收环节，不重跑 maker/spec-agent。 */
 function applyNarrowRetry(cfg, ts, kind) {
   const id = ts.id;
+  if (kind === 'env_failure_repeated') {
+    // 环境类短路收箱：不归档 maker 轮次产物（maker-r<n>.json 双标记原样保留），复位 READY + miss=0；
+    // 配合 READY 既有的「maker 标记 done → 跳过 spawn 只复跑绿门」幂等分支，实现
+    // 「人工修好环境 → retry → 直接重验，不重跑 maker」。
+    Object.assign(ts.runtime, { stage: 'READY', maker_miss_count: 0, last_failure_type: null });
+    state.saveRuntime(ts);
+    const dest = state.taskDir(cfg.queueDir, id);
+    fs.mkdirSync(cfg.queueDir, { recursive: true });
+    fs.renameSync(ts.dir, dest);
+    ts.dir = dest;
+    ts.box = 'queue';
+    state.appendTimeline(cfg, id, 'retry → READY（不重跑 maker，直接复跑绿门），maker 轮次产物保留');
+    console.log(`${id} 已重回 queue（stage=READY, miss=0），环境类失败已恢复，maker 产出保留，下次 run 只复跑绿门`);
+    return;
+  }
   const isVerifier = kind === 'verifier';
   const n = archiveArtifactsMatching(
     cfg, id,

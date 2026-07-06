@@ -6,10 +6,11 @@
 import * as state from '../lib/state.mjs';
 import { ensureWorktree, checkTrackedHarness } from '../lib/git.mjs';
 import { taskCfg } from '../lib/task-cfg.mjs';
-import { markerStatus, greenGatePassed, makerMissNext, fixingMode, makerRound } from './decisions.mjs';
+import { markerStatus, greenGatePassed, makerMissNext, fixingMode, makerRound, sameSignatureStreak } from './decisions.mjs';
+import { isEnvFailureSignature } from '../lib/failure-signature.mjs';
 import {
   worktreePath, runGreenGate, writeGreenGateResult, runTestGateProbe,
-  buildRepairContext, writeRepairContext,
+  buildRepairContext, writeRepairContext, readGreenGateSignatures,
   runMakerRound, buildMakerColdPrompt, buildMakerRepairPrompt,
   budgetExceeded, failToBox, HARNESS_ARTIFACTS, canStartSpawn,
 } from './shared.mjs';
@@ -65,7 +66,7 @@ export default async function fixingHandler(ts, cfg) {
   const startedAt = new Date().toISOString();
   const gate = await runGreenGate(ts.task.testCommand, wt, { timeoutMs: cfg.greenGateTimeoutMs });
   const finishedAt = new Date().toISOString();
-  writeGreenGateResult(cfg, id, round, {
+  const gateRecord = writeGreenGateResult(cfg, id, round, {
     command: ts.task.testCommand,
     exitCode: gate.exitCode,
     timedOut: gate.timedOut,
@@ -102,7 +103,24 @@ export default async function fixingHandler(ts, cfg) {
     return { changed: true };
   }
 
-  const ctx = buildRepairContext({ source: 'green_gate', round });
+  // green gate 失败：先判本攻坚周期的失败签名连续性（同签名连败短路环境类，见 failure-signature.mjs）。
+  const streak = sameSignatureStreak(readGreenGateSignatures(cfg, id, round));
+  if (streak >= 2 && isEnvFailureSignature(gateRecord.signature)) {
+    const missCount = (ts.runtime.maker_miss_count ?? 0) + 1;
+    return failToBox(
+      ts, cfg,
+      `green gate 连续 ${streak} 轮同签名失败，判定环境类（token: ${gateRecord.signature.errorTokens.join(', ')}；` +
+      `失败测试：${gateRecord.signature.failingTests.join(', ')}），短路 miss 阶梯，不再 spawn 下一轮 maker`,
+      'env_failure_repeated',
+      { maker_miss_count: missCount },
+    );
+  }
+
+  const ctx = buildRepairContext({
+    source: 'green_gate', round,
+    sameSignatureStreak: streak >= 2 ? streak : undefined,
+    failingTests: streak >= 2 ? gateRecord.signature?.failingTests : undefined,
+  });
   writeRepairContext(cfg, id, round, ctx);
   const next = makerMissNext(ts.runtime.maker_miss_count ?? 0, cfg.maxMakerMisses);
   if (next.stage === 'FAILED_BOX') {
