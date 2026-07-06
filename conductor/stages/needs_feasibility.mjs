@@ -9,6 +9,7 @@ import path from 'node:path';
 import { runClaude } from '../lib/claude.mjs';
 import * as state from '../lib/state.mjs';
 import { validateFeasibilityDoc } from '../lib/feasibility-contract.mjs';
+import { taskCfg } from '../lib/task-cfg.mjs';
 import { needsFeasibilityAction, feasibilityContractInvalidNext } from './decisions.mjs';
 import {
   addCost, archiveFeasibilityDraft, budgetExceeded, buildFeasibilityPrompt, failToBox,
@@ -18,6 +19,7 @@ import {
 
 export default async function needsFeasibilityHandler(ts, cfg) {
   const id = ts.id;
+  const tRepo = taskCfg(ts, cfg).targetRepo;
   const draftPath = feasibilityDraftPath(ts);
   let action = needsFeasibilityAction(fs.existsSync(draftPath), ts.runtime.feasibility_approval ?? null);
 
@@ -49,7 +51,7 @@ export default async function needsFeasibilityHandler(ts, cfg) {
       stream_file: path.relative(cfg.root, streamFile),
     });
     const res = await runClaude({
-      cwd: cfg.targetRepo,
+      cwd: tRepo,
       prompt: buildFeasibilityPrompt(ts, cfg, round),
       maxTurns: cfg.maxTurns,
       model: cfg.models?.feasibility ?? null,

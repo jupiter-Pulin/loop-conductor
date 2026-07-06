@@ -5,6 +5,7 @@
 // 幂等：maker-r<round>.json 双标记；崩溃残留（started 无 done）转 FAILED_BOX（crashed），retry 恢复。
 import * as state from '../lib/state.mjs';
 import { ensureWorktree, checkTrackedHarness } from '../lib/git.mjs';
+import { taskCfg } from '../lib/task-cfg.mjs';
 import { markerStatus, greenGatePassed, makerMissNext, fixingMode, makerRound } from './decisions.mjs';
 import {
   worktreePath, runGreenGate, writeGreenGateResult, runTestGateProbe,
@@ -15,6 +16,7 @@ import {
 
 export default async function fixingHandler(ts, cfg) {
   const id = ts.id;
+  const tRepo = taskCfg(ts, cfg).targetRepo;
   const miss = ts.runtime.maker_miss_count ?? 0;
   const round = makerRound(miss); // miss==1 → r2，miss==2 → r3
   const marker = state.readJsonIf(state.dossierPath(cfg, id, `maker-r${round}.json`));
@@ -34,7 +36,7 @@ export default async function fixingHandler(ts, cfg) {
       return failToBox(ts, cfg, `budget exceeded: $${ts.runtime.spent_usd} >= $${cfg.budgetUsd}，拒绝 spawn`, 'budget_exceeded');
     }
     if (!canStartSpawn(ts, cfg, 'maker')) return { changed: false };
-    const wt = ensureWorktree(cfg.targetRepo, worktreePath(cfg, id), `task/${id}`, HARNESS_ARTIFACTS.patterns);
+    const wt = ensureWorktree(tRepo, worktreePath(cfg, id), `task/${id}`, HARNESS_ARTIFACTS.patterns);
     const conflicts = checkTrackedHarness(wt, HARNESS_ARTIFACTS.tracked);
     if (conflicts.length > 0) {
       return failToBox(
@@ -56,7 +58,7 @@ export default async function fixingHandler(ts, cfg) {
     // 必须继续跑 green gate 实测（绿门是唯一事实源），红了照常计一次 maker miss。
     // 基础设施失败可能因此被计入 miss 阶梯——接受此取舍；timeline 已记 ok=false 供人工归因。
   } else {
-    ensureWorktree(cfg.targetRepo, worktreePath(cfg, id), `task/${id}`, HARNESS_ARTIFACTS.patterns);
+    ensureWorktree(tRepo, worktreePath(cfg, id), `task/${id}`, HARNESS_ARTIFACTS.patterns);
   }
 
   const wt = worktreePath(cfg, id);
