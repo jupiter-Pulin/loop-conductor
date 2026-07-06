@@ -11,6 +11,7 @@ import {
 } from '../lib/git.mjs';
 import { DEFAULT_TEST_GLOBS, classifyTestFileChanges, AC_TESTS_MAPPING_PATH, validateAcTestsMapping } from '../lib/test-gate.mjs';
 import { readApprovedSetupProfile, setupProfilePaths } from '../lib/profile.mjs';
+import { taskCfg } from '../lib/task-cfg.mjs';
 import * as state from '../lib/state.mjs';
 import { addRunCost, canStartSpawn } from '../lib/scheduler.mjs';
 import { SPEC_DOC_CONTRACT, validateSpecDoc } from '../lib/spec-contract.mjs';
@@ -227,6 +228,7 @@ function readAcTestsMapping(wt, expectedAcIds) {
 export async function runTestGateProbe(ts, cfg, round) {
   if (cfg.testGateEnabled === false) return null;
   const id = ts.id;
+  const tRepo = taskCfg(ts, cfg).targetRepo;
   const wt = worktreePath(cfg, id);
   const globs = cfg.testGateTestGlobs ?? DEFAULT_TEST_GLOBS;
   const probeDir = path.join(cfg.worktreesDir, `${id}.test-gate`);
@@ -272,8 +274,8 @@ export async function runTestGateProbe(ts, cfg, round) {
   const baseCommit = mergeBaseWith(wt, ts.task.baseBranch) ?? ts.task.baseBranch;
   const { copy, remove } = classifyTestFileChanges(diffNameStatusAgainstBase(wt, ts.task.baseBranch), globs);
 
-  removeWorktree(cfg.targetRepo, probeDir); // 清掉上次崩溃可能遗留的探针 worktree（幂等）
-  const added = addDetachedWorktree(cfg.targetRepo, probeDir, baseCommit);
+  removeWorktree(tRepo, probeDir); // 清掉上次崩溃可能遗留的探针 worktree（幂等）
+  const added = addDetachedWorktree(tRepo, probeDir, baseCommit);
   if (!added.ok) {
     // 探针基建失败：不 block（verdict=error），留痕供人工归因（per-AC 模式同样 fail-open）。
     return finish({ baseCommit, copied: copy, deleted: remove, verdict: 'error', error: `git worktree add failed: ${added.error}` });
@@ -322,7 +324,7 @@ export async function runTestGateProbe(ts, cfg, round) {
       verdict: testGateVerdict(gate.exitCode),
     });
   } finally {
-    removeWorktree(cfg.targetRepo, probeDir);
+    removeWorktree(tRepo, probeDir);
   }
 }
 
@@ -671,7 +673,7 @@ function readLatestSpecRepairContext(ts, cfg) {
 export function buildSetupPrompt(ts, cfg) {
   return [
     readAgentPrompt(cfg, 'setup-agent.md'),
-    `# Target repo\n${cfg.targetRepo}`,
+    `# Target repo\n${taskCfg(ts, cfg).targetRepo}`,
     `# Task that triggered setup\n${ts.id}: ${ts.task.title ?? '(untitled)'} (${ts.task.kind})`,
     `# Configured test command\n${ts.task.testCommand}`,
     '# 指令\n只读探索当前 target 仓库，输出 repo 级 setup profile Markdown 全文。不要输出 JSON 或包装。',
@@ -683,7 +685,8 @@ export function buildSetupPrompt(ts, cfg) {
  * 与 spec-agent 同模式：直写唯一交付物，hook 快反馈 + conductor 契约门终审。
  */
 export function buildFeasibilityPrompt(ts, cfg, round) {
-  const setup = readSetupProfileMarkdown(cfg) || '(no approved setup profile found)';
+  const tRepo = taskCfg(ts, cfg).targetRepo;
+  const setup = readSetupProfileMarkdown(taskCfg(ts, cfg)) || '(no approved setup profile found)';
   const brief = readBrief(ts);
   const rejectNotes = readFeasibilityRejectNotes(ts);
   const contractFail = readLatestFeasibilityContractErrors(ts, cfg);
@@ -692,6 +695,7 @@ export function buildFeasibilityPrompt(ts, cfg, round) {
     readAgentPrompt(cfg, 'feasibility-agent.md'),
     `# 任务 ${ts.id}（feasibility-agent r${round}）`,
     `标题：${ts.task.title ?? '(untitled)'}\nkind：${ts.task.kind}`,
+    `# Target repo\n${tRepo}`,
     `# 任务 brief\n\n${brief.trim() || '(无 brief：需求仅有上面的标题；未知项如实写进开放问题段，不要脑补需求)'}`,
     `# Approved setup profile\n\n${setup}`,
   ];
@@ -732,7 +736,8 @@ function renderFeasibilityDecisionSection(decision) {
 }
 
 export function buildSpecAgentPrompt(ts, cfg, round, { mode = 'draft' } = {}) {
-  const setup = readSetupProfileMarkdown(cfg) || '(no approved setup profile found)';
+  const tRepo = taskCfg(ts, cfg).targetRepo;
+  const setup = readSetupProfileMarkdown(taskCfg(ts, cfg)) || '(no approved setup profile found)';
   const feasibility = readFeasibilityContext(ts, cfg) || '(no feasibility-study context yet; placeholder for future feasibility-study agent)';
   const brief = readBrief(ts);
   const decision = readFeasibilityDecision(ts, cfg);
@@ -745,6 +750,7 @@ export function buildSpecAgentPrompt(ts, cfg, round, { mode = 'draft' } = {}) {
     readAgentPrompt(cfg, 'spec-agent.md'),
     `# 任务 ${ts.id}（spec-agent r${round}, mode=${mode}, epoch=${ts.runtime.spec_epoch ?? 1})`,
     `标题：${ts.task.title ?? '(untitled)'}\nkind：${ts.task.kind}`,
+    `# Target repo\n${tRepo}`,
     brief.trim() ? `# 任务 brief\n\n${brief}` : '',
     `# Approved setup profile\n\n${setup}`,
     `# Feasibility context\n\n${feasibility}`,
@@ -780,7 +786,8 @@ export function buildSpecAgentPrompt(ts, cfg, round, { mode = 'draft' } = {}) {
 }
 
 export function buildSpecVerifierPrompt(ts, cfg, round) {
-  const setup = readSetupProfileMarkdown(cfg) || '(no approved setup profile found)';
+  const tRepo = taskCfg(ts, cfg).targetRepo;
+  const setup = readSetupProfileMarkdown(taskCfg(ts, cfg)) || '(no approved setup profile found)';
   const feasibility = readFeasibilityContext(ts, cfg) || '(no feasibility-study context yet; placeholder for future feasibility-study agent)';
   const brief = readBrief(ts);
   const decision = readFeasibilityDecision(ts, cfg);
@@ -789,6 +796,7 @@ export function buildSpecVerifierPrompt(ts, cfg, round) {
   return [
     readAgentPrompt(cfg, 'spec-verifier-agent.md'),
     `# 任务 ${ts.id} spec 审查（spec round ${round}）`,
+    `# Target repo\n${tRepo}`,
     brief.trim() ? `# 任务 brief\n\n${brief}` : '',
     `# Approved setup profile\n\n${setup}`,
     `# Feasibility context\n\n${feasibility}`,
