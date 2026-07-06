@@ -6,6 +6,7 @@
 //       有 done → 跳过 spawn，仅复跑 green gate 完成转移。
 import * as state from '../lib/state.mjs';
 import { ensureWorktree, checkTrackedHarness } from '../lib/git.mjs';
+import { taskCfg } from '../lib/task-cfg.mjs';
 import { markerStatus, greenGatePassed, makerMissNext, makerRound } from './decisions.mjs';
 import {
   worktreePath, runGreenGate, writeGreenGateResult, runTestGateProbe,
@@ -16,6 +17,7 @@ import {
 
 export default async function readyHandler(ts, cfg) {
   const id = ts.id;
+  const tRepo = taskCfg(ts, cfg).targetRepo;
   const round = makerRound(ts.runtime.maker_miss_count); // READY 时 miss 恒为 0 → r1
   const marker = state.readJsonIf(state.dossierPath(cfg, id, `maker-r${round}.json`));
   const status = markerStatus(marker);
@@ -35,7 +37,7 @@ export default async function readyHandler(ts, cfg) {
     }
     if (!canStartSpawn(ts, cfg, 'maker')) return { changed: false };
     ensureDossierSpec(ts, cfg); // bugfix 档在此从 state/queue/<id>/spec.md 冻结进 dossier
-    const wt = ensureWorktree(cfg.targetRepo, worktreePath(cfg, id), `task/${id}`, HARNESS_ARTIFACTS.patterns);
+    const wt = ensureWorktree(tRepo, worktreePath(cfg, id), `task/${id}`, HARNESS_ARTIFACTS.patterns);
     const conflicts = checkTrackedHarness(wt, HARNESS_ARTIFACTS.tracked);
     if (conflicts.length > 0) {
       return failToBox(
@@ -57,7 +59,7 @@ export default async function readyHandler(ts, cfg) {
     // 基础设施失败可能因此被计入 miss 阶梯——接受此取舍；timeline 已记 ok=false 供人工归因。
   } else {
     // done 标记已在：跳过 spawn，仅确保环境后复跑 green gate
-    ensureWorktree(cfg.targetRepo, worktreePath(cfg, id), `task/${id}`, HARNESS_ARTIFACTS.patterns);
+    ensureWorktree(tRepo, worktreePath(cfg, id), `task/${id}`, HARNESS_ARTIFACTS.patterns);
     ensureDossierSpec(ts, cfg);
   }
 

@@ -4,6 +4,7 @@
 import path from 'node:path';
 import { runClaude } from '../lib/claude.mjs';
 import * as state from '../lib/state.mjs';
+import { taskCfg } from '../lib/task-cfg.mjs';
 import { specContractInvalidNext } from './decisions.mjs';
 import {
   addCost, budgetExceeded, buildSpecAgentPrompt, failToBox,
@@ -13,6 +14,7 @@ import {
 
 export default async function specFixingHandler(ts, cfg) {
   const id = ts.id;
+  const tRepo = taskCfg(ts, cfg).targetRepo;
   if (budgetExceeded(ts, cfg)) {
     return failToBox(ts, cfg, `budget exceeded: $${ts.runtime.spent_usd} >= $${cfg.budgetUsd}，拒绝 spawn spec-agent`, 'budget_exceeded');
   }
@@ -25,7 +27,7 @@ export default async function specFixingHandler(ts, cfg) {
     stream_file: path.relative(cfg.root, streamFile),
   });
   const res = await runClaude({
-    cwd: cfg.targetRepo,
+    cwd: tRepo,
     prompt: buildSpecAgentPrompt(ts, cfg, round, { mode: 'repair' }),
     maxTurns: cfg.maxTurns,
     model: cfg.models?.spec ?? null,
