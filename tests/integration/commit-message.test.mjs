@@ -103,6 +103,41 @@ test('提案两次 invalid → fail-open 降级机器文案，merge 不被 block
   assert.ok(timeline.includes('降级机器文案'), 'timeline 留降级痕迹');
 });
 
+test('提案 a1 轮次耗尽未输出：重试反馈禁工具指令而非「提案不是对象」，a2 提案生效', (t) => {
+  const env = makeEnv(t);
+  const id = 'task-20260704-904';
+  env.writeTask(id);
+  env.setScenario([
+    { actions: [{ type: 'writeFile', path: 'lib/stats.mjs', content: FIXED_STATS }], session_id: 'sess-m1', cost: 0.1, result: 'r1 修好' },
+    verifierStep(1),
+    // committer a1：模型把轮次花在工具上，输出提案前被 max-turns 截断（真实事故形态：
+    // dossier/task-20260707-001/committer-r1.stream.jsonl，result 缺失 + subtype=error_max_turns）
+    { cost: 0.01, result: '', extra: { subtype: 'error_max_turns', is_error: true, num_turns: 5 } },
+    { cost: 0.01, result: JSON.stringify(PROPOSAL) }, // a2：收到轮次纪律反馈后直接输出
+  ]);
+
+  const run = env.run('run');
+  assert.equal(run.status, 0, run.stderr);
+  const merge = env.run('merge', id);
+  assert.equal(merge.status, 0, merge.stderr);
+  assert.equal(env.findTask(id).box, 'done');
+
+  // a2 提案生效，不降级机器文案
+  const head = execFileSync('git', ['-C', env.targetDir, 'log', '-1', '--format=%B'], { encoding: 'utf8' });
+  assert.ok(head.startsWith(`${PROPOSAL.subject}\n`), `merge commit subject 应为 a2 提案：${head.split('\n')[0]}`);
+
+  // a2 prompt 收到的是轮次纪律反馈（禁工具直出），不是失真的「提案不是对象」
+  const calls = env.calls();
+  assert.equal(calls.length, 4, 'maker + verifier + committer×2');
+  const retryPrompt = promptOf(calls[3]);
+  assert.ok(retryPrompt.includes('耗尽了轮次'), '重试 prompt 指明真实失败原因');
+  assert.ok(retryPrompt.includes('禁止调用任何工具'), '重试 prompt 附禁工具直出指令');
+  assert.ok(!retryPrompt.includes('提案不是对象'), '不得回喂失真的校验错误');
+
+  const timeline = env.readFile(env.dossier(id, 'timeline.md'));
+  assert.ok(timeline.includes('轮次耗尽未输出提案'), 'timeline 记录真实归因');
+});
+
 test('budget 已超：跳过 committer spawn，直接机器文案', (t) => {
   const env = makeEnv(t);
   const id = 'task-20260704-903';

@@ -86,16 +86,25 @@ test('verdict fail×3：1/2/3 阶梯 → FAILED_BOX；retry 复活', (t) => {
   }
 });
 
-test('resume 失败自动降级为冷启动，阶梯顺延', (t) => {
-  const env = makeEnv(t);
+// resume 非零退出且无 result 事件（不透明失败）现按疑似瞬态重试（isTransientFailure，AC-001）；
+// 重试预算耗尽后仍要保留 cold 逃生口（AC-005）——这里把 spawnRetries 收窄到 1，
+// 让 resume 先重试一次、仍不透明失败、耗尽后再降级冷启动，覆盖新契约的完整路径。
+// 冷启动兜底成功后多留几份合法 verifier pass 兜底：不同代码路径下 maker 轮次消耗的调用数
+// 可能不同，多余的 verdict 不会被消费，也不影响最终裁决（round 字段仅供人读，不参与校验）。
+test('resume 不透明失败重试耗尽后仍降级冷启动，阶梯顺延（AC-005）', (t) => {
+  const env = makeEnv(t, { config: { spawnRetries: 1, spawnBackoffMs: [0] } });
   const id = 'task-20260611-102';
   env.writeTask(id);
+  const PASS2 = verifierStep(2, { 'AC-001': 'pass', 'AC-002': 'pass' });
   env.setScenario([
     { actions: [FIX], session_id: 'sess-m1', cost: 0.10, result: 'r1 修复' }, // 0 maker r1
     VFAIL(1),                                                                   // 1 verifier r1 → miss 1
-    { exitCode: 1, stderr: 'No conversation found with session ID' },          // 2 resume 失败
-    { session_id: 'sess-m2b', cost: 0.07, result: 'r2 冷启动兜底' },           // 3 降级冷启动
-    verifierStep(2, { 'AC-001': 'pass', 'AC-002': 'pass' }),                   // 4 verifier r2 pass
+    { exitCode: 1, stderr: 'No conversation found with session ID' },          // 2 resume 尝试1：不透明失败
+    { exitCode: 1, stderr: 'No conversation found with session ID' },          // 3 resume 尝试2（重试）：仍不透明失败，耗尽
+    { session_id: 'sess-m2b', cost: 0.07, result: 'r2 冷启动兜底' },           // 4 降级冷启动
+    PASS2,                                                                        // 5 verifier r2 pass
+    PASS2,                                                                        // 6 兜底
+    PASS2,                                                                        // 7 兜底
   ]);
 
   const run = env.run('run');
@@ -105,8 +114,8 @@ test('resume 失败自动降级为冷启动，阶梯顺延', (t) => {
   assert.equal(after.runtime.maker_miss_count, 1, '降级不额外消耗阶梯');
 
   const calls = env.calls();
-  assert.equal(resumeIdOf(calls[2]), 'sess-m1', '先尝试 resume');
-  assert.equal(resumeIdOf(calls[3]), null, '降级后冷启动');
+  const resumeCalls = calls.filter((c) => resumeIdOf(c) === 'sess-m1');
+  assert.equal(resumeCalls.length, 2, 'resume 应先按 retries 上限重试一次才耗尽，而非一次不透明失败就判死（AC-005 新契约）');
   const marker = env.readJson(env.dossier(id, 'maker-r2.json'));
   assert.equal(marker.resume_failed, true);
   assert.equal(marker.mode, 'cold-degraded');

@@ -11,12 +11,14 @@ import {
 } from '../lib/git.mjs';
 import { DEFAULT_TEST_GLOBS, classifyTestFileChanges, AC_TESTS_MAPPING_PATH, validateAcTestsMapping } from '../lib/test-gate.mjs';
 import { readApprovedSetupProfile, setupProfilePaths } from '../lib/profile.mjs';
+import { taskCfg } from '../lib/task-cfg.mjs';
 import * as state from '../lib/state.mjs';
 import { addRunCost, canStartSpawn } from '../lib/scheduler.mjs';
 import { SPEC_DOC_CONTRACT, validateSpecDoc } from '../lib/spec-contract.mjs';
 import { FEASIBILITY_DOC_CONTRACT, validateFeasibilityDoc } from '../lib/feasibility-contract.mjs';
+import { buildSignature } from '../lib/failure-signature.mjs';
 import {
-  overBudget, testGateVerdict, perAcProbeVerdict, perAcGateVerdict,
+  overBudget, testGateVerdict, perAcProbeVerdict, perAcGateVerdict, greenGatePassed,
   parseStrictJson, validateCommitMessage, verifierVerdictSkeleton,
   SPEC_VERIFIER_CONTRACT, VERIFIER_VERDICT_CONTRACT, COMMIT_MESSAGE_CONTRACT,
 } from './decisions.mjs';
@@ -184,8 +186,19 @@ export function writeGreenGateResult(cfg, id, round, fields, tailBytes) {
     started_at: fields.startedAt,
     finished_at: fields.finishedAt,
   };
+  if (!greenGatePassed(record.exit_code)) record.signature = buildSignature(record);
   state.writeJson(state.dossierPath(cfg, id, `green-gate-r${round}.json`), record);
   return record;
+}
+
+/** 本攻坚周期 green-gate-r1..rUptoRound 的签名 hash 数组（缺失/无签名记 undefined），供 sameSignatureStreak 用。 */
+export function readGreenGateSignatures(cfg, id, uptoRound) {
+  const sigs = [];
+  for (let r = 1; r <= uptoRound; r++) {
+    const rec = state.readJsonIf(state.dossierPath(cfg, id, `green-gate-r${r}.json`));
+    sigs.push(rec?.signature?.hash);
+  }
+  return sigs;
 }
 
 // ---- test gate（基线空转测试探针，docs/features/test-gate/tech-spec.md）----
@@ -227,6 +240,7 @@ function readAcTestsMapping(wt, expectedAcIds) {
 export async function runTestGateProbe(ts, cfg, round) {
   if (cfg.testGateEnabled === false) return null;
   const id = ts.id;
+  const tRepo = taskCfg(ts, cfg).targetRepo;
   const wt = worktreePath(cfg, id);
   const globs = cfg.testGateTestGlobs ?? DEFAULT_TEST_GLOBS;
   const probeDir = path.join(cfg.worktreesDir, `${id}.test-gate`);
@@ -272,8 +286,8 @@ export async function runTestGateProbe(ts, cfg, round) {
   const baseCommit = mergeBaseWith(wt, ts.task.baseBranch) ?? ts.task.baseBranch;
   const { copy, remove } = classifyTestFileChanges(diffNameStatusAgainstBase(wt, ts.task.baseBranch), globs);
 
-  removeWorktree(cfg.targetRepo, probeDir); // 清掉上次崩溃可能遗留的探针 worktree（幂等）
-  const added = addDetachedWorktree(cfg.targetRepo, probeDir, baseCommit);
+  removeWorktree(tRepo, probeDir); // 清掉上次崩溃可能遗留的探针 worktree（幂等）
+  const added = addDetachedWorktree(tRepo, probeDir, baseCommit);
   if (!added.ok) {
     // 探针基建失败：不 block（verdict=error），留痕供人工归因（per-AC 模式同样 fail-open）。
     return finish({ baseCommit, copied: copy, deleted: remove, verdict: 'error', error: `git worktree add failed: ${added.error}` });
@@ -287,25 +301,37 @@ export async function runTestGateProbe(ts, cfg, round) {
     for (const rel of remove) fs.rmSync(path.join(probeDir, rel), { force: true });
 
     if (mode === 'per-ac') {
-      // 逐 AC 定向探测（AC-008）：按冻结 spec 的 AC 枚举顺序执行映射条目；未映射记 unmapped。
-      // 单条超时/spawn error 只判该条 error，其余条目照常执行（AC-011）。
+      // 逐 AC 定向探测（AC-008）：结果按冻结 spec 的 AC 枚举顺序排列（按 index 写槽位，与完成
+      // 先后无关）；未映射记 unmapped。单条超时/spawn error 只判该条 error（runGreenGate 从不
+      // reject），其余条目照常执行（AC-011）。
+      // 并发是 opt-in（testGateProbeConcurrency，默认 1 = 与旧串行实现逐条一致）：所有映射命令
+      // 共享同一个探针 worktree，只有当命令之间无共享端口/临时文件/全局状态时才允许 >1，
+      // 由使用者对具体 target repo 负责；拿不准就保持串行，不制造 flaky。
       const byId = new Map(mapping.entries.map((e) => [e.ac_id, e]));
-      const perAc = [];
-      for (const acId of expectedAcIds) {
-        const entry = byId.get(acId);
-        if (!entry) {
-          perAc.push({ ac_id: acId, verdict: 'unmapped' });
-          continue;
+      const perAc = new Array(expectedAcIds.length);
+      const concurrencyRaw = Number(cfg.testGateProbeConcurrency);
+      const concurrency = Number.isFinite(concurrencyRaw) && concurrencyRaw > 1 ? Math.floor(concurrencyRaw) : 1;
+      let nextIdx = 0;
+      const probeWorker = async () => {
+        while (nextIdx < expectedAcIds.length) {
+          const i = nextIdx++;
+          const acId = expectedAcIds[i];
+          const entry = byId.get(acId);
+          if (!entry) {
+            perAc[i] = { ac_id: acId, verdict: 'unmapped' };
+            continue;
+          }
+          const r = await runGreenGate(entry.command, probeDir, { timeoutMs: cfg.greenGateTimeoutMs });
+          perAc[i] = {
+            ac_id: acId,
+            expect: entry.expect,
+            exit_code: r.exitCode,
+            timed_out: r.timedOut,
+            verdict: perAcProbeVerdict(entry.expect, r.exitCode, r.timedOut),
+          };
         }
-        const r = await runGreenGate(entry.command, probeDir, { timeoutMs: cfg.greenGateTimeoutMs });
-        perAc.push({
-          ac_id: acId,
-          expect: entry.expect,
-          exit_code: r.exitCode,
-          timed_out: r.timedOut,
-          verdict: perAcProbeVerdict(entry.expect, r.exitCode, r.timedOut),
-        });
-      }
+      };
+      await Promise.all(Array.from({ length: Math.min(concurrency, expectedAcIds.length) }, probeWorker));
       // per-AC 模式跳过 v1 全量基线复跑（省一次全量 suite 时间）：exit_code 留 null。
       return finish({ baseCommit, copied: copy, deleted: remove, perAc, verdict: perAcGateVerdict(perAc) });
     }
@@ -322,7 +348,7 @@ export async function runTestGateProbe(ts, cfg, round) {
       verdict: testGateVerdict(gate.exitCode),
     });
   } finally {
-    removeWorktree(cfg.targetRepo, probeDir);
+    removeWorktree(tRepo, probeDir);
   }
 }
 
@@ -333,13 +359,15 @@ export async function runTestGateProbe(ts, cfg, round) {
  * source==='verifier'：failed_criteria = verdict.criteria_results 里 status∈{fail,unknown} 的项；
  *                      green_gate=null；overall='fail'。
  * source==='green_gate'：failed_criteria=[]；存 green_gate_ref，不复制 green-gate tail；
- *                        prompt 层再展开摘要；instruction 改为修测试版。
+ *                        prompt 层再展开摘要；instruction 改为修测试版。sameSignatureStreak>=2
+ *                        （代码类同签名连败，见 isEnvFailureSignature 短路分支）时额外注入
+ *                        same_signature_streak 字段 + 人类可读提示（失败签名未变，附失败测试清单）。
  * source==='test_gate'：存 test_gate_ref（同 green_gate_ref 的去重策略）；per-ac 模式探针
  *                       （probe.mode==='per-ac'）把 vacuous 条目精确填进 failed_criteria，
  *                       suite 模式（降级）保持 v1 形态 failed_criteria=[]；
  *                       instruction 要求补/强化在基线上会失败的测试，禁止削弱换绿。
  */
-export function buildRepairContext({ source, round, verdict, probe }) {
+export function buildRepairContext({ source, round, verdict, probe, sameSignatureStreak, failingTests }) {
   if (source === 'green_gate') {
     return {
       schema_version: 1,
@@ -349,6 +377,10 @@ export function buildRepairContext({ source, round, verdict, probe }) {
       failed_criteria: [],
       green_gate: null,
       green_gate_ref: `green-gate-r${round}.json`,
+      ...(sameSignatureStreak >= 2 ? {
+        same_signature_streak: sameSignatureStreak,
+        same_signature_hint: `上一轮修复后失败签名完全未变：${(failingTests ?? []).join(', ') || '(无法解析具体失败测试名)'}——考虑未命中根因或原因在代码之外。`,
+      } : {}),
       instruction: 'Fix the failing tests so the test command exits 0. Keep unrelated code intact.',
     };
   }
@@ -671,7 +703,7 @@ function readLatestSpecRepairContext(ts, cfg) {
 export function buildSetupPrompt(ts, cfg) {
   return [
     readAgentPrompt(cfg, 'setup-agent.md'),
-    `# Target repo\n${cfg.targetRepo}`,
+    `# Target repo\n${taskCfg(ts, cfg).targetRepo}`,
     `# Task that triggered setup\n${ts.id}: ${ts.task.title ?? '(untitled)'} (${ts.task.kind})`,
     `# Configured test command\n${ts.task.testCommand}`,
     '# 指令\n只读探索当前 target 仓库，输出 repo 级 setup profile Markdown 全文。不要输出 JSON 或包装。',
@@ -683,7 +715,8 @@ export function buildSetupPrompt(ts, cfg) {
  * 与 spec-agent 同模式：直写唯一交付物，hook 快反馈 + conductor 契约门终审。
  */
 export function buildFeasibilityPrompt(ts, cfg, round) {
-  const setup = readSetupProfileMarkdown(cfg) || '(no approved setup profile found)';
+  const tRepo = taskCfg(ts, cfg).targetRepo;
+  const setup = readSetupProfileMarkdown(taskCfg(ts, cfg)) || '(no approved setup profile found)';
   const brief = readBrief(ts);
   const rejectNotes = readFeasibilityRejectNotes(ts);
   const contractFail = readLatestFeasibilityContractErrors(ts, cfg);
@@ -692,6 +725,7 @@ export function buildFeasibilityPrompt(ts, cfg, round) {
     readAgentPrompt(cfg, 'feasibility-agent.md'),
     `# 任务 ${ts.id}（feasibility-agent r${round}）`,
     `标题：${ts.task.title ?? '(untitled)'}\nkind：${ts.task.kind}`,
+    `# Target repo\n${tRepo}`,
     `# 任务 brief\n\n${brief.trim() || '(无 brief：需求仅有上面的标题；未知项如实写进开放问题段，不要脑补需求)'}`,
     `# Approved setup profile\n\n${setup}`,
   ];
@@ -732,7 +766,8 @@ function renderFeasibilityDecisionSection(decision) {
 }
 
 export function buildSpecAgentPrompt(ts, cfg, round, { mode = 'draft' } = {}) {
-  const setup = readSetupProfileMarkdown(cfg) || '(no approved setup profile found)';
+  const tRepo = taskCfg(ts, cfg).targetRepo;
+  const setup = readSetupProfileMarkdown(taskCfg(ts, cfg)) || '(no approved setup profile found)';
   const feasibility = readFeasibilityContext(ts, cfg) || '(no feasibility-study context yet; placeholder for future feasibility-study agent)';
   const brief = readBrief(ts);
   const decision = readFeasibilityDecision(ts, cfg);
@@ -745,6 +780,7 @@ export function buildSpecAgentPrompt(ts, cfg, round, { mode = 'draft' } = {}) {
     readAgentPrompt(cfg, 'spec-agent.md'),
     `# 任务 ${ts.id}（spec-agent r${round}, mode=${mode}, epoch=${ts.runtime.spec_epoch ?? 1})`,
     `标题：${ts.task.title ?? '(untitled)'}\nkind：${ts.task.kind}`,
+    `# Target repo\n${tRepo}`,
     brief.trim() ? `# 任务 brief\n\n${brief}` : '',
     `# Approved setup profile\n\n${setup}`,
     `# Feasibility context\n\n${feasibility}`,
@@ -780,7 +816,8 @@ export function buildSpecAgentPrompt(ts, cfg, round, { mode = 'draft' } = {}) {
 }
 
 export function buildSpecVerifierPrompt(ts, cfg, round) {
-  const setup = readSetupProfileMarkdown(cfg) || '(no approved setup profile found)';
+  const tRepo = taskCfg(ts, cfg).targetRepo;
+  const setup = readSetupProfileMarkdown(taskCfg(ts, cfg)) || '(no approved setup profile found)';
   const feasibility = readFeasibilityContext(ts, cfg) || '(no feasibility-study context yet; placeholder for future feasibility-study agent)';
   const brief = readBrief(ts);
   const decision = readFeasibilityDecision(ts, cfg);
@@ -789,6 +826,7 @@ export function buildSpecVerifierPrompt(ts, cfg, round) {
   return [
     readAgentPrompt(cfg, 'spec-verifier-agent.md'),
     `# 任务 ${ts.id} spec 审查（spec round ${round}）`,
+    `# Target repo\n${tRepo}`,
     brief.trim() ? `# 任务 brief\n\n${brief}` : '',
     `# Approved setup profile\n\n${setup}`,
     `# Feasibility context\n\n${feasibility}`,
@@ -1172,8 +1210,16 @@ export async function runCommitterProposal(ts, cfg) {
       state.appendTimeline(cfg, id, `committer 提案 a${attempt} 有效：${check.subject}`);
       return `${check.subject}\n\n${check.body}`;
     }
-    state.appendTimeline(cfg, id, `committer 提案 a${attempt} invalid：${check.errors.join('; ')}`);
-    prompt += `\n\n# 上一轮提案校验失败（必须全部修复后重出）\n${check.errors.map((e) => `- ${e}`).join('\n')}`;
+    // 失败归因分两类：模型在输出提案前耗尽轮次（result 为空，subtype=error_max_turns）与提案本身
+    // 不合格。前者若回喂「提案不是对象」会误导重试（模型从未输出过提案）——改喂轮次纪律指令。
+    const noProposal = !res.result?.trim() && res.raw?.subtype === 'error_max_turns';
+    if (noProposal) {
+      state.appendTimeline(cfg, id, `committer 提案 a${attempt} invalid：轮次耗尽未输出提案（error_max_turns）`);
+      prompt += '\n\n# 上一轮失败：你在输出提案前耗尽了轮次\n本轮**禁止调用任何工具**，直接基于上文已给的材料输出严格 JSON 提案。';
+    } else {
+      state.appendTimeline(cfg, id, `committer 提案 a${attempt} invalid：${check.errors.join('; ')}`);
+      prompt += `\n\n# 上一轮提案校验失败（必须全部修复后重出）\n${check.errors.map((e) => `- ${e}`).join('\n')}`;
+    }
   }
   state.appendTimeline(cfg, id, 'committer 提案两次 invalid，merge 降级机器文案');
   return null;
@@ -1181,11 +1227,22 @@ export async function runCommitterProposal(ts, cfg) {
 
 // ---- maker spawn（双标记 + 预算累计） ----
 
+/** max-turns 截断判定：会话本身健在（有 session_id），只是轮次预算耗尽——可同会话续跑。 */
+function isMaxTurnsCutoff(res) {
+  return res?.raw?.subtype === 'error_max_turns' && typeof (res.raw?.session_id ?? res.sessionId) === 'string';
+}
+
+const MAX_TURNS_CONTINUATION_PROMPT =
+  '上一条会话因轮次上限被截断，任务尚未完成。从中断处继续：优先把改动收敛到可编译、测试可跑的最小闭合状态，再继续未完成的 AC。';
+
 /**
  * spawn 一轮 maker，带双标记（started/done）与预算累计。
- * mode==='resume' 失败时自动降级为冷启动（coldPrompt），阶梯顺延。
+ * mode==='resume' 失败时自动降级为冷启动（coldPrompt），阶梯顺延；
+ * 唯一例外是 max-turns 截断（error_max_turns）：会话健在、工作未完，降级冷启动只会丢上下文重来
+ * （dossier 证据：task-20260705-003 r2/r3 连续截断+cold-degraded），改为同会话续跑
+ * （makerMaxTurnsContinuations 上限，默认 1；耗尽后回到旧行为——照常进 green gate 实测）。
  * 不在此 ensureWorktree / 不在此跑 green gate（handler 负责）；wt 由 handler 传入。
- * 返回 claude 调用结果（降级后为冷启动结果）。
+ * 返回 claude 调用结果（降级/续跑后为最后一腿的结果）。
  */
 export async function runMakerRound(ts, cfg, round, { mode, prompt, coldPrompt, wt }) {
   const id = ts.id;
@@ -1215,18 +1272,51 @@ export async function runMakerRound(ts, cfg, round, { mode, prompt, coldPrompt, 
     onRetry: ({ attempt, status }) =>
       state.appendTimeline(cfg, id, `maker r${round} transient retry attempt ${attempt} (status=${status ?? 'spawn-error'})`),
   };
+
+  // max-turns 续跑：每腿先把上一腿成本入账（budgetExceeded/canStartSpawn 才判得准），
+  // 腿流单独落盘（maker-r<n>.cont-<leg>.stream.jsonl，沿用「stream 不跨 attempt 混流」纪律）。
+  const maxContinuations = Number.isInteger(cfg.makerMaxTurnsContinuations) && cfg.makerMaxTurnsContinuations >= 0
+    ? cfg.makerMaxTurnsContinuations : 1;
+  const continueOnMaxTurns = async (res) => {
+    let legs = 0;
+    while (isMaxTurnsCutoff(res) && legs < maxContinuations) {
+      const sessionId = res.raw?.session_id ?? res.sessionId;
+      addCost(ts, res.costUsd, cfg);
+      state.saveRuntime(ts);
+      res = { ...res, costUsd: 0 }; // 本腿成本已入账；防止收尾 addCost 重复计费
+      if (budgetExceeded(ts, cfg) || !canStartSpawn(ts, cfg, 'maker')) break;
+      legs++;
+      state.appendTimeline(cfg, id, `maker r${round} max-turns 截断 → 同会话续跑 ${legs}/${maxContinuations}`);
+      res = await runClaudeWithRetry({
+        ...common,
+        resume: sessionId,
+        prompt: MAX_TURNS_CONTINUATION_PROMPT,
+        streamFile: state.dossierPath(cfg, id, `maker-r${round}.cont-${legs}.stream.jsonl`),
+      }, retryOpts);
+      rec.record.max_turns_continuations = legs;
+      state.writeJson(rec.path, rec.record);
+    }
+    return res;
+  };
+
   let res;
   if (mode === 'resume') {
     res = await runClaudeWithRetry({ ...common, resume: ts.runtime.maker_session_id, prompt }, retryOpts);
-    if (!res.ok && !res.retriesExhausted) {
+    res = await continueOnMaxTurns(res);
+    if (!res.ok && !isMaxTurnsCutoff(res)) {
+      // resume 无论是立即判非瞬态失败，还是瞬态重试耗尽，都必须落到冷启动兜底一次——
+      // resume 失败绝不能让本轮直接以 retriesExhausted 收场（那会被上层判 spawn_transient_exhausted 收箱，
+      // 跳过冷启动逃生口）。max-turns 截断不算 resume 失败：续跑额度耗尽后照常进 green gate。
       rec.record.resume_failed = true;
       rec.record.mode = 'cold-degraded';
       state.writeJson(rec.path, rec.record);
       state.appendTimeline(cfg, id, `maker r${round} resume 失败（${res.error ?? 'unknown'}）→ 降级冷启动`);
       res = await runClaudeWithRetry({ ...common, prompt: coldPrompt ?? prompt }, retryOpts);
+      res = await continueOnMaxTurns(res);
     }
   } else {
     res = await runClaudeWithRetry({ ...common, prompt }, retryOpts);
+    res = await continueOnMaxTurns(res);
   }
   if (res.retriesExhausted) {
     state.appendTimeline(cfg, id, `maker r${round} transient retries exhausted`);

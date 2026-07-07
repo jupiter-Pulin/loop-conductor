@@ -3,8 +3,33 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { buildClaudeArgs, parseClaudeJson, claudeBin, runClaudeStream } from '../../conductor/lib/claude.mjs';
+import {
+  buildClaudeArgs, parseClaudeJson, claudeBin, runClaudeStream,
+  isTransientFailure, runClaudeWithRetry, setSleepFn,
+} from '../../conductor/lib/claude.mjs';
 import { FAKE_CLAUDE } from '../helpers/env.mjs';
+
+/** 起一个临时目录 + fake-claude 剧本，注入 CLAUDE_BIN，返回 { dir, scenarioPath }；t.after 自动还原环境与清理。 */
+function makeFakeClaudeDir(t, steps) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-unit-'));
+  const scenarioPath = path.join(dir, 'scenario.json');
+  fs.writeFileSync(scenarioPath, JSON.stringify(steps));
+  const prevEnv = {
+    CLAUDE_BIN: process.env.CLAUDE_BIN,
+    FAKE_CLAUDE_SCRIPT: process.env.FAKE_CLAUDE_SCRIPT,
+    FAKE_CLAUDE_LOG: process.env.FAKE_CLAUDE_LOG,
+  };
+  process.env.CLAUDE_BIN = FAKE_CLAUDE;
+  process.env.FAKE_CLAUDE_SCRIPT = scenarioPath;
+  delete process.env.FAKE_CLAUDE_LOG;
+  t.after(() => {
+    for (const [k, v] of Object.entries(prevEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  return dir;
+}
 
 test('buildClaudeArgs：冷启动（prompt 不进 argv，走 stdin）', () => {
   const args = buildClaudeArgs({ prompt: 'do it', maxTurns: 30 });
@@ -97,4 +122,126 @@ test('claudeBin：CLAUDE_BIN 环境变量覆盖（fake-claude 挂载点）', () 
   } finally {
     if (prev === undefined) delete process.env.CLAUDE_BIN; else process.env.CLAUDE_BIN = prev;
   }
+});
+
+test('AC-001: isTransientFailure — 不透明退出失败（非零退出/被杀 + raw==null + 无 api_error_status）判定为瞬态', () => {
+  // 非零退出 + 无 result 事件（raw==null）→ 疑似瞬态
+  assert.equal(isTransientFailure({ ok: false, exitCode: 1, raw: null, killed: null }), true);
+  assert.equal(isTransientFailure({ ok: false, exitCode: -1, raw: null, killed: null }), true);
+  // 边界：exit 0 且 raw==null 不属于 AC-001 定义的「非零退出或被杀」范围，不应命中新分支
+  assert.equal(isTransientFailure({ ok: true, exitCode: 0, raw: null, killed: null }), false);
+  // 既有分类不变：spawnError / killed / 瞬态状态码
+  assert.equal(isTransientFailure({ spawnError: true, raw: null, exitCode: -1 }), true);
+  assert.equal(isTransientFailure({ killed: 'inactivity', raw: null, exitCode: null }), true);
+  assert.equal(isTransientFailure({ ok: true, exitCode: 0, raw: { is_error: true, api_error_status: 429 } }), true);
+  assert.equal(isTransientFailure({ ok: true, exitCode: 0, raw: { is_error: true, api_error_status: 503 } }), true);
+});
+
+test('AC-003: isTransientFailure — 非瞬态可读硬错误（400/404）仍返回 false（回归守卫）', () => {
+  assert.equal(isTransientFailure({ ok: true, exitCode: 0, raw: { is_error: true, api_error_status: 400 } }), false);
+  assert.equal(isTransientFailure({ ok: true, exitCode: 0, raw: { is_error: true, api_error_status: 404 } }), false);
+});
+
+test('AC-002: runClaudeWithRetry 对不透明退出失败按 retries 上限重试；中途成功即停止', async (t) => {
+  const dir = makeFakeClaudeDir(t, [
+    { exitCode: 1 }, // attempt1：不透明失败
+    { exitCode: 1 }, // attempt2：不透明失败（重试）
+    { session_id: 's-ok', cost: 0.02, result: 'done' }, // attempt3：成功
+  ]);
+  const retryLog = [];
+  setSleepFn(() => {}); // 跳过真实退避
+  t.after(() => setSleepFn(null));
+
+  const res = await runClaudeWithRetry({ prompt: 'x', cwd: dir, maxTurns: 5 }, {
+    retries: 4,
+    backoffMs: [0],
+    onRetry: (info) => retryLog.push(info),
+  });
+
+  assert.equal(res.ok, true, res.error);
+  assert.equal(res.sessionId, 's-ok');
+  assert.equal(res.attempts.length, 3, '2 次不透明失败 + 1 次成功');
+  assert.equal(res.attempts[0].transient, true);
+  assert.equal(res.attempts[1].transient, true);
+  assert.equal(res.attempts[2].transient, false);
+  assert.equal(retryLog.length, 2, 'onRetry 应恰好调用 2 次（每次失败后触发一次）');
+});
+
+test('AC-002: 连续不透明退出失败达 retries 上限 → retriesExhausted:true', async (t) => {
+  const dir = makeFakeClaudeDir(t, [{ exitCode: 1 }, { exitCode: 1 }, { exitCode: 1 }]);
+  setSleepFn(() => {});
+  t.after(() => setSleepFn(null));
+
+  const res = await runClaudeWithRetry({ prompt: 'x', cwd: dir, maxTurns: 5 }, { retries: 2, backoffMs: [0] });
+  assert.equal(res.ok, false);
+  assert.equal(res.retriesExhausted, true);
+  assert.equal(res.attempts.length, 3, 'retries=2 → 共 3 次尝试后耗尽');
+  assert.ok(res.attempts.every((a) => a.transient === true));
+});
+
+test('AC-003: 非瞬态硬错误（api_error_status=400）不被重试 —— 一次即返回、无退避（回归守卫）', async (t) => {
+  const dir = makeFakeClaudeDir(t, [
+    { cost: 0.01, extra: { is_error: true, api_error_status: 400, num_turns: 1 } },
+    { cost: 0.01, result: '不应被调用到' }, // 若误重试会消费到这一步，断言会因 attempts.length 不符而失败
+  ]);
+  const retryLog = [];
+  setSleepFn(() => { throw new Error('不应发生退避 sleep'); });
+  t.after(() => setSleepFn(null));
+
+  const res = await runClaudeWithRetry({ prompt: 'x', cwd: dir, maxTurns: 5 }, {
+    retries: 4,
+    backoffMs: [0],
+    onRetry: (info) => retryLog.push(info),
+  });
+
+  assert.equal(res.attempts.length, 1, '非瞬态硬错误一次即返回，不重试');
+  assert.equal(res.attempts[0].transient, false);
+  assert.equal(retryLog.length, 0, '不得触发 onRetry');
+});
+
+test('AC-006: runClaudeStream 失败时 stderr/error 捞到 CLI 实际 stderr；无 stderr 时退回默认文案', async (t) => {
+  const dir = makeFakeClaudeDir(t, [
+    { exitCode: 1, stderr: 'boom: real stderr content' },
+    { exitCode: 1, stderr: '' }, // 无 stderr（fake-claude 缺省会自己写一句诊断，显式传空串抑制）
+  ]);
+
+  const withStderr = await runClaudeStream({ prompt: 'x', cwd: dir, maxTurns: 5 });
+  assert.ok(withStderr.stderr.includes('boom: real stderr content'), 'res.stderr 应捞到 CLI 实际 stderr');
+  assert.ok(withStderr.error.includes('boom: real stderr content'), 'res.error 应捞到 CLI 实际 stderr');
+
+  const noStderr = await runClaudeStream({ prompt: 'x', cwd: dir, maxTurns: 5 });
+  assert.match(noStderr.error, /exited \d+ with no result event/, '无 stderr 时退回默认文案');
+});
+
+test('H11: isTransientFailure — spawn 确定性 errno（EACCES/ENOENT/EPERM/ENOTDIR）判非瞬态，其余 spawn 错误仍瞬态', () => {
+  // 确定性：二进制层面的死错误，重试必然同样失败
+  assert.equal(isTransientFailure({ spawnError: true, error: 'Error: spawn EACCES', raw: null, exitCode: -1 }), false);
+  assert.equal(isTransientFailure({ spawnError: true, error: 'Error: spawn /opt/x/claude ENOENT', raw: null, exitCode: -1 }), false);
+  assert.equal(isTransientFailure({ spawnError: true, error: 'Error: spawn EPERM', raw: null, exitCode: -1 }), false);
+  assert.equal(isTransientFailure({ spawnError: true, error: 'Error: spawn ENOTDIR', raw: null, exitCode: -1 }), false);
+  // 非确定性 spawn 错误（EAGAIN/EMFILE 资源枯竭类、无错误文案）保持瞬态（回归守卫：line 134 旧断言不变）
+  assert.equal(isTransientFailure({ spawnError: true, error: 'Error: spawn EAGAIN', raw: null, exitCode: -1 }), true);
+  assert.equal(isTransientFailure({ spawnError: true, raw: null, exitCode: -1 }), true);
+});
+
+test('H11: 真实 spawn EACCES（二进制无执行位）→ 一次即返回，不吃退避阶梯', async (t) => {
+  // 用一个无 +x 的文件当 CLAUDE_BIN：posix_spawn 报 EACCES（task-20260612-001 事故形态）
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-eacces-'));
+  const binPath = path.join(dir, 'not-executable.mjs');
+  fs.writeFileSync(binPath, '#!/usr/bin/env node\n', { mode: 0o644 });
+  const prev = process.env.CLAUDE_BIN;
+  process.env.CLAUDE_BIN = binPath;
+  t.after(() => {
+    if (prev === undefined) delete process.env.CLAUDE_BIN; else process.env.CLAUDE_BIN = prev;
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  setSleepFn(() => { throw new Error('确定性 spawn 错误不得触发退避 sleep'); });
+  t.after(() => setSleepFn(null));
+
+  const res = await runClaudeWithRetry({ prompt: 'x', cwd: dir, maxTurns: 5 }, { retries: 6, backoffMs: [15000] });
+  assert.equal(res.ok, false);
+  assert.equal(res.spawnError, true);
+  assert.match(String(res.error), /EACCES/);
+  assert.equal(res.attempts.length, 1, '确定性 spawn 错误一次即返回');
+  assert.ok(!res.retriesExhausted, '非瞬态路径不得标记 retriesExhausted');
 });

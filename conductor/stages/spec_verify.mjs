@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { runClaudeWithRetry } from '../lib/claude.mjs';
 import * as state from '../lib/state.mjs';
+import { taskCfg } from '../lib/task-cfg.mjs';
 import {
   parseStrictJson, specMissNext, specVerifierInvalidNext, validateSpecVerifierVerdict,
 } from './decisions.mjs';
@@ -14,6 +15,7 @@ import {
 
 export default async function specVerifyHandler(ts, cfg) {
   const id = ts.id;
+  const tRepo = taskCfg(ts, cfg).targetRepo;
   const round = ts.runtime.current_spec_round ?? 0;
   if (round < 1) {
     return failToBox(ts, cfg, 'SPEC_VERIFY 缺 current_spec_round', 'spec_state_invalid');
@@ -40,7 +42,7 @@ export default async function specVerifyHandler(ts, cfg) {
     stream_file: path.relative(cfg.root, streamFile),
   });
   const res = await runClaudeWithRetry({
-    cwd: cfg.targetRepo,
+    cwd: tRepo,
     prompt: buildSpecVerifierPrompt(ts, cfg, round),
     maxTurns: cfg.maxTurns,
     model: cfg.models?.specVerifier ?? null,

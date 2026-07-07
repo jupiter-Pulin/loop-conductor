@@ -2,6 +2,8 @@
 // 不是协议失败——不得写 *.invalid-a<m>.json、不得动 invalid 计数，任务留在原 stage
 // 等下次 run 重 spawn（changed:false）。协议失败（res.ok=true 但内容非法）仍走原阶梯，见
 // verifier-invalid.test.mjs / verifier-fail.test.mjs。
+// 非零退出且无 result 事件（不透明失败）现按疑似瞬态重试（见 lib/claude.mjs::isTransientFailure）；
+// 这里把 spawnRetries 收窄到 0，使其在预算内立即耗尽，仍落到同一条「基建失败」路径。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -9,9 +11,10 @@ import { makeEnv, verifierStep, specVerifierStep } from '../helpers/env.mjs';
 import { FIXED_STATS } from '../helpers/target-fixture.mjs';
 
 const FIX = { type: 'writeFile', path: 'lib/stats.mjs', content: FIXED_STATS };
+const NO_RETRY = { spawnRetries: 0, spawnBackoffMs: [0] };
 
-test('verifier 非零退出（不满足瞬态条件，不重试）→ 基建失败，留 VERIFY，不计 invalid', (t) => {
-  const env = makeEnv(t);
+test('verifier 非零退出（不透明失败，重试预算耗尽）→ 基建失败，留 VERIFY，不计 invalid', (t) => {
+  const env = makeEnv(t, { config: NO_RETRY });
   const id = 'task-20260704-501';
   env.writeTask(id);
   env.setScenario([
@@ -32,7 +35,7 @@ test('verifier 非零退出（不满足瞬态条件，不重试）→ 基建失�
   const timeline = fs.readFileSync(env.dossier(id, 'timeline.md'), 'utf8');
   assert.match(timeline, /verifier r1 基建失败/, 'timeline 记录基建失败原因');
 
-  assert.equal(env.calls().length, 2, 'maker r1 + verifier×1（非瞬态，不重试）');
+  assert.equal(env.calls().length, 2, 'maker r1 + verifier×1（retries=0，一次即耗尽）');
 });
 
 test('verifier 瞬态错误连续耗尽重试 → 基建失败，留 VERIFY；下次 run 重 spawn 后正常通过', (t) => {
@@ -74,8 +77,8 @@ test('verifier 瞬态错误连续耗尽重试 → 基建失败，留 VERIFY；�
   assert.equal(env.calls().length, 5, '追加一次合法 verifier 调用');
 });
 
-test('spec-verifier 非零退出 → 基建失败，留 SPEC_VERIFY，不计 invalid', (t) => {
-  const env = makeEnv(t);
+test('spec-verifier 非零退出（不透明失败，重试预算耗尽）→ 基建失败，留 SPEC_VERIFY，不计 invalid', (t) => {
+  const env = makeEnv(t, { config: NO_RETRY });
   const id = 'task-20260704-503';
   env.writeTask(id, { kind: 'feature', stage: 'SPEC_VERIFY', currentRound: 0 });
   // SPEC_VERIFY 要求 current_spec_round>=1 且 specs/<id>.md 已存在：直接落盘草稿并补 runtime 字段。

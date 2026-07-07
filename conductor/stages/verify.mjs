@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import * as state from '../lib/state.mjs';
 import { runClaudeWithRetry } from '../lib/claude.mjs';
+import { runCodexExec } from '../lib/codex.mjs';
 import {
   parseStrictJson, validateVerifierVerdict, verdictNext, verifierInvalidNext, makerMissNext, makerRound,
 } from './decisions.mjs';
@@ -113,7 +114,108 @@ export default async function verifyHandler(ts, cfg) {
   ts.runtime.verifier_invalid_count = 0;
   state.saveRuntime(ts);
   state.appendTimeline(cfg, id, `verifier r${round} verdict: ${check.verdict.overall} (cost=$${res.costUsd})`);
+
+  // ---- verifier shadow（opt-in 观测实验，契约：默认关闭；开启也绝不影响状态机）----
+  // 主 verdict 已落盘后才跑；shadow 的任何失败（spawn/协议/异常）只留 shadow 证据与 timeline，
+  // 不写 verifier_invalid_count、不改 stage、不产生 repair-context。幂等：compare 已存在不重跑。
+  if (cfg.verifierShadowEnabled === true) {
+    try {
+      await runVerifierShadow(ts, cfg, round, check.verdict, { prompt, expectedAcIds, mainCostUsd: res.costUsd });
+    } catch (err) {
+      state.appendTimeline(cfg, id, `verifier shadow 异常（已忽略，不影响主链）：${String(err)}`);
+    }
+  }
   return consumeValidVerdict(ts, cfg, round, check.verdict);
+}
+
+/**
+ * Codex shadow verifier：同 prompt、同 worktree、同契约校验（validateVerifierVerdict），
+ * 不同引擎（codex exec，read-only 沙箱）。产物（dossier/<id>/）：
+ *   verify-r<n>.codex-shadow.verdict.json / .md      —— 合法 shadow verdict + 人读报告
+ *   verify-r<n>.codex-shadow.invalid.json            —— 基建失败或协议失败证据（不计主 invalid）
+ *   verify-r<n>.codex-shadow.stream.jsonl            —— codex 事件流
+ *   verify-r<n>.shadow-compare.json                  —— 逐 AC 对照（切换裁决的数据源）
+ */
+async function runVerifierShadow(ts, cfg, round, mainVerdict, { prompt, expectedAcIds, mainCostUsd }) {
+  const id = ts.id;
+  const backend = cfg.verifierShadowBackend ?? 'codex-exec';
+  const comparePath = state.dossierPath(cfg, id, `verify-r${round}.shadow-compare.json`);
+  if (state.readJsonIf(comparePath)) return; // 幂等重入不重跑 shadow
+  if (backend !== 'codex-exec') {
+    state.appendTimeline(cfg, id, `verifier shadow 跳过：未知 backend「${backend}」（当前仅支持 codex-exec）`);
+    return;
+  }
+  state.appendTimeline(cfg, id, `verifier shadow r${round} spawn (codex-exec, model=${cfg.verifierShadowModel ?? 'default'})`);
+  const res = await runCodexExec({
+    prompt,
+    cwd: worktreePath(cfg, id),
+    model: cfg.verifierShadowModel ?? null,
+    sandbox: 'read-only',
+    outputLastMessage: state.dossierPath(cfg, id, `verify-r${round}.codex-shadow.last-message.txt`),
+    streamFile: state.dossierPath(cfg, id, `verify-r${round}.codex-shadow.stream.jsonl`),
+    timeoutMs: cfg.verifierShadowTimeoutMs,
+  });
+
+  let shadow = { valid: false, overall: null, by_ac: null, invalid_kind: null };
+  if (!res.ok) {
+    shadow.invalid_kind = 'infra';
+    state.writeJson(state.dossierPath(cfg, id, `verify-r${round}.codex-shadow.invalid.json`), {
+      schema_version: 1, round, kind: 'infra', error: res.error ?? 'unknown', exit_code: res.exitCode ?? null,
+    });
+    state.appendTimeline(cfg, id, `verifier shadow r${round} 基建失败（不影响主链）：${res.error ?? 'unknown'}`);
+  } else {
+    const parsed = parseStrictJson(res.result);
+    const check = validateVerifierVerdict(parsed, expectedAcIds);
+    if (!check.ok) {
+      shadow.invalid_kind = 'protocol';
+      state.writeJson(state.dossierPath(cfg, id, `verify-r${round}.codex-shadow.invalid.json`), {
+        schema_version: 1, round, kind: 'protocol', errors: check.errors, raw_result: res.result ?? null,
+      });
+      state.appendTimeline(cfg, id, `verifier shadow r${round} 协议失败（不计主 invalid）：${check.errors.join('; ')}`);
+    } else {
+      shadow = {
+        valid: true,
+        overall: check.verdict.overall,
+        by_ac: Object.fromEntries(check.verdict.criteria_results.map((c) => [c.ac_id, c.status])),
+        invalid_kind: null,
+      };
+      state.writeJson(state.dossierPath(cfg, id, `verify-r${round}.codex-shadow.verdict.json`), check.verdict);
+      state.writeFileEnsured(
+        state.dossierPath(cfg, id, `verify-r${round}.codex-shadow.md`),
+        renderVerifyReport(check.verdict, round),
+      );
+    }
+  }
+
+  // 逐 AC 对照：high_risk = 主裁 fail/unknown 而 shadow 裁 pass（false-pass 风险，切换否决项）。
+  const mainByAc = Object.fromEntries(mainVerdict.criteria_results.map((c) => [c.ac_id, c.status]));
+  const disagreements = [];
+  let agreed = 0;
+  if (shadow.valid) {
+    for (const acId of expectedAcIds) {
+      const m = mainByAc[acId] ?? null;
+      const s = shadow.by_ac[acId] ?? null;
+      if (m === s) agreed++;
+      else disagreements.push({ ac_id: acId, main: m, shadow: s, high_risk: s === 'pass' && (m === 'fail' || m === 'unknown') });
+    }
+  }
+  state.writeJson(comparePath, {
+    schema_version: 1,
+    round,
+    backend,
+    shadow_model: cfg.verifierShadowModel ?? null,
+    main: { overall: mainVerdict.overall, by_ac: mainByAc, cost_usd: mainCostUsd ?? null },
+    shadow: { ...shadow, duration_ms: res.durationMs ?? null, usage: res.usage ?? null, error: res.error ?? null },
+    agreement: shadow.valid
+      ? { total_acs: expectedAcIds.length, agreed, disagreements, high_risk_count: disagreements.filter((d) => d.high_risk).length }
+      : null,
+  });
+  state.appendTimeline(
+    cfg, id,
+    shadow.valid
+      ? `verifier shadow r${round} 对照落盘：overall main=${mainVerdict.overall}/shadow=${shadow.overall}，AC 一致 ${agreed}/${expectedAcIds.length}，high-risk ${disagreements.filter((d) => d.high_risk).length}`
+      : `verifier shadow r${round} 无有效 verdict（${shadow.invalid_kind}），compare 记录 shadow 无效`,
+  );
 }
 
 /** 消费一个「有效」verdict（幂等分支与新产出分支共用）：按 verdictNext 路由。 */
