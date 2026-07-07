@@ -1198,8 +1198,16 @@ export async function runCommitterProposal(ts, cfg) {
       state.appendTimeline(cfg, id, `committer 提案 a${attempt} 有效：${check.subject}`);
       return `${check.subject}\n\n${check.body}`;
     }
-    state.appendTimeline(cfg, id, `committer 提案 a${attempt} invalid：${check.errors.join('; ')}`);
-    prompt += `\n\n# 上一轮提案校验失败（必须全部修复后重出）\n${check.errors.map((e) => `- ${e}`).join('\n')}`;
+    // 失败归因分两类：模型在输出提案前耗尽轮次（result 为空，subtype=error_max_turns）与提案本身
+    // 不合格。前者若回喂「提案不是对象」会误导重试（模型从未输出过提案）——改喂轮次纪律指令。
+    const noProposal = !res.result?.trim() && res.raw?.subtype === 'error_max_turns';
+    if (noProposal) {
+      state.appendTimeline(cfg, id, `committer 提案 a${attempt} invalid：轮次耗尽未输出提案（error_max_turns）`);
+      prompt += '\n\n# 上一轮失败：你在输出提案前耗尽了轮次\n本轮**禁止调用任何工具**，直接基于上文已给的材料输出严格 JSON 提案。';
+    } else {
+      state.appendTimeline(cfg, id, `committer 提案 a${attempt} invalid：${check.errors.join('; ')}`);
+      prompt += `\n\n# 上一轮提案校验失败（必须全部修复后重出）\n${check.errors.map((e) => `- ${e}`).join('\n')}`;
+    }
   }
   state.appendTimeline(cfg, id, 'committer 提案两次 invalid，merge 降级机器文案');
   return null;
