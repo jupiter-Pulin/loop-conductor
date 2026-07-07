@@ -10,6 +10,7 @@
 | 本地配置样例 | `conductor.config.json` |
 | 状态布局、dossier helper | `conductor/lib/state.mjs` |
 | Claude CLI 封装、瞬态重试 | `conductor/lib/claude.mjs` |
+| Codex CLI 封装（verifier shadow 后端，opt-in） | `conductor/lib/codex.mjs`（设计：`docs/features/fable-loop-optimization/codex-shadow-design.md`） |
 | worktree、diff、commit、merge | `conductor/lib/git.mjs` |
 | setup profile 存储 | `conductor/lib/profile.mjs` |
 | spec 交付契约（spec-doc/v1，AC 枚举/校验） | `conductor/lib/spec-contract.mjs` |
@@ -21,6 +22,7 @@
 | commit / 分支规范（committer 提案的规范源） | `.claude/skills/git-conventions/SKILL.md` |
 | 行为 case | `tests/integration/*.test.mjs` |
 | 单元级不变量 | `tests/unit/*.test.mjs` |
+| 跨任务失败分布/成本/轮次聚合 CLI | `tools/dossier-stats.mjs`（`node tools/dossier-stats.mjs [--json]`） |
 | 最近一次实现证据 | `docs/features/committer-merge-message/request-log.md` |
 
 ## 当前角色
@@ -112,6 +114,11 @@ npm run conductor -- retry <id>
 | verifier fail repair context | `tests/integration/verifier-fail.test.mjs` |
 | verifier invalid 重试 | `tests/integration/verifier-invalid.test.mjs` |
 | maker retry ladder | `tests/integration/retry-ladder.test.mjs` |
+| maker max-turns 同会话续跑 | `tests/integration/maker-max-turns-continuation.test.mjs` |
+| spawn 确定性失败快速收箱（EACCES 类） | `tests/integration/spawn-deterministic-failure.test.mjs` |
+| approve 时 spec 契约终审（人工修订入口守门） | `tests/integration/approve-spec-contract-guard.test.mjs` |
+| verifier shadow（默认关 / 不动 stage / 不污染主计数） | `tests/integration/verifier-shadow.test.mjs` |
+| test gate per-AC 探针有界并发（opt-in） | `tests/integration/test-gate-probe-concurrency.test.mjs` |
 | crash re-entry | `tests/integration/crash-reentry.test.mjs` |
 | box/stage 崩溃巡检 | `tests/integration/crash-patrol.test.mjs` |
 | budget gate | `tests/integration/budget.test.mjs` |
