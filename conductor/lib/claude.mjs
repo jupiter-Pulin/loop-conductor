@@ -203,8 +203,10 @@ export const runClaude = runClaudeStream;
 
 // ---- 瞬态故障重试（API 不稳定：403/408/429/5xx 或 spawn 本身失败时退避重试，能续会话就续）。
 
-const DEFAULT_RETRIES = 4;
-const DEFAULT_BACKOFF_MS = [15000, 30000, 60000, 120000];
+// 尾部 300s/600s：dossier 证据（task-20260706-001）显示 4 连 429 在 3.75min 阶梯内穿不过
+// 限流窗口，收箱后人工 retry 一次即过——长尾退避把这类失败变成自愈。
+const DEFAULT_RETRIES = 6;
+const DEFAULT_BACKOFF_MS = [15000, 30000, 60000, 120000, 300000, 600000];
 const TRANSIENT_STATUSES = new Set([403, 408, 429, 500, 502, 503, 529]);
 const RESUME_PROMPT = '上一条请求被瞬态错误打断，请从中断处继续完成原任务';
 
