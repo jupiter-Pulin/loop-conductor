@@ -85,7 +85,6 @@ export function runClaudeStream(opts) {
     const stdoutChunks = [];
     const stderrChunks = [];
     let stdoutBuffered = '';
-    let stderrBuffered = '';
     let parsedAny = false;
     let resultEvent = null;
     let lastEvent = null;
@@ -150,7 +149,6 @@ export function runClaudeStream(opts) {
     child.stderr.on('data', (chunk) => {
       resetInactivity();
       if (Buffer.concat(stderrChunks).length < MAX_BUFFER) stderrChunks.push(Buffer.from(chunk));
-      stderrBuffered += chunk.toString('utf8');
     });
 
     child.on('error', (err) => {
@@ -171,7 +169,7 @@ export function runClaudeStream(opts) {
       if (forceTimer) clearTimeout(forceTimer);
       if (stdoutBuffered.trim()) consumeLine(stdoutBuffered);
       const stdout = Buffer.concat(stdoutChunks).toString('utf8');
-      const stderr = `${Buffer.concat(stderrChunks).toString('utf8')}${stderrBuffered ? '' : ''}`;
+      const stderr = Buffer.concat(stderrChunks).toString('utf8');
       const raw = resultEvent ?? lastEvent;
       const sessionId = raw?.session_id ?? lastEvent?.session_id ?? null;
       const costUnknown = Boolean(killed) || resultEvent == null;
@@ -222,10 +220,16 @@ export function setSleepFn(fn) {
   sleepFn = fn ?? defaultSleep;
 }
 
-/** 瞬态判定：API 错误状态码命中名单，或 spawnSync 自身报错。 */
+/**
+ * 瞬态判定：API 错误状态码命中名单、spawn 自身报错、被杀，或「不透明退出失败」
+ * ——CLI 非零退出且无可解析 result 事件（raw==null，从而也读不到 api_error_status）。
+ * 拿不到状态码时无法区分真是瞬态还是硬错误，按疑似瞬态给一次重试机会；
+ * 带可读 api_error_status 的硬错误（如 400/404）不受影响，仍判非瞬态。
+ */
 export function isTransientFailure(res) {
   if (res?.spawnError) return true;
   if (res?.killed) return true;
+  if (res?.raw == null && res?.exitCode !== 0) return true;
   return res?.raw?.is_error === true && TRANSIENT_STATUSES.has(res.raw?.api_error_status);
 }
 
