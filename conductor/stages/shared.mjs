@@ -1215,11 +1215,22 @@ export async function runCommitterProposal(ts, cfg) {
 
 // ---- maker spawn（双标记 + 预算累计） ----
 
+/** max-turns 截断判定：会话本身健在（有 session_id），只是轮次预算耗尽——可同会话续跑。 */
+function isMaxTurnsCutoff(res) {
+  return res?.raw?.subtype === 'error_max_turns' && typeof (res.raw?.session_id ?? res.sessionId) === 'string';
+}
+
+const MAX_TURNS_CONTINUATION_PROMPT =
+  '上一条会话因轮次上限被截断，任务尚未完成。从中断处继续：优先把改动收敛到可编译、测试可跑的最小闭合状态，再继续未完成的 AC。';
+
 /**
  * spawn 一轮 maker，带双标记（started/done）与预算累计。
- * mode==='resume' 失败时自动降级为冷启动（coldPrompt），阶梯顺延。
+ * mode==='resume' 失败时自动降级为冷启动（coldPrompt），阶梯顺延；
+ * 唯一例外是 max-turns 截断（error_max_turns）：会话健在、工作未完，降级冷启动只会丢上下文重来
+ * （dossier 证据：task-20260705-003 r2/r3 连续截断+cold-degraded），改为同会话续跑
+ * （makerMaxTurnsContinuations 上限，默认 1；耗尽后回到旧行为——照常进 green gate 实测）。
  * 不在此 ensureWorktree / 不在此跑 green gate（handler 负责）；wt 由 handler 传入。
- * 返回 claude 调用结果（降级后为冷启动结果）。
+ * 返回 claude 调用结果（降级/续跑后为最后一腿的结果）。
  */
 export async function runMakerRound(ts, cfg, round, { mode, prompt, coldPrompt, wt }) {
   const id = ts.id;
@@ -1249,21 +1260,51 @@ export async function runMakerRound(ts, cfg, round, { mode, prompt, coldPrompt, 
     onRetry: ({ attempt, status }) =>
       state.appendTimeline(cfg, id, `maker r${round} transient retry attempt ${attempt} (status=${status ?? 'spawn-error'})`),
   };
+
+  // max-turns 续跑：每腿先把上一腿成本入账（budgetExceeded/canStartSpawn 才判得准），
+  // 腿流单独落盘（maker-r<n>.cont-<leg>.stream.jsonl，沿用「stream 不跨 attempt 混流」纪律）。
+  const maxContinuations = Number.isInteger(cfg.makerMaxTurnsContinuations) && cfg.makerMaxTurnsContinuations >= 0
+    ? cfg.makerMaxTurnsContinuations : 1;
+  const continueOnMaxTurns = async (res) => {
+    let legs = 0;
+    while (isMaxTurnsCutoff(res) && legs < maxContinuations) {
+      const sessionId = res.raw?.session_id ?? res.sessionId;
+      addCost(ts, res.costUsd, cfg);
+      state.saveRuntime(ts);
+      res = { ...res, costUsd: 0 }; // 本腿成本已入账；防止收尾 addCost 重复计费
+      if (budgetExceeded(ts, cfg) || !canStartSpawn(ts, cfg, 'maker')) break;
+      legs++;
+      state.appendTimeline(cfg, id, `maker r${round} max-turns 截断 → 同会话续跑 ${legs}/${maxContinuations}`);
+      res = await runClaudeWithRetry({
+        ...common,
+        resume: sessionId,
+        prompt: MAX_TURNS_CONTINUATION_PROMPT,
+        streamFile: state.dossierPath(cfg, id, `maker-r${round}.cont-${legs}.stream.jsonl`),
+      }, retryOpts);
+      rec.record.max_turns_continuations = legs;
+      state.writeJson(rec.path, rec.record);
+    }
+    return res;
+  };
+
   let res;
   if (mode === 'resume') {
     res = await runClaudeWithRetry({ ...common, resume: ts.runtime.maker_session_id, prompt }, retryOpts);
-    if (!res.ok) {
+    res = await continueOnMaxTurns(res);
+    if (!res.ok && !isMaxTurnsCutoff(res)) {
       // resume 无论是立即判非瞬态失败，还是瞬态重试耗尽，都必须落到冷启动兜底一次——
       // resume 失败绝不能让本轮直接以 retriesExhausted 收场（那会被上层判 spawn_transient_exhausted 收箱，
-      // 跳过冷启动逃生口）。
+      // 跳过冷启动逃生口）。max-turns 截断不算 resume 失败：续跑额度耗尽后照常进 green gate。
       rec.record.resume_failed = true;
       rec.record.mode = 'cold-degraded';
       state.writeJson(rec.path, rec.record);
       state.appendTimeline(cfg, id, `maker r${round} resume 失败（${res.error ?? 'unknown'}）→ 降级冷启动`);
       res = await runClaudeWithRetry({ ...common, prompt: coldPrompt ?? prompt }, retryOpts);
+      res = await continueOnMaxTurns(res);
     }
   } else {
     res = await runClaudeWithRetry({ ...common, prompt }, retryOpts);
+    res = await continueOnMaxTurns(res);
   }
   if (res.retriesExhausted) {
     state.appendTimeline(cfg, id, `maker r${round} transient retries exhausted`);
