@@ -1244,7 +1244,10 @@ export async function runMakerRound(ts, cfg, round, { mode, prompt, coldPrompt, 
   let res;
   if (mode === 'resume') {
     res = await runClaudeWithRetry({ ...common, resume: ts.runtime.maker_session_id, prompt }, retryOpts);
-    if (!res.ok && !res.retriesExhausted) {
+    if (!res.ok) {
+      // resume 无论是立即判非瞬态失败，还是瞬态重试耗尽，都必须落到冷启动兜底一次——
+      // resume 失败绝不能让本轮直接以 retriesExhausted 收场（那会被上层判 spawn_transient_exhausted 收箱，
+      // 跳过冷启动逃生口）。
       rec.record.resume_failed = true;
       rec.record.mode = 'cold-degraded';
       state.writeJson(rec.path, rec.record);
