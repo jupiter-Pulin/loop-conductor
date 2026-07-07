@@ -71,6 +71,7 @@ export function loadCfg(root = resolveRoot()) {
     verifierDiffMaxBytes: 200000, // verifier prompt 内嵌 diff 的字节上限，超限降级为 name-status 清单
     spawnRetries: 4, // Claude 瞬态重试次数（保留现状）
     spawnBackoffMs: [15000, 30000, 60000, 120000], // 瞬态重试退避（保留现状）
+    makerMaxTurnsContinuations: 1, // maker 撞 max-turns 时同会话续跑次数上限（0 = 关闭，恢复截断即进 gate 的旧行为）
     maxConcurrentTasks: 3,
     inactivityTimeoutMs: 600000,
     spawnWallClockMs: 14400000,
