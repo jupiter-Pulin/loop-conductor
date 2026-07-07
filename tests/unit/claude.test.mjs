@@ -202,7 +202,7 @@ test('AC-003: 非瞬态硬错误（api_error_status=400）不被重试 —— �
 test('AC-006: runClaudeStream 失败时 stderr/error 捞到 CLI 实际 stderr；无 stderr 时退回默认文案', async (t) => {
   const dir = makeFakeClaudeDir(t, [
     { exitCode: 1, stderr: 'boom: real stderr content' },
-    { exitCode: 1 }, // 无 stderr
+    { exitCode: 1, stderr: '' }, // 无 stderr（fake-claude 缺省会自己写一句诊断，显式传空串抑制）
   ]);
 
   const withStderr = await runClaudeStream({ prompt: 'x', cwd: dir, maxTurns: 5 });
