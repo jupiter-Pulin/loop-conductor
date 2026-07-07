@@ -14,6 +14,7 @@ import { hasApprovedSetupProfile } from './lib/profile.mjs';
 import { taskCfg } from './lib/task-cfg.mjs';
 import { runCommitterProposal } from './stages/shared.mjs';
 import { validateFeasibilityDoc } from './lib/feasibility-contract.mjs';
+import { validateSpecDoc } from './lib/spec-contract.mjs';
 import needsTargetSetupHandler from './stages/needs_target_setup.mjs';
 import awaitSetupApprovalHandler from './stages/await_setup_approval.mjs';
 import needsFeasibilityHandler from './stages/needs_feasibility.mjs';
@@ -342,6 +343,20 @@ async function cmdApprove(cfg, id) {
   if (ts.error) { console.error(`${id} 任务目录损坏：${ts.error}`); process.exitCode = 1; return; }
   if (ts.runtime.stage !== 'AWAIT_SPEC_APPROVAL') {
     console.error(`警告：${id} 当前 stage=${ts.runtime.stage}（非 AWAIT_SPEC_APPROVAL），仍写入 approval=approved`);
+  }
+  // 人审期间 spec 草稿可能被人工改写（合法动作），但 approve 后冻结不再过契约门：
+  // 标题/AC 枚举不合格会静默兜底成 1 条笼统 AC，整条 per-AC 验证链退化。
+  // 所以在人审落章处终审一次：不合格拒绝写入，任务保持原状（真实案例：20260706-002
+  // 人工重写后用了英文标题「## Acceptance Criteria」，枚举为 0）。
+  const draftPath = path.join(cfg.specsDir, `${id}.md`);
+  if (fs.existsSync(draftPath)) {
+    const check = validateSpecDoc(fs.readFileSync(draftPath, 'utf8'));
+    if (!check.ok) {
+      console.error(`拒绝 approve：specs/${id}.md 不满足 spec-doc/v1，冻结会退化为兜底单条 AC。`);
+      for (const e of check.errors) console.error(`  - ${e}`);
+      process.exitCode = 1;
+      return;
+    }
   }
   ts.runtime.approval = 'approved';
   state.saveRuntime(ts);
