@@ -73,6 +73,10 @@ export function loadCfg(root = resolveRoot()) {
     verifierDiffMaxBytes: 200000, // verifier prompt 内嵌 diff 的字节上限，超限降级为 name-status 清单
     spawnRetries: 6, // Claude 瞬态重试次数（H7：长尾覆盖限流窗口）
     spawnBackoffMs: [15000, 30000, 60000, 120000, 300000, 600000], // 瞬态重试退避（H7：尾部 5min/10min 穿越 429 窗口）
+    verifierShadowEnabled: false, // verifier shadow 观测实验（R4-E11）：默认关；开启也绝不影响状态机
+    verifierShadowBackend: 'codex-exec', // 当前唯一支持的 shadow 后端（codex CLI 非交互形态）
+    verifierShadowModel: null, // 传给 codex exec -m；null 用 codex 本地默认
+    verifierShadowTimeoutMs: 1800000, // shadow 墙钟上限（与 green gate 同量级），超时只记 shadow 失败
     makerMaxTurnsContinuations: 1, // maker 撞 max-turns 时同会话续跑次数上限（0 = 关闭，恢复截断即进 gate 的旧行为）
     maxConcurrentTasks: 3,
     inactivityTimeoutMs: 600000,
