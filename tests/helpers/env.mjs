@@ -98,12 +98,18 @@ export function makeEnv(t, { config = {}, trackedHarness = false } = {}) {
 
     /** 跑一次 conductor 子命令，返回 { status, stdout, stderr }。 */
     run(...args) {
+      return api.runWithEnv({}, ...args);
+    },
+
+    /** 同 run，但可覆盖子进程环境变量（如 CLAUDE_BIN 指向坏二进制，模拟 spawn 层故障）。 */
+    runWithEnv(overrides, ...args) {
       const env = {
         ...process.env,
         CONDUCTOR_ROOT: root,
         CLAUDE_BIN: FAKE_CLAUDE,
         FAKE_CLAUDE_SCRIPT: scenarioPath,
         FAKE_CLAUDE_LOG: logPath,
+        ...overrides,
       };
       // 不能让外层 node:test 的 child 标记泄漏进 conductor：否则 green gate 的
       // `node --test` 会自认是 test-runner 子进程而恒 exit 0（红灯被吞）。
