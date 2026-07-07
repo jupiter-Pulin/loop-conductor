@@ -301,25 +301,37 @@ export async function runTestGateProbe(ts, cfg, round) {
     for (const rel of remove) fs.rmSync(path.join(probeDir, rel), { force: true });
 
     if (mode === 'per-ac') {
-      // 逐 AC 定向探测（AC-008）：按冻结 spec 的 AC 枚举顺序执行映射条目；未映射记 unmapped。
-      // 单条超时/spawn error 只判该条 error，其余条目照常执行（AC-011）。
+      // 逐 AC 定向探测（AC-008）：结果按冻结 spec 的 AC 枚举顺序排列（按 index 写槽位，与完成
+      // 先后无关）；未映射记 unmapped。单条超时/spawn error 只判该条 error（runGreenGate 从不
+      // reject），其余条目照常执行（AC-011）。
+      // 并发是 opt-in（testGateProbeConcurrency，默认 1 = 与旧串行实现逐条一致）：所有映射命令
+      // 共享同一个探针 worktree，只有当命令之间无共享端口/临时文件/全局状态时才允许 >1，
+      // 由使用者对具体 target repo 负责；拿不准就保持串行，不制造 flaky。
       const byId = new Map(mapping.entries.map((e) => [e.ac_id, e]));
-      const perAc = [];
-      for (const acId of expectedAcIds) {
-        const entry = byId.get(acId);
-        if (!entry) {
-          perAc.push({ ac_id: acId, verdict: 'unmapped' });
-          continue;
+      const perAc = new Array(expectedAcIds.length);
+      const concurrencyRaw = Number(cfg.testGateProbeConcurrency);
+      const concurrency = Number.isFinite(concurrencyRaw) && concurrencyRaw > 1 ? Math.floor(concurrencyRaw) : 1;
+      let nextIdx = 0;
+      const probeWorker = async () => {
+        while (nextIdx < expectedAcIds.length) {
+          const i = nextIdx++;
+          const acId = expectedAcIds[i];
+          const entry = byId.get(acId);
+          if (!entry) {
+            perAc[i] = { ac_id: acId, verdict: 'unmapped' };
+            continue;
+          }
+          const r = await runGreenGate(entry.command, probeDir, { timeoutMs: cfg.greenGateTimeoutMs });
+          perAc[i] = {
+            ac_id: acId,
+            expect: entry.expect,
+            exit_code: r.exitCode,
+            timed_out: r.timedOut,
+            verdict: perAcProbeVerdict(entry.expect, r.exitCode, r.timedOut),
+          };
         }
-        const r = await runGreenGate(entry.command, probeDir, { timeoutMs: cfg.greenGateTimeoutMs });
-        perAc.push({
-          ac_id: acId,
-          expect: entry.expect,
-          exit_code: r.exitCode,
-          timed_out: r.timedOut,
-          verdict: perAcProbeVerdict(entry.expect, r.exitCode, r.timedOut),
-        });
-      }
+      };
+      await Promise.all(Array.from({ length: Math.min(concurrency, expectedAcIds.length) }, probeWorker));
       // per-AC 模式跳过 v1 全量基线复跑（省一次全量 suite 时间）：exit_code 留 null。
       return finish({ baseCommit, copied: copy, deleted: remove, perAc, verdict: perAcGateVerdict(perAc) });
     }

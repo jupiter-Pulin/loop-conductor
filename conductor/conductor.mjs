@@ -68,6 +68,7 @@ export function loadCfg(root = resolveRoot()) {
     greenGateOutputTailBytes: 12000, // green gate stdout/stderr tail 字节上限（契约 §6）
     testGateEnabled: true, // green pass 后的基线空转测试探针（docs/features/test-gate/tech-spec.md）
     testGateTestGlobs: DEFAULT_TEST_GLOBS, // 测试文件识别 glob（探针 overlay 用）
+    testGateProbeConcurrency: 1, // per-AC 探针并发上限；>1 是 opt-in（命令共享探针 worktree，须自证无共享端口/文件/全局状态）
     verifierDiffMaxBytes: 200000, // verifier prompt 内嵌 diff 的字节上限，超限降级为 name-status 清单
     spawnRetries: 4, // Claude 瞬态重试次数（保留现状）
     spawnBackoffMs: [15000, 30000, 60000, 120000], // 瞬态重试退避（保留现状）
