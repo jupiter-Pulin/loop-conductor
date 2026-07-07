@@ -9,6 +9,7 @@ import path from 'node:path';
 import { runClaude } from '../lib/claude.mjs';
 import * as state from '../lib/state.mjs';
 import { validateSpecDoc } from '../lib/spec-contract.mjs';
+import { taskCfg } from '../lib/task-cfg.mjs';
 import { needsSpecAction, specContractInvalidNext } from './decisions.mjs';
 import {
   addCost, archiveSpecDraft, budgetExceeded, buildSpecAgentPrompt, failToBox,
@@ -18,6 +19,7 @@ import {
 
 export default async function needsSpecHandler(ts, cfg) {
   const id = ts.id;
+  const tRepo = taskCfg(ts, cfg).targetRepo;
   const specPath = specDraftPath(cfg, id);
   let action = needsSpecAction(fs.existsSync(specPath), ts.runtime.approval ?? null);
 
@@ -50,7 +52,7 @@ export default async function needsSpecHandler(ts, cfg) {
       stream_file: path.relative(cfg.root, streamFile),
     });
     const res = await runClaude({
-      cwd: cfg.targetRepo,
+      cwd: tRepo,
       prompt: buildSpecAgentPrompt(ts, cfg, round, { mode: 'draft' }),
       maxTurns: cfg.maxTurns,
       model: cfg.models?.spec ?? null,

@@ -4,6 +4,8 @@
 //   actions: [{type:'writeFile', path, content}]  在 cwd（即任务 worktree）落盘文件
 //            [{type:'deleteFile', path}]          在 cwd 删除文件（对抗性删测试场景）
 //   exitCode: 非零则报错退出（模拟 CLI 失败 / resume 失效）
+//   exitCodeAfterResult: 先照常发 result 事件再以该码退出（模拟 error_max_turns：CLI 留下
+//                        subtype=error_max_turns 的 result 事件后 exit 1）
 //   session_id / cost / result: 拼成 --output-format stream-json 的 result 事件
 // 全部调用的 argv+cwd 追加记录到 FAKE_CLAUDE_LOG，测试据此断言（如 resume 是否带 -r）。
 // 任何测试都不许调用真 claude 二进制 —— 本文件就是替身。
@@ -98,3 +100,5 @@ if (outputFormat === 'stream-json') {
 } else {
   console.log(JSON.stringify(resultEvent));
 }
+
+if (step.exitCodeAfterResult) process.exit(step.exitCodeAfterResult);

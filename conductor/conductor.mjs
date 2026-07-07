@@ -11,8 +11,10 @@ import { withTaskLock, TaskLockBusyError } from './lib/task-lock.mjs';
 import { currentBranch, mergeBranch, removeWorktree, deleteBranch } from './lib/git.mjs';
 import { DEFAULT_TEST_GLOBS } from './lib/test-gate.mjs';
 import { hasApprovedSetupProfile } from './lib/profile.mjs';
+import { taskCfg } from './lib/task-cfg.mjs';
 import { runCommitterProposal } from './stages/shared.mjs';
 import { validateFeasibilityDoc } from './lib/feasibility-contract.mjs';
+import { validateSpecDoc } from './lib/spec-contract.mjs';
 import needsTargetSetupHandler from './stages/needs_target_setup.mjs';
 import awaitSetupApprovalHandler from './stages/await_setup_approval.mjs';
 import needsFeasibilityHandler from './stages/needs_feasibility.mjs';
@@ -67,9 +69,15 @@ export function loadCfg(root = resolveRoot()) {
     greenGateOutputTailBytes: 12000, // green gate stdout/stderr tail 字节上限（契约 §6）
     testGateEnabled: true, // green pass 后的基线空转测试探针（docs/features/test-gate/tech-spec.md）
     testGateTestGlobs: DEFAULT_TEST_GLOBS, // 测试文件识别 glob（探针 overlay 用）
+    testGateProbeConcurrency: 1, // per-AC 探针并发上限；>1 是 opt-in（命令共享探针 worktree，须自证无共享端口/文件/全局状态）
     verifierDiffMaxBytes: 200000, // verifier prompt 内嵌 diff 的字节上限，超限降级为 name-status 清单
-    spawnRetries: 4, // Claude 瞬态重试次数（保留现状）
-    spawnBackoffMs: [15000, 30000, 60000, 120000], // 瞬态重试退避（保留现状）
+    spawnRetries: 6, // Claude 瞬态重试次数（H7：长尾覆盖限流窗口）
+    spawnBackoffMs: [15000, 30000, 60000, 120000, 300000, 600000], // 瞬态重试退避（H7：尾部 5min/10min 穿越 429 窗口）
+    verifierShadowEnabled: false, // verifier shadow 观测实验（R4-E11）：默认关；开启也绝不影响状态机
+    verifierShadowBackend: 'codex-exec', // 当前唯一支持的 shadow 后端（codex CLI 非交互形态）
+    verifierShadowModel: null, // 传给 codex exec -m；null 用 codex 本地默认
+    verifierShadowTimeoutMs: 1800000, // shadow 墙钟上限（与 green gate 同量级），超时只记 shadow 失败
+    makerMaxTurnsContinuations: 1, // maker 撞 max-turns 时同会话续跑次数上限（0 = 关闭，恢复截断即进 gate 的旧行为）
     maxConcurrentTasks: 3,
     inactivityTimeoutMs: 600000,
     spawnWallClockMs: 14400000,
@@ -95,6 +103,7 @@ export function loadCfg(root = resolveRoot()) {
     queueDir: path.join(root, 'state', 'queue'),
     doneDir: path.join(root, 'state', 'done'),
     failedDir: path.join(root, 'state', 'failed'),
+    parkedDir: path.join(root, 'state', 'parked'),
     specsDir: path.join(root, 'specs'),
     dossierDir: path.join(root, 'dossier'),
     worktreesDir: path.join(root, 'worktrees'),
@@ -195,7 +204,7 @@ function nextId(cfg) {
     String(today.getDate()).padStart(2, '0'),
   ].join('');
   let max = 0;
-  for (const dir of [cfg.queueDir, cfg.failedDir, cfg.doneDir]) {
+  for (const dir of [cfg.queueDir, cfg.failedDir, cfg.doneDir, cfg.parkedDir]) {
     for (const name of state.listTaskDirNames(dir)) {
       const m = name.match(/^task-(\d{8})-(\d{3})$/);
       if (m && m[1] === ymd) max = Math.max(max, Number(m[2]));
@@ -228,18 +237,28 @@ function cmdNew(cfg, opts) {
     }
     brief = fs.readFileSync(briefPath, 'utf8');
   }
+  // --repo <path>：覆盖快照的 targetRepo（含该仓库的 setup-profile 判定与 baseBranch 解析）。
+  let targetRepo = cfg.targetRepo;
+  if (opts.repo != null) {
+    if (opts.repo === true) {
+      console.error('--repo 需要一个仓库路径');
+      process.exitCode = 1;
+      return;
+    }
+    targetRepo = path.resolve(cfg.root, opts.repo);
+  }
   const id = nextId(cfg);
   // feasibility gate：--feasibility 强制开 / --feasibility false 强制关，缺省随 config.feasibilityEnabled；仅 feature 有意义。
   const feasibility = kind === 'feature' && (
     opts.feasibility != null ? opts.feasibility !== 'false' : cfg.feasibilityEnabled === true
   );
   const naturalStage = kind === 'feature' ? (feasibility ? 'NEEDS_FEASIBILITY' : 'NEEDS_SPEC') : 'READY';
-  const stage = hasApprovedSetupProfile(cfg) ? naturalStage : 'NEEDS_TARGET_SETUP';
+  const stage = hasApprovedSetupProfile({ ...cfg, targetRepo }) ? naturalStage : 'NEEDS_TARGET_SETUP';
 
-  // task.json 不可变快照（契约 §1）：baseBranch = config.baseBranch ?? currentBranch ?? 'main'。
+  // task.json 不可变快照（契约 §1）：baseBranch = config.baseBranch ?? currentBranch(targetRepo) ?? 'main'。
   let baseBranch = cfg.baseBranch;
   if (baseBranch == null) {
-    try { baseBranch = currentBranch(cfg.targetRepo); } catch { baseBranch = 'main'; }
+    try { baseBranch = currentBranch(targetRepo); } catch { baseBranch = 'main'; }
     if (!baseBranch) baseBranch = 'main';
   }
   const task = {
@@ -248,8 +267,8 @@ function cmdNew(cfg, opts) {
     kind,
     title,
     ...(kind === 'feature' ? { feasibility } : {}),
-    repo: path.basename(cfg.targetRepo),
-    targetRepo: cfg.targetRepo,
+    repo: path.basename(targetRepo),
+    targetRepo,
     baseBranch,
     testCommand: cfg.testCommand,
     created_at: new Date().toISOString(),
@@ -328,6 +347,20 @@ async function cmdApprove(cfg, id) {
   if (ts.error) { console.error(`${id} 任务目录损坏：${ts.error}`); process.exitCode = 1; return; }
   if (ts.runtime.stage !== 'AWAIT_SPEC_APPROVAL') {
     console.error(`警告：${id} 当前 stage=${ts.runtime.stage}（非 AWAIT_SPEC_APPROVAL），仍写入 approval=approved`);
+  }
+  // 人审期间 spec 草稿可能被人工改写（合法动作），但 approve 后冻结不再过契约门：
+  // 标题/AC 枚举不合格会静默兜底成 1 条笼统 AC，整条 per-AC 验证链退化。
+  // 所以在人审落章处终审一次：不合格拒绝写入，任务保持原状（真实案例：20260706-002
+  // 人工重写后用了英文标题「## Acceptance Criteria」，枚举为 0）。
+  const draftPath = path.join(cfg.specsDir, `${id}.md`);
+  if (fs.existsSync(draftPath)) {
+    const check = validateSpecDoc(fs.readFileSync(draftPath, 'utf8'));
+    if (!check.ok) {
+      console.error(`拒绝 approve：specs/${id}.md 不满足 spec-doc/v1，冻结会退化为兜底单条 AC。`);
+      for (const e of check.errors) console.error(`  - ${e}`);
+      process.exitCode = 1;
+      return;
+    }
   }
   ts.runtime.approval = 'approved';
   state.saveRuntime(ts);
@@ -540,7 +573,8 @@ async function cmdMerge(cfg, id) {
     process.exitCode = 1;
     return;
   }
-  const cur = currentBranch(cfg.targetRepo);
+  const tcfg = taskCfg(ts, cfg);
+  const cur = currentBranch(tcfg.targetRepo);
   if (cur !== ts.task.baseBranch) {
     console.error(`merge 拒绝：target 仓库当前分支 ${cur} ≠ 任务 baseBranch ${ts.task.baseBranch}（任务保持原状）`);
     process.exitCode = 1;
@@ -553,15 +587,15 @@ async function cmdMerge(cfg, id) {
   // --no-ff，任务分支上的 maker r<n> commit 原样保留在历史里。
   const proposal = await runCommitterProposal(ts, cfg);
   try {
-    mergeBranch(cfg.targetRepo, branch, proposal ?? `merge ${branch} (conductor)`);
+    mergeBranch(tcfg.targetRepo, branch, proposal ?? `merge ${branch} (conductor)`);
   } catch (err) {
     console.error(`merge 失败（任务保持原状）：${err.message}`);
     process.exitCode = 1;
     return;
   }
-  state.appendTimeline(cfg, id, `merged ${branch} → ${currentBranch(cfg.targetRepo)}`);
-  removeWorktree(cfg.targetRepo, wt);
-  deleteBranch(cfg.targetRepo, branch);
+  state.appendTimeline(cfg, id, `merged ${branch} → ${currentBranch(tcfg.targetRepo)}`);
+  removeWorktree(tcfg.targetRepo, wt);
+  deleteBranch(tcfg.targetRepo, branch);
   // 归档：先产物（merge 已完成）后状态。
   ts.runtime.stage = 'DONE';
   state.saveRuntime(ts);
@@ -609,12 +643,30 @@ function narrowRetryKind(cfg, ts) {
   if (type === 'spec_verifier_protocol_exhausted' && fs.existsSync(path.join(cfg.specsDir, `${ts.id}.md`))) {
     return 'spec_verifier';
   }
+  if (type === 'env_failure_repeated' && fs.existsSync(path.join(cfg.worktreesDir, ts.id))) {
+    return 'env_failure_repeated';
+  }
   return null;
 }
 
 /** 只归档对应协议失败的 invalid 产物，任务回 queue 且 stage 回到失败前的验收环节，不重跑 maker/spec-agent。 */
 function applyNarrowRetry(cfg, ts, kind) {
   const id = ts.id;
+  if (kind === 'env_failure_repeated') {
+    // 环境类短路收箱：不归档 maker 轮次产物（maker-r<n>.json 双标记原样保留），复位 READY + miss=0；
+    // 配合 READY 既有的「maker 标记 done → 跳过 spawn 只复跑绿门」幂等分支，实现
+    // 「人工修好环境 → retry → 直接重验，不重跑 maker」。
+    Object.assign(ts.runtime, { stage: 'READY', maker_miss_count: 0, last_failure_type: null });
+    state.saveRuntime(ts);
+    const dest = state.taskDir(cfg.queueDir, id);
+    fs.mkdirSync(cfg.queueDir, { recursive: true });
+    fs.renameSync(ts.dir, dest);
+    ts.dir = dest;
+    ts.box = 'queue';
+    state.appendTimeline(cfg, id, 'retry → READY（不重跑 maker，直接复跑绿门），maker 轮次产物保留');
+    console.log(`${id} 已重回 queue（stage=READY, miss=0），环境类失败已恢复，maker 产出保留，下次 run 只复跑绿门`);
+    return;
+  }
   const isVerifier = kind === 'verifier';
   const n = archiveArtifactsMatching(
     cfg, id,
@@ -706,9 +758,10 @@ function parseArgs(argv) {
 
 const USAGE = `用法：conductor <command>
   run                                  drain 一轮：推进所有任务直到无状态变化
-  new --kind bugfix|feature --title "…" [--brief <file>] [--feasibility]
+  new --kind bugfix|feature --title "…" [--brief <file>] [--feasibility] [--repo <path>]
                                        新建任务（--brief 落盘需求原文；--feasibility 让 feature 先走
-                                       feasibility gate，缺省随 config.feasibilityEnabled）
+                                       feasibility gate，缺省随 config.feasibilityEnabled；--repo 覆盖
+                                       快照的 targetRepo，缺省用 conductor.config.json 的 targetRepo）
   approve-feasibility <id> --option O-X [--notes "…"]
                                        按 option ID 点名批准 feasibility memo（无静默通过）
   reject-feasibility <id> [--notes "…"] 打回 feasibility memo，notes 追加进 feasibility_reject_notes.md

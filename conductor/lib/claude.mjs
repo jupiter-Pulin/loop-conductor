@@ -85,7 +85,6 @@ export function runClaudeStream(opts) {
     const stdoutChunks = [];
     const stderrChunks = [];
     let stdoutBuffered = '';
-    let stderrBuffered = '';
     let parsedAny = false;
     let resultEvent = null;
     let lastEvent = null;
@@ -150,7 +149,6 @@ export function runClaudeStream(opts) {
     child.stderr.on('data', (chunk) => {
       resetInactivity();
       if (Buffer.concat(stderrChunks).length < MAX_BUFFER) stderrChunks.push(Buffer.from(chunk));
-      stderrBuffered += chunk.toString('utf8');
     });
 
     child.on('error', (err) => {
@@ -171,7 +169,7 @@ export function runClaudeStream(opts) {
       if (forceTimer) clearTimeout(forceTimer);
       if (stdoutBuffered.trim()) consumeLine(stdoutBuffered);
       const stdout = Buffer.concat(stdoutChunks).toString('utf8');
-      const stderr = `${Buffer.concat(stderrChunks).toString('utf8')}${stderrBuffered ? '' : ''}`;
+      const stderr = Buffer.concat(stderrChunks).toString('utf8');
       const raw = resultEvent ?? lastEvent;
       const sessionId = raw?.session_id ?? lastEvent?.session_id ?? null;
       const costUnknown = Boolean(killed) || resultEvent == null;
@@ -205,9 +203,14 @@ export const runClaude = runClaudeStream;
 
 // ---- 瞬态故障重试（API 不稳定：403/408/429/5xx 或 spawn 本身失败时退避重试，能续会话就续）。
 
-const DEFAULT_RETRIES = 4;
-const DEFAULT_BACKOFF_MS = [15000, 30000, 60000, 120000];
+// 尾部 300s/600s：dossier 证据（task-20260706-001）显示 4 连 429 在 3.75min 阶梯内穿不过
+// 限流窗口，收箱后人工 retry 一次即过——长尾退避把这类失败变成自愈。
+const DEFAULT_RETRIES = 6;
+const DEFAULT_BACKOFF_MS = [15000, 30000, 60000, 120000, 300000, 600000];
 const TRANSIENT_STATUSES = new Set([403, 408, 429, 500, 502, 503, 529]);
+// spawn 层确定性 errno：二进制不可执行/不存在/权限问题，重试必然同样失败——
+// 退避阶梯加长后误判为瞬态的代价升至 ~18.75min（task-20260612-001 EACCES 即此类）。
+const DETERMINISTIC_SPAWN_ERRNO = /\b(EACCES|ENOENT|EPERM|ENOTDIR)\b/;
 const RESUME_PROMPT = '上一条请求被瞬态错误打断，请从中断处继续完成原任务';
 
 /** 异步 sleep；测试经 setSleepFn 注入空函数。 */
@@ -222,10 +225,18 @@ export function setSleepFn(fn) {
   sleepFn = fn ?? defaultSleep;
 }
 
-/** 瞬态判定：API 错误状态码命中名单，或 spawnSync 自身报错。 */
+/**
+ * 瞬态判定：API 错误状态码命中名单、spawn 自身报错、被杀，或「不透明退出失败」
+ * ——CLI 非零退出且无可解析 result 事件（raw==null，从而也读不到 api_error_status）。
+ * 拿不到状态码时无法区分真是瞬态还是硬错误，按疑似瞬态给一次重试机会；
+ * 带可读 api_error_status 的硬错误（如 400/404）不受影响，仍判非瞬态。
+ * 例外：spawn 报确定性 errno（EACCES/ENOENT/EPERM/ENOTDIR，二进制层面的死错误）
+ * 判非瞬态——重试必然同样失败，只会白等整条退避阶梯。
+ */
 export function isTransientFailure(res) {
-  if (res?.spawnError) return true;
+  if (res?.spawnError) return !DETERMINISTIC_SPAWN_ERRNO.test(String(res.error ?? ''));
   if (res?.killed) return true;
+  if (res?.raw == null && res?.exitCode !== 0) return true;
   return res?.raw?.is_error === true && TRANSIENT_STATUSES.has(res.raw?.api_error_status);
 }
 

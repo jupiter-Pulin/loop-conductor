@@ -98,12 +98,18 @@ export function makeEnv(t, { config = {}, trackedHarness = false } = {}) {
 
     /** 跑一次 conductor 子命令，返回 { status, stdout, stderr }。 */
     run(...args) {
+      return api.runWithEnv({}, ...args);
+    },
+
+    /** 同 run，但可覆盖子进程环境变量（如 CLAUDE_BIN 指向坏二进制，模拟 spawn 层故障）。 */
+    runWithEnv(overrides, ...args) {
       const env = {
         ...process.env,
         CONDUCTOR_ROOT: root,
         CLAUDE_BIN: FAKE_CLAUDE,
         FAKE_CLAUDE_SCRIPT: scenarioPath,
         FAKE_CLAUDE_LOG: logPath,
+        ...overrides,
       };
       // 不能让外层 node:test 的 child 标记泄漏进 conductor：否则 green gate 的
       // `node --test` 会自认是 test-runner 子进程而恒 exit 0（红灯被吞）。
@@ -129,6 +135,7 @@ export function makeEnv(t, { config = {}, trackedHarness = false } = {}) {
       testCommand = 'node --test',
       currentRound = 0,
       lastFailureType = null,
+      targetRepo = path.join(root, 'target'), // 任务级 targetRepo 快照；缺省与 cfg.targetRepo 一致
       bodyAc,        // 自定义 spec.md 草稿正文（含 ## 验收标准）；不给用默认
       specDraft,     // 直接给 spec.md 全文（优先于 bodyAc）
     } = {}) {
@@ -139,8 +146,8 @@ export function makeEnv(t, { config = {}, trackedHarness = false } = {}) {
         id,
         kind,
         title: 'median 偶数分支返回错误',
-        repo: 'target',
-        targetRepo: path.join(root, 'target'),
+        repo: path.basename(targetRepo),
+        targetRepo,
         baseBranch,
         testCommand,
         created_at: '2026-06-11T00:00:00.000Z',
@@ -166,15 +173,15 @@ export function makeEnv(t, { config = {}, trackedHarness = false } = {}) {
       return dir;
     },
 
-    writeApprovedSetupProfile(markdown = '# Setup Profile\n\n- test: node --test\n') {
-      const key = setupProfileKey(path.join(root, 'target'));
+    writeApprovedSetupProfile(markdown = '# Setup Profile\n\n- test: node --test\n', { targetRepo = path.join(root, 'target') } = {}) {
+      const key = setupProfileKey(targetRepo);
       const dir = path.join(root, 'target-profiles', key);
       fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(path.join(dir, 'setup-profile.md'), markdown);
       fs.writeFileSync(path.join(dir, 'setup-profile.json'), `${JSON.stringify({
         schema_version: 1,
         profile_key: key,
-        targetRepo: path.join(root, 'target'),
+        targetRepo,
         approved: true,
         approved_at: '2026-06-11T00:00:00.000Z',
         source_task_id: 'test',
