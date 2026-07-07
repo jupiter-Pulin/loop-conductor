@@ -70,8 +70,8 @@ export function loadCfg(root = resolveRoot()) {
     testGateTestGlobs: DEFAULT_TEST_GLOBS, // 测试文件识别 glob（探针 overlay 用）
     testGateProbeConcurrency: 1, // per-AC 探针并发上限；>1 是 opt-in（命令共享探针 worktree，须自证无共享端口/文件/全局状态）
     verifierDiffMaxBytes: 200000, // verifier prompt 内嵌 diff 的字节上限，超限降级为 name-status 清单
-    spawnRetries: 4, // Claude 瞬态重试次数（保留现状）
-    spawnBackoffMs: [15000, 30000, 60000, 120000], // 瞬态重试退避（保留现状）
+    spawnRetries: 6, // Claude 瞬态重试次数（H7：长尾覆盖限流窗口）
+    spawnBackoffMs: [15000, 30000, 60000, 120000, 300000, 600000], // 瞬态重试退避（H7：尾部 5min/10min 穿越 429 窗口）
     makerMaxTurnsContinuations: 1, // maker 撞 max-turns 时同会话续跑次数上限（0 = 关闭，恢复截断即进 gate 的旧行为）
     maxConcurrentTasks: 3,
     inactivityTimeoutMs: 600000,
