@@ -212,3 +212,36 @@ test('AC-006: runClaudeStream 失败时 stderr/error 捞到 CLI 实际 stderr；
   const noStderr = await runClaudeStream({ prompt: 'x', cwd: dir, maxTurns: 5 });
   assert.match(noStderr.error, /exited \d+ with no result event/, '无 stderr 时退回默认文案');
 });
+
+test('H11: isTransientFailure — spawn 确定性 errno（EACCES/ENOENT/EPERM/ENOTDIR）判非瞬态，其余 spawn 错误仍瞬态', () => {
+  // 确定性：二进制层面的死错误，重试必然同样失败
+  assert.equal(isTransientFailure({ spawnError: true, error: 'Error: spawn EACCES', raw: null, exitCode: -1 }), false);
+  assert.equal(isTransientFailure({ spawnError: true, error: 'Error: spawn /opt/x/claude ENOENT', raw: null, exitCode: -1 }), false);
+  assert.equal(isTransientFailure({ spawnError: true, error: 'Error: spawn EPERM', raw: null, exitCode: -1 }), false);
+  assert.equal(isTransientFailure({ spawnError: true, error: 'Error: spawn ENOTDIR', raw: null, exitCode: -1 }), false);
+  // 非确定性 spawn 错误（EAGAIN/EMFILE 资源枯竭类、无错误文案）保持瞬态（回归守卫：line 134 旧断言不变）
+  assert.equal(isTransientFailure({ spawnError: true, error: 'Error: spawn EAGAIN', raw: null, exitCode: -1 }), true);
+  assert.equal(isTransientFailure({ spawnError: true, raw: null, exitCode: -1 }), true);
+});
+
+test('H11: 真实 spawn EACCES（二进制无执行位）→ 一次即返回，不吃退避阶梯', async (t) => {
+  // 用一个无 +x 的文件当 CLAUDE_BIN：posix_spawn 报 EACCES（task-20260612-001 事故形态）
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-eacces-'));
+  const binPath = path.join(dir, 'not-executable.mjs');
+  fs.writeFileSync(binPath, '#!/usr/bin/env node\n', { mode: 0o644 });
+  const prev = process.env.CLAUDE_BIN;
+  process.env.CLAUDE_BIN = binPath;
+  t.after(() => {
+    if (prev === undefined) delete process.env.CLAUDE_BIN; else process.env.CLAUDE_BIN = prev;
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  setSleepFn(() => { throw new Error('确定性 spawn 错误不得触发退避 sleep'); });
+  t.after(() => setSleepFn(null));
+
+  const res = await runClaudeWithRetry({ prompt: 'x', cwd: dir, maxTurns: 5 }, { retries: 6, backoffMs: [15000] });
+  assert.equal(res.ok, false);
+  assert.equal(res.spawnError, true);
+  assert.match(String(res.error), /EACCES/);
+  assert.equal(res.attempts.length, 1, '确定性 spawn 错误一次即返回');
+  assert.ok(!res.retriesExhausted, '非瞬态路径不得标记 retriesExhausted');
+});

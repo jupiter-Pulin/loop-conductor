@@ -55,6 +55,11 @@ export default async function fixingHandler(ts, cfg) {
       // maker spawn 瞬态重试耗尽（基础设施失败）：直接收箱，不跑 green gate、不进 miss 阶梯（契约 §15）。
       return failToBox(ts, cfg, `maker spawn 瞬态重试耗尽 (r${round})`, 'spawn_transient_exhausted');
     }
+    if (res?.spawnError) {
+      // spawn 确定性失败（EACCES/ENOENT 等，判非瞬态不重试）：进程未启动，worktree 未动，
+      // 收箱清晰归因，不让基线红白吃 miss（与 ready.mjs 同一分支语义）。
+      return failToBox(ts, cfg, `maker spawn 确定性失败 (r${round})：${res.error ?? 'unknown'}`, 'spawn_failed');
+    }
     // maker 非瞬态硬失败（ok=false，如 max-turns 打断）不在此分支：worktree 状态未知，
     // 必须继续跑 green gate 实测（绿门是唯一事实源），红了照常计一次 maker miss。
     // 基础设施失败可能因此被计入 miss 阶梯——接受此取舍；timeline 已记 ok=false 供人工归因。

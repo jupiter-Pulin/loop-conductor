@@ -57,6 +57,12 @@ export default async function readyHandler(ts, cfg) {
       // 保留旧行为，直接收箱，不跑 green gate、不进 miss 阶梯（契约 §15）。
       return failToBox(ts, cfg, `maker spawn 瞬态重试耗尽 (r${round})`, 'spawn_transient_exhausted');
     }
+    if (res?.spawnError) {
+      // spawn 确定性失败（EACCES/ENOENT 等，isTransientFailure 判非瞬态不重试）：
+      // maker 进程从未启动，worktree 没被碰过，跑 green gate 只会把基线红误记成 miss。
+      // 直接收箱清晰归因（task-20260612-001 EACCES 曾被记成 spawn_transient_exhausted）。
+      return failToBox(ts, cfg, `maker spawn 确定性失败 (r${round})：${res.error ?? 'unknown'}`, 'spawn_failed');
+    }
     // maker 非瞬态硬失败（ok=false，如 max-turns 打断）不在此分支：worktree 状态未知，
     // 必须继续跑 green gate 实测（绿门是唯一事实源），红了照常计一次 maker miss。
     // 基础设施失败可能因此被计入 miss 阶梯——接受此取舍；timeline 已记 ok=false 供人工归因。
