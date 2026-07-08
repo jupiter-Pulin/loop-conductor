@@ -78,6 +78,7 @@ export function loadCfg(root = resolveRoot()) {
     verifierShadowModel: null, // 传给 codex exec -m；null 用 codex 本地默认
     verifierShadowTimeoutMs: 1800000, // shadow 墙钟上限（与 green gate 同量级），超时只记 shadow 失败
     makerMaxTurnsContinuations: 1, // maker 撞 max-turns 时同会话续跑次数上限（0 = 关闭，恢复截断即进 gate 的旧行为）
+    commitLanguage: 'en', // committer 提案语言门（团队政策：commit 一律英文）；非 en=旧行为逃生口
     maxConcurrentTasks: 3,
     inactivityTimeoutMs: 600000,
     spawnWallClockMs: 14400000,

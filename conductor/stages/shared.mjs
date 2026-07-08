@@ -1205,7 +1205,7 @@ export async function runCommitterProposal(ts, cfg) {
     finishSpawnRecord(rec, res);
     addCost(ts, res.costUsd);
     state.saveRuntime(ts);
-    const check = validateCommitMessage(parseStrictJson(res.result));
+    const check = validateCommitMessage(parseStrictJson(res.result), cfg.commitLanguage);
     if (check.ok) {
       state.appendTimeline(cfg, id, `committer 提案 a${attempt} 有效：${check.subject}`);
       return `${check.subject}\n\n${check.body}`;
