@@ -422,9 +422,9 @@ test('AC-015: --no-auto-run 启动时，同步动作成功后不触发后台 run
   assert.equal(after.runtime.stage, 'AWAIT_SETUP_APPROVAL', '未触发 run，stage 不应推进');
 });
 
-// ---- AC-016：merge 走 detached 后台，立即返回，后台失败不改变任务状态 ----
+// ---- AC-016：merge 与其余 6 个动作一致，同步等待 conductor merge 并回传真实结果 ----
 
-test('AC-016: POST .../merge 立即返回「已触发」；无有效分支时后台 merge 失败但任务保持原状', async (t) => {
+test('AC-016: POST .../merge 同步等待 conductor merge 并回传真实结果；无有效分支时失败但任务保持原状', async (t) => {
   const env = makeEnv(t);
   const id = 'task-20260705-160';
   // spent_usd >= 默认 budgetUsd=5：committer 提案 fail-open 直接跳过，merge 失败路径不依赖 fake-claude。
@@ -432,18 +432,47 @@ test('AC-016: POST .../merge 立即返回「已触发」；无有效分支时后
 
   const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
 
-  const startedAt = Date.now();
   const res = await postJson(srv.baseUrl, `/api/task/${id}/merge`, {});
-  const elapsedMs = Date.now() - startedAt;
   assert.equal(res.status, 200);
-  assert.equal(res.body.ok, true);
-  assert.match(res.body.message, /已触发/);
-  assert.ok(elapsedMs < 300, 'merge 端点不应同步等待 merge 完成');
+  assert.equal(res.body.ok, false, '无 task/<id> 分支，merge 应真实失败而非恒 ok:true');
+  assert.notEqual(res.body.exitCode, 0);
+  assert.match(res.body.message, /merge 失败/);
 
-  await new Promise((r) => setTimeout(r, 800)); // 给后台 merge 尝试并失败留出时间
   const after = env.findTask(id);
   assert.equal(after.box, 'queue');
-  assert.equal(after.runtime.stage, 'AWAIT_HUMAN_MERGE', '无 task/<id> 分支，后台 merge 应失败，任务保持原状');
+  assert.equal(after.runtime.stage, 'AWAIT_HUMAN_MERGE', '无 task/<id> 分支，merge 应失败，任务保持原状');
+});
+
+// ---- AC-003：merge 成功路径不应额外 spawn run（与其余 6 个同步动作不同）----
+
+test('AC-003: merge 成功后不 spawn conductor run；队列里其它任务不被连带触发', async (t) => {
+  const env = makeEnv(t, { config: { spawnRetries: 0 } });
+
+  const mergeId = 'task-20260705-161';
+  env.writeTask(mergeId, { stage: 'AWAIT_HUMAN_MERGE', spent: 6 });
+  execFileSync('git', ['-C', env.targetDir, 'checkout', '-b', `task/${mergeId}`], { stdio: 'pipe' });
+  fs.writeFileSync(path.join(env.targetDir, 'DASHBOARD_AC003.md'), 'fixture change for AC-003\n');
+  execFileSync('git', ['-C', env.targetDir, 'add', '-A'], { stdio: 'pipe' });
+  execFileSync('git', ['-C', env.targetDir, 'commit', '-m', 'fixture: AC-003 merge diff'], { stdio: 'pipe' });
+  execFileSync('git', ['-C', env.targetDir, 'checkout', 'main'], { stdio: 'pipe' });
+
+  // probe 任务留在 READY：若后台 run 被 spawn，它会被拿去跑 maker（调用 fake-claude）。
+  const probeId = 'task-20260705-162';
+  env.writeTask(probeId, { stage: 'READY' });
+  env.setScenario([
+    { delayMs: 50, actions: [], session_id: 'sess-probe-ac003', cost: 0.01, result: '(probe，不应被触发)' },
+  ]);
+
+  const srv = await startDashboard(t, env, ['--port', '0']); // 默认 autoRun=true
+
+  const res = await postJson(srv.baseUrl, `/api/task/${mergeId}/merge`, {});
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true, 'merge 应成功');
+
+  await waitFor(() => env.findTask(mergeId)?.box === 'done', 4000);
+  await new Promise((r) => setTimeout(r, 1000));
+  assert.equal(env.calls().length, 0, 'merge 成功不应触发后台 run，probe 任务的 fake-claude 不应被调用');
+  assert.equal(env.findTask(probeId).runtime.stage, 'READY', 'merge 成功不应连带推进队列里其它任务');
 });
 
 // ---- AC-017：new-task 透传 CLI + brief 临时文件生命周期 + id 解析 + feasibility 显式布尔 ----

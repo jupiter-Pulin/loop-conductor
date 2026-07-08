@@ -88,9 +88,10 @@ async function handleSyncAction(cfg, id, action, req, res, autoRun) {
   sendJson(res, 200, { ok, exitCode: result.exitCode, message: formatCliMessage(result) });
 }
 
-function handleMerge(id, res) {
-  spawnDetachedConductor(['merge', id]);
-  sendJson(res, 200, { ok: true, message: `已触发 merge ${id}，请稍后查看 board/timeline 确认结果` });
+async function handleMerge(id, res) {
+  const result = await runConductor(['merge', id]);
+  const ok = result.exitCode === 0;
+  sendJson(res, 200, { ok, exitCode: result.exitCode, message: formatCliMessage(result) });
 }
 
 async function handleNewTask(req, res, autoRun) {
@@ -151,7 +152,7 @@ export function createDashboardServer(cfg, { autoRun = true } = {}) {
         const id = parts[2];
         const action = parts[3];
         if (!isValidTaskId(id)) { sendJson(res, 400, { error: 'invalid task id' }); return; }
-        if (action === 'merge') { handleMerge(id, res); return; }
+        if (action === 'merge') { await handleMerge(id, res); return; }
         if (!SYNC_ACTIONS.includes(action)) { sendJson(res, 400, { error: `unknown action: ${action}` }); return; }
         await handleSyncAction(cfg, id, action, req, res, autoRun);
         return;
