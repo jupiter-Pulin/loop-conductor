@@ -11,6 +11,8 @@ import { execFileSync } from 'node:child_process';
 import { makeEnv, promptOf, verifierStep } from '../helpers/env.mjs';
 import { FIXED_STATS } from '../helpers/target-fixture.mjs';
 
+// 中文提案：commitLanguage 缺省 en 会被语言门拦，用它的测试都显式配 commitLanguage:'zh'
+// 逃生口关闭语言门——这几个测试盯的是提案生效/重试链路，不是语言门本身（语言门见 AC-4 测试）。
 const PROPOSAL = {
   subject: 'fix(stats): median 偶数长度取中间两数平均',
   body: '预埋 bug：偶数长度错取上中位。\n\n验证：node --test 全绿。\n索引：README case 表 bugfix happy path。',
@@ -22,7 +24,7 @@ function mainLog(env, format) {
 }
 
 test('提案有效：merge commit 用 committer 文案，轮次 commit 颗粒度不丢', (t) => {
-  const env = makeEnv(t, { config: { models: { committer: 'haiku-test' } } });
+  const env = makeEnv(t, { config: { models: { committer: 'haiku-test' }, commitLanguage: 'zh' } });
   const id = 'task-20260704-901';
   env.writeTask(id);
   // 仓库根的 git-conventions skill 是 committer prompt 的规范源
@@ -103,8 +105,40 @@ test('提案两次 invalid → fail-open 降级机器文案，merge 不被 block
   assert.ok(timeline.includes('降级机器文案'), 'timeline 留降级痕迹');
 });
 
+test('提案两次形状合法但非英文 → 语言门拒收，复用降级阶梯 fail-open（AC-4）', (t) => {
+  const env = makeEnv(t); // 不配 commitLanguage：缺省 en，语言门开启
+  const id = 'task-20260704-905';
+  env.writeTask(id);
+  const zhProposal = {
+    subject: 'fix: median 偶数长度取中间两数平均',
+    body: '为什么：合入前偶数长度取值错误。\n\n验证：node --test 全绿。\n索引：README case 表 bugfix happy path。',
+  };
+  env.setScenario([
+    { actions: [{ type: 'writeFile', path: 'lib/stats.mjs', content: FIXED_STATS }], session_id: 'sess-m1', cost: 0.1, result: 'r1 修好' },
+    verifierStep(1),
+    { cost: 0.01, result: JSON.stringify(zhProposal) }, // a1：形状合法但非英文
+    { cost: 0.01, result: JSON.stringify(zhProposal) }, // a2：仍非英文
+  ]);
+
+  const run = env.run('run');
+  assert.equal(run.status, 0, run.stderr);
+  const merge = env.run('merge', id);
+  assert.equal(merge.status, 0, merge.stderr);
+
+  // 语言门两次拒收 → 复用既有降级阶梯，merge 不被 block，机器兜底文案本身是英文
+  const subject = execFileSync('git', ['-C', env.targetDir, 'log', '-1', '--format=%s'], { encoding: 'utf8' }).trim();
+  assert.equal(subject, `merge task/${id} (conductor)`);
+  assert.equal(env.findTask(id).box, 'done');
+
+  const calls = env.calls();
+  assert.equal(calls.length, 4, 'maker + verifier + committer×2');
+  assert.ok(promptOf(calls[3]).includes('commit 必须为英文'), '重试 prompt 附语言门错误反馈');
+  const timeline = env.readFile(env.dossier(id, 'timeline.md'));
+  assert.ok(timeline.includes('降级机器文案'), 'timeline 留降级痕迹');
+});
+
 test('提案 a1 轮次耗尽未输出：重试反馈禁工具指令而非「提案不是对象」，a2 提案生效', (t) => {
-  const env = makeEnv(t);
+  const env = makeEnv(t, { config: { commitLanguage: 'zh' } });
   const id = 'task-20260704-904';
   env.writeTask(id);
   env.setScenario([

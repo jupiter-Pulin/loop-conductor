@@ -90,13 +90,19 @@ export const COMMIT_MESSAGE_CONTRACT = Object.freeze({
   bodyLineMaxLen: 100,
 });
 
+/** 非 ASCII 字符探测（CJK 等）：commit 语言门用，不识别具体语言，只认字节范围。 */
+const NON_ASCII_RE = /[^\x00-\x7F]/;
+
 /**
  * committer 提案的唯一裁判（绝不抛错）：subject 匹配
  * ^(type)(\(scope\))?: 描述{1,72}$，单行、无首尾空白、不含 WIP；
  * body 非空字符串且每行 ≤bodyLineMaxLen。合格返回 { ok:true, subject, body }。
  * 不合格由调用方重试一次，再不过降级机器文案（fail-open，格式问题绝不 block merge）。
+ *
+ * commitLanguage 语言门（缺省 "en"，团队政策：commit 一律英文）：subject/body 命中非 ASCII
+ * 字符即拒收。显式传非 "en"（如 "zh"）关闭此门，逐字节回退旧行为——既有 shape/行长校验不受影响。
  */
-export function validateCommitMessage(parsed) {
+export function validateCommitMessage(parsed, commitLanguage = 'en') {
   const { types, subjectMaxLen, bodyLineMaxLen } = COMMIT_MESSAGE_CONTRACT;
   const errors = [];
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -114,6 +120,9 @@ export function validateCommitMessage(parsed) {
       errors.push(`subject 必须匹配 \`type(scope)?: 描述\`（type ∈ {${types.join('|')}}，描述 ≤${subjectMaxLen} 字符）`);
     }
     if (/\bwip\b/i.test(subject)) errors.push('subject 不得含 WIP');
+    if (commitLanguage === 'en' && NON_ASCII_RE.test(subject)) {
+      errors.push('commit 必须为英文（subject 检出非 ASCII 字符）');
+    }
   }
   if (typeof body !== 'string' || body.trim() === '') {
     errors.push('body 必须是非空字符串（为什么 / 契约边界 / 验证 / 索引指针）');
@@ -121,6 +130,9 @@ export function validateCommitMessage(parsed) {
     body.split('\n').forEach((line, i) => {
       if (line.length > bodyLineMaxLen) errors.push(`body 第 ${i + 1} 行超 ${bodyLineMaxLen} 字符`);
     });
+    if (commitLanguage === 'en' && NON_ASCII_RE.test(body)) {
+      errors.push('commit 必须为英文（body 检出非 ASCII 字符）');
+    }
   }
   if (errors.length > 0) return { ok: false, errors };
   return { ok: true, errors: [], subject, body };
