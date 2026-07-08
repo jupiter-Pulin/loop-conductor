@@ -1,6 +1,7 @@
 // READY（契约 §11）：round=1。ensureWorktree(+excludes) → checkTrackedHarness →
 // spawn maker（cold）→ conductor 亲跑 green gate → writeGreenGateResult。
-// pass → test gate 探针（vacuous → 同 miss 阶梯 FIXING/FAILED_BOX）→ VERIFY；
+// pass → 可选 gateCommands（同一 worktree 按序跑 typecheck/build/boot 类命令，缺省/空跳过，
+//        task-20260708-005）→ test gate 探针（vacuous → 同 miss 阶梯 FIXING/FAILED_BOX）→ VERIFY；
 // fail → 先判失败签名连续性：同签名连败 2 轮且环境类 → 短路收箱（env_failure_repeated，不
 //        spawn 下一轮 maker）；否则 writeRepairContext(green_gate)（同签名非环境类附
 //        same_signature_streak 提示）+ makerMissNext → FIXING / FAILED_BOX。
@@ -15,7 +16,7 @@ import {
   worktreePath, runGreenGate, writeGreenGateResult, runTestGateProbe,
   buildRepairContext, writeRepairContext, readGreenGateSignatures,
   runMakerRound, buildMakerColdPrompt, ensureDossierSpec, budgetExceeded, failToBox,
-  HARNESS_ARTIFACTS, canStartSpawn,
+  HARNESS_ARTIFACTS, canStartSpawn, resolveGateCommandsForTask, runGateCommands,
 } from './shared.mjs';
 
 export default async function readyHandler(ts, cfg) {
@@ -88,7 +89,34 @@ export default async function readyHandler(ts, cfg) {
   state.appendTimeline(cfg, id, `green gate r${round}: ${gate.timedOut ? 'timed out' : `exit ${gate.exitCode}`}`);
 
   if (greenGatePassed(gate.exitCode)) {
-    // 第二道闸：test gate（基线空转测试探针）。仅 vacuous block，走同一 miss 阶梯；
+    // 可选第二道闸：gateCommands（AC-2）。缺省/空数组时完全跳过本分支（AC-5：逐字节等价旧版）。
+    const gateCommands = resolveGateCommandsForTask(ts, cfg);
+    if (gateCommands.length > 0) {
+      const gateRun = await runGateCommands(cfg, id, round, wt, gateCommands);
+      if (gateRun.failed) {
+        const ctx = buildRepairContext({
+          source: 'green_gate', round,
+          refFile: gateRun.refFile,
+          instruction: 'Fix the failing gate command (e.g. typecheck/build/boot) so it exits 0. Keep unrelated code intact.',
+        });
+        writeRepairContext(cfg, id, round, ctx);
+        const gcNext = makerMissNext(ts.runtime.maker_miss_count ?? 0, cfg.maxMakerMisses);
+        if (gcNext.stage === 'FAILED_BOX') {
+          return failToBox(
+            ts, cfg,
+            `gate command failed (${gateRun.record.command}) at r${round}，miss ${gcNext.missCount} 阶梯耗尽`,
+            'maker_misses_exhausted',
+            { maker_miss_count: gcNext.missCount },
+          );
+        }
+        state.transitionState(ts, cfg, 'FIXING', `gate command fail r${round} (${gateRun.record.command}), miss=${gcNext.missCount}`, {
+          maker_miss_count: gcNext.missCount,
+          current_round: round,
+        });
+        return { changed: true };
+      }
+    }
+    // 第三道闸：test gate（基线空转测试探针）。仅 vacuous block，走同一 miss 阶梯；
     // falsifies / error / disabled(null) 照常进 VERIFY（单侧闸门，见 shared.mjs::runTestGateProbe）。
     const probe = await runTestGateProbe(ts, cfg, round);
     if (probe?.verdict === 'vacuous') {

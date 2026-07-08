@@ -58,12 +58,15 @@ READY
 实现/验收:
 READY -> VERIFY -> AWAIT_HUMAN_MERGE -> DONE
 READY/FIXING green-gate fail -> FIXING
+READY/FIXING 可选 gateCommands（task.json 显式值 > target-profile 默认，缺省/空跳过）任一非 0 -> FIXING
 READY/FIXING test-gate vacuous（测试在基线上仍全绿）-> FIXING
 VERIFY verdict fail -> FIXING
 verifier invalid -> VERIFY
 budget/retry/crash exhausted -> FAILED_BOX
 FAILED_BOX --retry--> READY or NEEDS_SPEC
 ```
+
+`gateCommands` 含 `yarn run` 之类需要真实依赖的命令时，需 target-profile 保证任务 worktree 能跑该命令（本仓库不提供依赖 provisioning：worktree 是否可 `yarn run` 取决于 target repo 自身，不在 conductor 职责范围）。
 
 ## 常用命令
 
@@ -91,9 +94,9 @@ npm run conductor -- retry <id>
 | `state/queue/<id>/spec.md` | bugfix 冻结前的 spec 草稿。 |
 | `state/queue/<id>/brief.md` | `new --brief` 落盘的需求原文（喂 feasibility/spec 链）。 |
 | `state/queue/<id>/feasibility-study.md` | 人审前的 feasibility 决策 memo 草稿（归档进同目录 feasibility-archive/）。 |
-| `target-profiles/<repo>/` | setup profile 草稿/批准稿。 |
+| `target-profiles/<repo>/` | setup profile 草稿/批准稿；`setup-profile.json` 亦可携带可选 `gateCommands` 默认值（见下）。 |
 | `specs/<id>.md` | feature 人审前的 spec 草稿。 |
-| `dossier/<id>/` | 唯一 agent 交接媒介：冻结 spec、冻结 feasibility memo + 人审 decision（feasibility-study.md / feasibility-decision.json）、spawn 记录、verdict、repair context、契约门结果（spec-check-r\<n\>.json / feasibility-check-r\<n\>.json 为 conductor 终审、.hook.json 为沙箱内预检证据）、test gate 探针结果（test-gate-r\<n\>.json）、逐轮 hook settings、timeline。 |
+| `dossier/<id>/` | 唯一 agent 交接媒介：冻结 spec、冻结 feasibility memo + 人审 decision（feasibility-study.md / feasibility-decision.json）、spawn 记录、verdict、repair context、契约门结果（spec-check-r\<n\>.json / feasibility-check-r\<n\>.json 为 conductor 终审、.hook.json 为沙箱内预检证据）、test gate 探针结果（test-gate-r\<n\>.json）、可选 gateCommands 探测结果（gate-\<name\>-r\<n\>.json，同构于 green-gate-r\<n\>.json）、逐轮 hook settings、timeline。 |
 | `worktrees/<id>/` | target repo 的任务 worktree。 |
 | `target/` | demo target repo。不要在仓库根裸跑 `node --test`；用 `npm test`。 |
 
@@ -108,6 +111,7 @@ npm run conductor -- retry <id>
 | spec 直写交付 + 契约门（hook 护栏） | `tests/integration/spec-contract-gate.test.mjs` |
 | maker git 护栏（--settings 注入形态） | `tests/integration/maker-git-guard.test.mjs` |
 | green gate 修复路径 | `tests/integration/green-gate.test.mjs` |
+| 可选 gateCommands（来源优先级 / 按序执行短路 / 复用回喂通道 / 默认空不变量） | `tests/integration/gate-commands.test.mjs` |
 | test gate 空转测试拦截 | `tests/integration/test-gate.test.mjs` |
 | test gate per-AC 定向探针（AC→测试映射） | `tests/integration/test-gate-per-ac.test.mjs` |
 | merge commit 文案提案 + 降级 | `tests/integration/commit-message.test.mjs` |
