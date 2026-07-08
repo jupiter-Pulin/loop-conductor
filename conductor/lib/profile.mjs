@@ -42,7 +42,11 @@ export function hasApprovedSetupProfile(cfg) {
   return readApprovedSetupProfile(cfg) !== null;
 }
 
-export function writeApprovedSetupProfile(cfg, { markdown, sourceTaskId = null }) {
+/**
+ * gateCommands：可选，repo 级 green-gate 附加命令默认值（task.json 未提供该字段时的兜底，
+ * 见 stages/decisions.mjs::resolveGateCommands）。缺省不写该字段，保持旧 meta 形态不变。
+ */
+export function writeApprovedSetupProfile(cfg, { markdown, sourceTaskId = null, gateCommands } = {}) {
   const paths = setupProfilePaths(cfg);
   fs.mkdirSync(paths.dir, { recursive: true });
   writeFileAtomic(paths.approved, markdown);
@@ -53,6 +57,7 @@ export function writeApprovedSetupProfile(cfg, { markdown, sourceTaskId = null }
     approved: true,
     approved_at: new Date().toISOString(),
     source_task_id: sourceTaskId,
+    ...(gateCommands !== undefined ? { gateCommands } : {}),
   };
   writeJsonAtomic(paths.meta, meta);
   return { paths, meta };
