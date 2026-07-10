@@ -12,7 +12,7 @@ import { currentBranch, mergeBranch, removeWorktree, deleteBranch } from './lib/
 import { DEFAULT_TEST_GLOBS } from './lib/test-gate.mjs';
 import { hasApprovedSetupProfile } from './lib/profile.mjs';
 import { taskCfg } from './lib/task-cfg.mjs';
-import { runCommitterProposal } from './stages/shared.mjs';
+import { runCommitterProposal, computeTestChangeGuard, performMerge } from './stages/shared.mjs';
 import { validateFeasibilityDoc } from './lib/feasibility-contract.mjs';
 import { validateSpecDoc } from './lib/spec-contract.mjs';
 import needsTargetSetupHandler from './stages/needs_target_setup.mjs';
@@ -39,8 +39,9 @@ const STAGE_HANDLERS = {
   READY: readyHandler,
   VERIFY: verifyHandler,
   FIXING: fixingHandler,
-  // 终态：只响应人工 merge / retry 命令
+  // 终态：只响应人工 merge / close / retry 命令
   AWAIT_HUMAN_MERGE: async () => ({ changed: false }),
+  AWAIT_PROBE_CLOSE: async () => ({ changed: false }),
   FAILED_BOX: async () => ({ changed: false }),
 };
 
@@ -71,6 +72,18 @@ export function loadCfg(root = resolveRoot()) {
     testGateTestGlobs: DEFAULT_TEST_GLOBS, // 测试文件识别 glob（探针 overlay 用）
     testGateProbeConcurrency: 1, // per-AC 探针并发上限；>1 是 opt-in（命令共享探针 worktree，须自证无共享端口/文件/全局状态）
     verifierDiffMaxBytes: 200000, // verifier prompt 内嵌 diff 的字节上限，超限降级为 name-status 清单
+    verifierEvidenceAnchorsMode: 'off', // verifier evidence 机械锚定核验（R5-H15）：off=旧行为；observe=只落对照产物；enforce=文件不存在/行号越界判协议 invalid（引用 diff 外文件任何模式都只观测）
+    testChangeGuardEnabled: false, // H16 测试改动守卫：机械 diff 出被改/删/改名的既有测试文件，注入 verifier prompt + merge 摘要高亮（观测型，绝不 block）
+    eventsLogEnabled: false, // H17 结构化事件流：dossier/<id>/events.jsonl（NDJSON）供机器消费，timeline 回归纯人读；best-effort 绝不打断主链
+    specChainIsolationEnabled: false, // H19 spec/feasibility 链物理隔离：探索 cwd 换 baseBranch 一次性 detached worktree（交付走编排侧绝对路径不受影响；只见已提交状态）
+    unknownSpawnCostEstimateEnabled: false, // H20 killed/无 result spawn 按角色 dossier 历史均价估计入账（标 estimated，独立累计 runtime.estimated_cost_usd；无样本退回 lower-bound）
+    specMaxAcs: null, // H18 spec 规模闸（软档）：AC 数超此阈值时要求 spec-verifier 附拆分建议 finding，不改路由；null=关
+    reviewStage: 'off', // H21 独立 Reviewer：off=关；shadow=verifier pass 后对照跑（只落盘+分歧对照，绝不影响 stage）；gate 档属 H22（未实现，等 shadow 数据）
+    autoMergeEnabled: false, // H33 机械全绿自动本地合并：默认关；开=verdict pass 后 evaluateAutoMerge 谓词全绿即本地 merge（绝不 push）。拨开须人签字（红区），且先有 shadow 期无假绿数据
+    autoMergeKinds: ['bugfix'], // H33 允许自动合并的任务 kind（feature 一律人审）
+    autoMergeMaxDiffLines: 400, // H33 机械低风险判定：numstat 总改动行数上限
+    autoMergeMaxAcs: 8, // H33 机械低风险判定：AC 数上限
+    autoMergeDeniedPaths: [], // H33 危险路径清单（命中即不放行）：'dir/' 前缀匹配，其余子串匹配；空=不限（开启提案时应配真实清单）
     spawnRetries: 6, // Claude 瞬态重试次数（H7：长尾覆盖限流窗口）
     spawnBackoffMs: [15000, 30000, 60000, 120000, 300000, 600000], // 瞬态重试退避（H7：尾部 5min/10min 穿越 429 窗口）
     verifierShadowEnabled: false, // verifier shadow 观测实验（R4-E11）：默认关；开启也绝不影响状态机
@@ -85,7 +98,7 @@ export function loadCfg(root = resolveRoot()) {
     lockHeartbeatMs: 60000,
     maxStepsPerTask: 20,
     runBudgetUsd: null,
-    models: { setup: null, feasibility: null, spec: null, specVerifier: null, maker: null, verifier: null, committer: null },
+    models: { setup: null, feasibility: null, spec: null, specVerifier: null, maker: null, verifier: null, committer: null, reviewer: null },
   };
   let user = {};
   try {
@@ -215,8 +228,8 @@ function nextId(cfg) {
 
 function cmdNew(cfg, opts) {
   const kind = opts.kind;
-  if (kind !== 'bugfix' && kind !== 'feature') {
-    console.error('用法：conductor new --kind bugfix|feature --title "..."');
+  if (kind !== 'bugfix' && kind !== 'feature' && kind !== 'probe') {
+    console.error('用法：conductor new --kind bugfix|feature|probe --title "..."');
     process.exitCode = 1;
     return;
   }
@@ -252,7 +265,10 @@ function cmdNew(cfg, opts) {
   const feasibility = kind === 'feature' && (
     opts.feasibility != null ? opts.feasibility !== 'false' : cfg.feasibilityEnabled === true
   );
-  const naturalStage = kind === 'feature' ? (feasibility ? 'NEEDS_FEASIBILITY' : 'NEEDS_SPEC') : 'READY';
+  const naturalStage = kind === 'feature'
+    ? (feasibility ? 'NEEDS_FEASIBILITY' : 'NEEDS_SPEC')
+    : kind === 'probe' ? 'NEEDS_FEASIBILITY' // probe 链（H26）：只读调查，复用 feasibility agent
+      : 'READY';
   const stage = hasApprovedSetupProfile({ ...cfg, targetRepo }) ? naturalStage : 'NEEDS_TARGET_SETUP';
 
   // task.json 不可变快照（契约 §1）：baseBranch = config.baseBranch ?? currentBranch(targetRepo) ?? 'main'。
@@ -309,6 +325,8 @@ function cmdNew(cfg, opts) {
   console.log(`已创建 ${path.relative(cfg.root, dir)}/（kind=${kind}, stage=${stage}）`);
   if (kind === 'bugfix') {
     console.log('提醒：编辑该目录的 spec.md「## 验收标准」段（它就是 bugfix 档的 spec），然后 conductor run');
+  } else if (kind === 'probe') {
+    console.log('probe 档（只读调查）：conductor run 会让 feasibility-agent 产出调查报告，人读后 conductor close 归档（无实现链）');
   } else if (feasibility) {
     console.log('feature 档（feasibility gate）：conductor run 会先让 feasibility-agent 产出决策 memo，等你 approve-feasibility --option 点名后再进 spec 链');
   } else {
@@ -573,37 +591,46 @@ async function cmdMerge(cfg, id) {
     process.exitCode = 1;
     return;
   }
-  const tcfg = taskCfg(ts, cfg);
-  const cur = currentBranch(tcfg.targetRepo);
-  if (cur !== ts.task.baseBranch) {
-    console.error(`merge 拒绝：target 仓库当前分支 ${cur} ≠ 任务 baseBranch ${ts.task.baseBranch}（任务保持原状）`);
+  // merge 舞步（守卫高亮 / committer 提案 / --no-ff / 归档）提取为 performMerge，
+  // 与 H33 auto-merge 共用同一实现——文案与行为逐字保持。
+  const res = await performMerge(ts, cfg);
+  if (!res.ok) {
+    console.error(res.error);
     process.exitCode = 1;
     return;
   }
-  const branch = `task/${id}`;
-  const wt = path.join(cfg.worktreesDir, id);
-  // merge commit 文案：committer 提案 + validateCommitMessage 裁决，两次不过 / 预算超限
-  // 降级机器文案（fail-open，绝不 block merge）。轮次 commit 颗粒度不丢：merge 保持
-  // --no-ff，任务分支上的 maker r<n> commit 原样保留在历史里。
-  const proposal = await runCommitterProposal(ts, cfg);
-  try {
-    mergeBranch(tcfg.targetRepo, branch, proposal ?? `merge ${branch} (conductor)`);
-  } catch (err) {
-    console.error(`merge 失败（任务保持原状）：${err.message}`);
+  console.log(`${id} 已 merge 并归档（state/done/），worktree 已清理`);
+  });
+}
+
+/**
+ * probe 终点闸门（H26）：queue 中 AWAIT_PROBE_CLOSE 的任务，调查报告固化进
+ * dossier/<id>/probe-report.md 后整目录归档 done。无 merge、无 worktree 清理（probe 不建 worktree）。
+ */
+async function cmdClose(cfg, id) {
+  return withCliTaskMutation(cfg, id, async () => {
+  const ts = findTask(cfg, id);
+  if (!ts) { console.error(`找不到任务 ${id}`); process.exitCode = 1; return; }
+  if (ts.error) { console.error(`${id} 任务目录损坏：${ts.error}`); process.exitCode = 1; return; }
+  if (ts.box !== 'queue' || ts.runtime.stage !== 'AWAIT_PROBE_CLOSE') {
+    console.error(`close 仅适用于 queue 中 stage=AWAIT_PROBE_CLOSE 的任务（当前 box=${ts.box}, stage=${ts.runtime.stage}）`);
     process.exitCode = 1;
     return;
   }
-  state.appendTimeline(cfg, id, `merged ${branch} → ${currentBranch(tcfg.targetRepo)}`);
-  removeWorktree(tcfg.targetRepo, wt);
-  deleteBranch(tcfg.targetRepo, branch);
-  // 归档：先产物（merge 已完成）后状态。
+  // 先产物后状态：报告固化进 dossier（dossier 不随任务目录搬箱，永久可查）。
+  const draft = path.join(ts.dir, 'feasibility-study.md');
+  if (fs.existsSync(draft)) {
+    state.writeFileEnsured(state.dossierPath(cfg, id, 'probe-report.md'), fs.readFileSync(draft, 'utf8'));
+    state.appendTimeline(cfg, id, 'probe 报告固化 → dossier/probe-report.md');
+  }
   ts.runtime.stage = 'DONE';
   state.saveRuntime(ts);
   const dest = state.taskDir(cfg.doneDir, id);
   fs.mkdirSync(cfg.doneDir, { recursive: true });
   fs.renameSync(ts.dir, dest);
-  state.appendTimeline(cfg, id, '归档 → state/done/');
-  console.log(`${id} 已 merge 并归档（state/done/），worktree 已清理`);
+  state.appendTimeline(cfg, id, '归档 → state/done/（probe closed）');
+  state.appendEvent(cfg, id, 'stage', { stage: 'DONE', note: 'probe closed' });
+  console.log(`${id} 已 close 并归档（state/done/），报告：dossier/${id}/probe-report.md`);
   });
 }
 
@@ -704,9 +731,11 @@ async function cmdRetry(cfg, id) {
   if (ts.box === 'failed') {
     // reset runtime（契约 §12）。复位目标按「冻结产物走到哪」倒推：
     // feasibility gate 任务缺冻结 memo → NEEDS_FEASIBILITY；缺冻结 spec → NEEDS_SPEC；否则 READY。
-    const retryStage = ts.task.kind !== 'feature' ? 'READY'
-      : ts.task.feasibility === true && !fs.existsSync(state.dossierPath(cfg, id, 'feasibility-study.md')) ? 'NEEDS_FEASIBILITY'
-        : !fs.existsSync(state.dossierPath(cfg, id, 'spec.md')) ? 'NEEDS_SPEC' : 'READY';
+    // probe（H26）没有实现链，恒回 NEEDS_FEASIBILITY 重产报告。
+    const retryStage = ts.task.kind === 'probe' ? 'NEEDS_FEASIBILITY'
+      : ts.task.kind !== 'feature' ? 'READY'
+        : ts.task.feasibility === true && !fs.existsSync(state.dossierPath(cfg, id, 'feasibility-study.md')) ? 'NEEDS_FEASIBILITY'
+          : !fs.existsSync(state.dossierPath(cfg, id, 'spec.md')) ? 'NEEDS_SPEC' : 'READY';
     Object.assign(ts.runtime, {
       stage: retryStage,
       maker_miss_count: 0,
@@ -758,10 +787,11 @@ function parseArgs(argv) {
 
 const USAGE = `用法：conductor <command>
   run                                  drain 一轮：推进所有任务直到无状态变化
-  new --kind bugfix|feature --title "…" [--brief <file>] [--feasibility] [--repo <path>]
+  new --kind bugfix|feature|probe --title "…" [--brief <file>] [--feasibility] [--repo <path>]
                                        新建任务（--brief 落盘需求原文；--feasibility 让 feature 先走
                                        feasibility gate，缺省随 config.feasibilityEnabled；--repo 覆盖
-                                       快照的 targetRepo，缺省用 conductor.config.json 的 targetRepo）
+                                       快照的 targetRepo，缺省用 conductor.config.json 的 targetRepo；
+                                       probe = 只读调查任务，报告人读后 close 归档）
   approve-feasibility <id> --option O-X [--notes "…"]
                                        按 option ID 点名批准 feasibility memo（无静默通过）
   reject-feasibility <id> [--notes "…"] 打回 feasibility memo，notes 追加进 feasibility_reject_notes.md
@@ -771,6 +801,7 @@ const USAGE = `用法：conductor <command>
   status                               打印任务表（queue / failed / done）
   spy                                  只读查看 queue 任务的运行中角色与最近活动
   merge <id>                           人工终点闸门：合入分支、归档、清 worktree
+  close <id>                           probe 终点闸门：调查报告固化进 dossier 后归档（无 merge）
   retry <id>                           FAILED_BOX → READY（重置 miss，保留案卷）/ 清理崩溃标记`;
 
 export async function main(argv = process.argv.slice(2)) {
@@ -788,6 +819,7 @@ export async function main(argv = process.argv.slice(2)) {
     case 'status': cmdStatus(cfg); break;
     case 'spy': cmdSpy(cfg); break;
     case 'merge': await cmdMerge(cfg, opts._[0]); break;
+    case 'close': await cmdClose(cfg, opts._[0]); break;
     case 'retry': await cmdRetry(cfg, opts._[0]); break;
     default:
       console.error(USAGE);

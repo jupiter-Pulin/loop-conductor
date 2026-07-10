@@ -14,6 +14,7 @@ export const STAGES = [
   'VERIFY',
   'FIXING',
   'AWAIT_HUMAN_MERGE',
+  'AWAIT_PROBE_CLOSE',
   'FAILED_BOX',
 ];
 
@@ -420,6 +421,178 @@ export function validateVerifierVerdict(parsed, expectedAcIds) {
   };
 }
 
+/**
+ * H15：verifier evidence 机械锚定核验（纯函数）。fileIndex 由调用方按 worktree/base 构建：
+ * `{ [file]: { lines: number|null, in_diff: boolean, missing_reason?: string } }`，
+ * lines=null 表示文件在 worktree 与 base blob 都解析不到。
+ * hard = 客观幻觉（文件不存在 / 行号越界）；soft = 引用 diff 外文件——verifier 有全树只读权，
+ * 属合法行为，只观测不拒收。行号区间形状（整数、≥1、end≥start）已由 validateVerifierVerdict
+ * 把关，此处只裁与真实文件的锚定关系。
+ */
+export function checkEvidenceAnchors(verdict, fileIndex) {
+  const hard = [];
+  const soft = [];
+  for (const c of verdict?.criteria_results ?? []) {
+    for (const ev of c.evidence ?? []) {
+      const info = fileIndex?.[ev.file];
+      if (!info || info.lines === null || info.lines === undefined) {
+        hard.push({
+          ac_id: c.ac_id, file: ev.file, reason: info?.missing_reason ?? 'file_missing',
+          start_line: ev.start_line, end_line: ev.end_line,
+        });
+        continue;
+      }
+      if (ev.end_line > info.lines) {
+        hard.push({
+          ac_id: c.ac_id, file: ev.file, reason: 'line_out_of_range',
+          start_line: ev.start_line, end_line: ev.end_line, file_lines: info.lines,
+        });
+        continue;
+      }
+      if (!info.in_diff) {
+        soft.push({
+          ac_id: c.ac_id, file: ev.file, reason: 'outside_diff',
+          start_line: ev.start_line, end_line: ev.end_line,
+        });
+      }
+    }
+  }
+  return { hard, soft };
+}
+
+/**
+ * H21：独立 Reviewer 报告的程序级契约。字段名与取值逐字移植自 review-diff skill
+ * （references/review-diff-template.json + scripts/check-review-diff.mjs），零外部依赖。
+ * gate 由 findings/acCoverage/tests/residualRisk 机械推导，agent 声明的 gate 必须与推导一致。
+ */
+export const REVIEW_REPORT_CONTRACT = Object.freeze({
+  id: 'review-diff/v1',
+  schemaVersion: 1,
+  stage: 'review-diff',
+  gates: Object.freeze(['ready', 'ready_with_concerns', 'blocked']),
+  severities: Object.freeze(['P0', 'P1', 'P2']),
+  acStatuses: Object.freeze(['pass', 'fail', 'unknown', 'not-applicable']),
+  commandStatuses: Object.freeze(['passed', 'failed', 'not-run']),
+});
+
+/** review 报告骨架（喂 reviewer prompt 用），从契约常量生成防漂移；`a|b` 表示枚举取值。 */
+export function reviewReportSkeleton() {
+  const { schemaVersion, stage, gates, severities, acStatuses } = REVIEW_REPORT_CONTRACT;
+  return {
+    schemaVersion,
+    stage,
+    gate: gates.join('|'),
+    findings: [
+      {
+        severity: severities.join('|'),
+        file: '相对路径',
+        line: 1,
+        title: '非空字符串',
+        impact: '出错时用户/系统承受什么',
+        trigger: '什么输入/状态触发',
+        evidence: '锚定 diff 的证据描述',
+        fix: '最小修复方向',
+      },
+    ],
+    acCoverage: [
+      { acId: 'AC-###（与枚举清单逐字一致，无缺无多）', status: acStatuses.join('|'), evidence: '非空字符串' },
+    ],
+    tests: { run: [], suggested: [] },
+    residualRisk: false,
+  };
+}
+
+/**
+ * review 报告的唯一裁判（绝不抛错）。expectedAcIds = conductor 对冻结 spec 的 AC 枚举。
+ * 校验 = check-review-diff.mjs 全量移植 + verifier 级 AC 覆盖纪律（无缺、无重、无多）。
+ * 合格返回 { ok:true, report }，report 附机械推导的 metrics 与 blockers（不采信 agent 自报）。
+ */
+export function validateReviewReport(parsed, expectedAcIds) {
+  const C = REVIEW_REPORT_CONTRACT;
+  const errors = [];
+  const expected = new Set(expectedAcIds ?? []);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ok: false, errors: ['report 不是对象'] };
+  }
+  if (parsed.schemaVersion !== C.schemaVersion) errors.push(`schemaVersion 必须为 ${C.schemaVersion}`);
+  if (parsed.stage !== C.stage) errors.push(`stage 必须为 '${C.stage}'`);
+  if (!C.gates.includes(parsed.gate)) errors.push(`gate 必须 ∈ {${C.gates.join(',')}}`);
+
+  const findings = Array.isArray(parsed.findings) ? parsed.findings : (errors.push('findings 必须是数组'), []);
+  findings.forEach((f, i) => {
+    if (!f || typeof f !== 'object') { errors.push(`findings[${i + 1}] 不是对象`); return; }
+    if (!C.severities.includes(f.severity)) errors.push(`findings[${i + 1}].severity 非法`);
+    if (!Number.isInteger(f.line) || f.line < 1) errors.push(`findings[${i + 1}].line 必须是正整数`);
+    for (const field of ['file', 'title', 'impact', 'trigger', 'evidence', 'fix']) {
+      if (typeof f[field] !== 'string' || f[field].trim() === '') errors.push(`findings[${i + 1}].${field} 必须非空`);
+    }
+  });
+
+  const acCoverage = Array.isArray(parsed.acCoverage) ? parsed.acCoverage : (errors.push('acCoverage 必须是数组'), []);
+  const seen = new Set();
+  acCoverage.forEach((a, i) => {
+    if (!a || typeof a !== 'object') { errors.push(`acCoverage[${i + 1}] 不是对象`); return; }
+    const acId = String(a.acId ?? '');
+    if (!/^AC-\d{3,}$/i.test(acId)) errors.push(`acCoverage[${i + 1}].acId 必须是 AC-001 形态`);
+    else {
+      if (seen.has(acId)) errors.push(`acCoverage acId 重复：${acId}`);
+      seen.add(acId);
+    }
+    if (!C.acStatuses.includes(a.status)) errors.push(`acCoverage[${i + 1}].status 非法`);
+    if (typeof a.evidence !== 'string' || a.evidence.trim() === '') errors.push(`acCoverage[${i + 1}].evidence 必须非空`);
+  });
+  for (const id of expected) if (!seen.has(id)) errors.push(`acCoverage 缺 AC：${id}`);
+  for (const id of seen) if (!expected.has(id)) errors.push(`acCoverage 多余 AC：${id}`);
+
+  const testsRun = Array.isArray(parsed.tests?.run) ? parsed.tests.run : [];
+  if (!parsed.tests || typeof parsed.tests !== 'object' || !Array.isArray(parsed.tests.run) || !Array.isArray(parsed.tests.suggested)) {
+    errors.push('tests 必须是 { run: [], suggested: [] } 形态');
+  }
+  testsRun.forEach((c, i) => {
+    if (!c || typeof c !== 'object' || typeof c.command !== 'string' || c.command.trim() === '') errors.push(`tests.run[${i + 1}].command 必须非空`);
+    if (!C.commandStatuses.includes(c?.status)) errors.push(`tests.run[${i + 1}].status 非法`);
+  });
+
+  // gate 机械推导（不采信 agent 自报 blockers）：与 check-review-diff.mjs 同口径。
+  const metrics = {
+    p0: findings.filter((f) => f?.severity === 'P0').length,
+    p1: findings.filter((f) => f?.severity === 'P1').length,
+    p2: findings.filter((f) => f?.severity === 'P2').length,
+    acFailed: acCoverage.filter((a) => a?.status === 'fail').length,
+    acUnknown: acCoverage.filter((a) => a?.status === 'unknown').length,
+    testsFailed: testsRun.filter((c) => c?.status === 'failed').length,
+    testsNotRun: testsRun.filter((c) => c?.status === 'not-run').length,
+    residualRisk: Boolean(parsed.residualRisk),
+  };
+  const blockers = [];
+  if (metrics.p0 > 0) blockers.push({ code: 'P0_FINDINGS', count: metrics.p0 });
+  if (metrics.p1 > 0) blockers.push({ code: 'P1_FINDINGS', count: metrics.p1 });
+  if (metrics.acFailed > 0) blockers.push({ code: 'AC_FAILED', count: metrics.acFailed });
+  if (metrics.testsFailed > 0) blockers.push({ code: 'REVIEW_VALIDATION_FAILED', count: metrics.testsFailed });
+  let derivedGate = 'ready';
+  if (blockers.length > 0) derivedGate = 'blocked';
+  else if (metrics.p2 > 0 || metrics.acUnknown > 0 || metrics.testsNotRun > 0 || metrics.residualRisk) derivedGate = 'ready_with_concerns';
+  if (C.gates.includes(parsed.gate) && parsed.gate !== derivedGate) {
+    errors.push(`gate 必须为机械推导值 '${derivedGate}'（声明为 '${parsed.gate}'）`);
+  }
+
+  if (errors.length > 0) return { ok: false, errors };
+  return {
+    ok: true,
+    report: {
+      schemaVersion: C.schemaVersion,
+      stage: C.stage,
+      gate: parsed.gate,
+      findings,
+      acCoverage,
+      tests: { run: testsRun, suggested: parsed.tests.suggested },
+      residualRisk: metrics.residualRisk,
+      metrics,
+      blockers,
+    },
+  };
+}
+
 export function validateSpecVerifierVerdict(parsed) {
   const errors = [];
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -474,4 +647,108 @@ export function validateSpecVerifierVerdict(parsed) {
       findings: parsed.findings,
     },
   };
+}
+
+/** 解析 git diff --numstat 输出（H33）：{ total_lines, files, binary }。二进制行（-\t-）计入 binary。 */
+export function parseNumstat(text) {
+  let totalLines = 0;
+  const files = [];
+  let binary = 0;
+  for (const line of (text ?? '').split('\n')) {
+    if (line.trim() === '') continue;
+    const [added, deleted, ...rest] = line.split('\t');
+    const p = rest.join('\t').trim();
+    if (p === '') continue;
+    files.push(p);
+    if (added === '-' || deleted === '-') {
+      binary++;
+      continue;
+    }
+    totalLines += (Number(added) || 0) + (Number(deleted) || 0);
+  }
+  return { total_lines: totalLines, files, binary };
+}
+
+/**
+ * H33 自动本地合并放行谓词（纯函数唯一裁判；输入全部是机械产物，禁止任何 AI 自评）。
+ * 放行 = 全部机械门的合取；任何一门数据缺失即 fail-closed（观测开关没开 = 无证据 = 不放行）。
+ * 注意：shadow 的 high_risk 字段衡量的是「shadow=pass 而 main=fail」（换用 shadow 的放水风险），
+ * 与自动合并的风险方向（main 假绿）相反——所以这里要求分歧数为 0（任何方向），不看 high_risk_count。
+ * 边界：本谓词只决定「本地合并」；push 永远人工（git-safety hook 不变）。
+ */
+export function evaluateAutoMerge({
+  kind, allowedKinds,
+  verdictOverall, acCount, maxAcs,
+  testGate,
+  guardEnabled, guardChanges,
+  anchorsMode, anchors,
+  shadowEnabled, shadowCompare,
+  reviewCompare,
+  diff, maxDiffLines, deniedPaths,
+}) {
+  const reasons = [];
+
+  if (!Array.isArray(allowedKinds) || !allowedKinds.includes(kind)) {
+    reasons.push(`kind=${kind ?? '?'} 不在 autoMergeKinds`);
+  }
+  if (verdictOverall !== 'pass') reasons.push(`verifier overall=${verdictOverall ?? '缺失'} ≠ pass`);
+  if (!Number.isFinite(acCount) || acCount <= 0) reasons.push('AC 数缺失');
+  else if (Number.isFinite(maxAcs) && acCount > maxAcs) reasons.push(`AC 数 ${acCount} > 上限 ${maxAcs}`);
+
+  // 机械测试证明：per-AC 模式 + 映射 valid + 每条 AC 都有定向探针裁决（unmapped/error/vacuous 都不算证明）。
+  if (!testGate) reasons.push('test-gate 产物缺失');
+  else {
+    if (testGate.mode !== 'per-ac') reasons.push(`test-gate mode=${testGate.mode ?? '?'} ≠ per-ac（无逐 AC 机械证明）`);
+    if (testGate.verdict !== 'falsifies') reasons.push(`test-gate verdict=${testGate.verdict ?? '?'} ≠ falsifies`);
+    if (testGate.mapping_status !== 'valid') reasons.push(`mapping_status=${testGate.mapping_status ?? '?'} ≠ valid`);
+    const perAc = Array.isArray(testGate.per_ac) ? testGate.per_ac : [];
+    const unproven = perAc.filter((p) => p.verdict !== 'falsifies' && p.verdict !== 'guard_holds');
+    if (unproven.length > 0) {
+      reasons.push(`存在无机械证明的 AC：${unproven.map((p) => `${p.ac_id}=${p.verdict}`).join('、')}`);
+    }
+  }
+
+  // 既有测试改动守卫：开关必须开（否则无证据），且清单必须为空（零弱化嫌疑）。
+  if (guardEnabled !== true) reasons.push('testChangeGuardEnabled 未开（无守卫证据，fail-closed）');
+  else if (guardChanges !== null && guardChanges !== undefined) {
+    reasons.push(`既有测试被改动（modified ${guardChanges.modified?.length ?? 0} / deleted ${guardChanges.deleted?.length ?? 0} / renamed ${guardChanges.renamed?.length ?? 0}）`);
+  }
+
+  // evidence 锚定：observe/enforce 之一且当轮产物 hard=0。
+  if (anchorsMode !== 'observe' && anchorsMode !== 'enforce') reasons.push('verifierEvidenceAnchorsMode=off（无锚定证据，fail-closed）');
+  else if (!anchors) reasons.push('evidence-anchors 产物缺失');
+  else {
+    const hard = anchors.hard_count ?? (Array.isArray(anchors.hard) ? anchors.hard.length : null);
+    if (hard !== 0) reasons.push(`evidence anchors hard=${hard ?? '?'} ≠ 0`);
+  }
+
+  // codex shadow：必须开、当轮 shadow verdict 有效、分歧数为 0（任何方向）。
+  if (shadowEnabled !== true) reasons.push('verifierShadowEnabled 未开（无第二意见，fail-closed）');
+  else if (!shadowCompare?.agreement || shadowCompare?.shadow?.valid !== true) {
+    reasons.push('shadow 对照缺失或 shadow verdict 无效');
+  } else if ((shadowCompare.agreement.disagreements?.length ?? 0) > 0) {
+    const d = shadowCompare.agreement.disagreements.map((x) => `${x.ac_id} ${x.main}→${x.shadow}`).join('、');
+    reasons.push(`shadow 分歧：${d}`);
+  }
+
+  // reviewer shadow（可选面）：产物存在时必须无分歧；不存在不阻塞（reviewStage 默认 off，是否强制由开启提案裁）。
+  if (reviewCompare) {
+    if (reviewCompare.review?.valid !== true) reasons.push('reviewer 对照存在但 review 无效');
+    else if (reviewCompare.disagreement === true) reasons.push(`reviewer 分歧（gate=${reviewCompare.review?.gate ?? '?'}）`);
+  }
+
+  // 变更规模与危险路径（机械「低风险」判定）。
+  if (!diff) reasons.push('diff 统计缺失');
+  else {
+    if (diff.binary > 0) reasons.push(`含 ${diff.binary} 个二进制/不可计行文件`);
+    if (Number.isFinite(maxDiffLines) && diff.total_lines > maxDiffLines) {
+      reasons.push(`diff ${diff.total_lines} 行 > 上限 ${maxDiffLines}`);
+    }
+    for (const p of Array.isArray(deniedPaths) ? deniedPaths : []) {
+      const hit = diff.files.filter((f) => (p.endsWith('/') ? f.startsWith(p) : f.includes(p)));
+      if (hit.length > 0) reasons.push(`命中危险路径 ${p}：${hit.join('、')}`);
+    }
+  }
+
+  return { eligible: reasons.length === 0, reasons };
 }
