@@ -7,9 +7,9 @@ import { spawn } from 'node:child_process';
 import { runClaude, runClaudeWithRetry } from '../lib/claude.mjs';
 import {
   ensureWorktree, commitAll, diffAgainstBase, diffNameStatusAgainstBase, diffStatAgainstBase,
-  mergeBaseWith, addDetachedWorktree, removeWorktree,
+  mergeBaseWith, addDetachedWorktree, removeWorktree, currentBranch, mergeBranch, deleteBranch,
 } from '../lib/git.mjs';
-import { DEFAULT_TEST_GLOBS, classifyTestFileChanges, AC_TESTS_MAPPING_PATH, validateAcTestsMapping } from '../lib/test-gate.mjs';
+import { DEFAULT_TEST_GLOBS, classifyTestFileChanges, listExistingTestFileChanges, AC_TESTS_MAPPING_PATH, validateAcTestsMapping } from '../lib/test-gate.mjs';
 import { readApprovedSetupProfile, setupProfilePaths } from '../lib/profile.mjs';
 import { taskCfg } from '../lib/task-cfg.mjs';
 import * as state from '../lib/state.mjs';
@@ -19,8 +19,8 @@ import { FEASIBILITY_DOC_CONTRACT, validateFeasibilityDoc } from '../lib/feasibi
 import { buildSignature } from '../lib/failure-signature.mjs';
 import {
   overBudget, testGateVerdict, perAcProbeVerdict, perAcGateVerdict, greenGatePassed,
-  parseStrictJson, validateCommitMessage, verifierVerdictSkeleton,
-  SPEC_VERIFIER_CONTRACT, VERIFIER_VERDICT_CONTRACT, COMMIT_MESSAGE_CONTRACT,
+  parseStrictJson, validateCommitMessage, verifierVerdictSkeleton, reviewReportSkeleton,
+  SPEC_VERIFIER_CONTRACT, VERIFIER_VERDICT_CONTRACT, COMMIT_MESSAGE_CONTRACT, REVIEW_REPORT_CONTRACT,
 } from './decisions.mjs';
 
 export function worktreePath(cfg, id) {
@@ -58,9 +58,11 @@ export const MAKER_ALLOWED_TOOLS = ['Bash'];
 /** worktree harness 排除（契约 §8）。exclude patterns 与 tracked 检测名分开。 */
 export const HARNESS_ARTIFACTS = {
   // 写进 worktree-local .git/info/exclude 的 gitignore pattern。
-  patterns: ['/.claude_review_state.json', '/.will-workflow/', '/.agent/'],
+  // node_modules：testCommand 常 `ln -s` 出一个 node_modules symlink，若不排除会被
+  // commitAll 的 `git add -A` 提交进 task 分支，merge 时与目标 working tree 的 node_modules 冲突而中止。
+  patterns: ['/.claude_review_state.json', '/.will-workflow/', '/.agent/', '/node_modules'],
   // ls-files 检测「是否已被目标仓库追踪」用的名字（目录名直接传）。
-  tracked: ['.claude_review_state.json', '.will-workflow', '.agent'],
+  tracked: ['.claude_review_state.json', '.will-workflow', '.agent', 'node_modules'],
 };
 
 export { canStartSpawn };
@@ -434,6 +436,7 @@ export function readAgentPrompt(cfg, name) {
 }
 
 export function entryStageAfterSetup(ts) {
+  if (ts.task.kind === 'probe') return 'NEEDS_FEASIBILITY'; // probe 链（H26）：只读调查
   if (ts.task.kind !== 'feature') return 'READY';
   return ts.task.feasibility === true ? 'NEEDS_FEASIBILITY' : 'NEEDS_SPEC';
 }
@@ -489,6 +492,29 @@ export function readBrief(ts) {
 /** feasibility-agent 唯一交付文件（人审前草稿）的绝对路径：随任务目录走（对齐 reject_notes）。 */
 export function feasibilityDraftPath(ts) {
   return path.join(ts.dir, 'feasibility-study.md');
+}
+
+/**
+ * H19 spec/feasibility 链物理隔离（config `specChainIsolationEnabled`，默认关）：
+ * 只读探索 cwd 改到 baseBranch 的一次性 detached worktree——任何越轨写都落在随后即弃的
+ * worktree 里，物理到不了用户 checkout；隔离不再依赖 hook 白名单枚举正确。
+ * 交付面不受影响：spec 草稿写 specsDir、feasibility 草稿写任务目录，都是编排侧绝对路径。
+ * 语义边界：隔离 worktree 只见已提交状态，target 仓库的脏工作区不可见。
+ * worktree 建不起来时 fail-open 回退真仓库 cwd（旧行为）并记 timeline——隔离是加固，
+ * 不是可用性闸门。返回 { cwd, cleanup }；cleanup 幂等、绝不抛。
+ */
+export function acquireSpecChainCwd(ts, cfg, role) {
+  const tRepo = taskCfg(ts, cfg).targetRepo;
+  if (cfg.specChainIsolationEnabled !== true) return { cwd: tRepo, cleanup: () => {} };
+  const wtPath = path.join(cfg.worktreesDir, `${ts.id}.spec-ro`);
+  removeWorktree(tRepo, wtPath); // 清崩溃残留；无残留时是无害 no-op
+  const added = addDetachedWorktree(tRepo, wtPath, ts.task.baseBranch);
+  if (!added.ok) {
+    state.appendTimeline(cfg, ts.id, `spec 链隔离 worktree 建立失败（${added.error}），${role} 本轮回退真仓库 cwd`);
+    return { cwd: tRepo, cleanup: () => {} };
+  }
+  state.appendTimeline(cfg, ts.id, `spec 链隔离：${role} cwd → 一次性 worktree ${path.relative(cfg.root, wtPath)} @ ${ts.task.baseBranch}`);
+  return { cwd: wtPath, cleanup: () => { try { removeWorktree(tRepo, wtPath); } catch { /* 清理失败不影响主链 */ } } };
 }
 
 /**
@@ -729,6 +755,12 @@ export function buildFeasibilityPrompt(ts, cfg, round) {
     `# 任务 brief\n\n${brief.trim() || '(无 brief：需求仅有上面的标题；未知项如实写进开放问题段，不要脑补需求)'}`,
     `# Approved setup profile\n\n${setup}`,
   ];
+  if (ts.task.kind === 'probe') {
+    parts.push(
+      '# Probe 模式（只读调查任务，H26）\n本任务没有后续实现链：你的 memo 就是最终交付，人读后直接 close 归档。' +
+      '把「选项对比 / 推荐」理解为「调查结论与可能的后续行动建议」；每条结论必须带可复查证据锚（文件:行号 / 命令与输出摘要），不确定的如实写进开放问题段。',
+    );
+  }
   if (rejectNotes.trim()) {
     parts.push(`# Human reject notes（上一稿被人审打回的原因，本稿必须逐条回应）\n\n${rejectNotes}`);
   }
@@ -815,7 +847,7 @@ export function buildSpecAgentPrompt(ts, cfg, round, { mode = 'draft' } = {}) {
   return parts.filter(Boolean).join('\n\n');
 }
 
-export function buildSpecVerifierPrompt(ts, cfg, round) {
+export function buildSpecVerifierPrompt(ts, cfg, round, scaleGate = null) {
   const tRepo = taskCfg(ts, cfg).targetRepo;
   const setup = readSetupProfileMarkdown(taskCfg(ts, cfg)) || '(no approved setup profile found)';
   const feasibility = readFeasibilityContext(ts, cfg) || '(no feasibility-study context yet; placeholder for future feasibility-study agent)';
@@ -833,6 +865,13 @@ export function buildSpecVerifierPrompt(ts, cfg, round) {
     decision ? `# 已选 option（人审裁决，spec 偏离即 blocker）\n\n${renderFeasibilityDecisionSection(decision)}` : '',
     history.trim() ? `# Prior spec-verifier reports\n\n${history}` : '',
     `# Spec draft under review\n\n${spec}`,
+    scaleGate
+      ? `# 规模闸（H18 软档，conductor 机械计数）\n本 spec 含 ${scaleGate.acCount} 条 AC，超过阈值 ${scaleGate.max}` +
+        '（单任务链轮次预算按 one-thing-per-loop 设计，超规模 spec 已有真实截断先例）。' +
+        '无论 overall 裁决如何，findings 必须包含一条 severity=major、audience=both 的**拆分建议**：' +
+        '给出把本 spec 拆成多任务或 AC 分批 milestone 的具体方案（哪些 AC 一组、组间依赖顺序）。' +
+        '不因规模本身判 fail——拆分决定权在人审闸门。'
+      : null,
     `# Verdict contract\n${SPEC_VERIFIER_CONTRACT.id} ` +
     `(schema_version=${SPEC_VERIFIER_CONTRACT.schemaVersion})。`,
     '# JSON 字段\n必须包含 schema_version、round、overall、summary、human_report、spec_agent_feedback、findings。' +
@@ -945,6 +984,59 @@ export function addCost(ts, costUsd, cfg = null) {
   const next = (ts.runtime.spent_usd ?? 0) + (costUsd ?? 0);
   ts.runtime.spent_usd = Math.round(next * 1e6) / 1e6;
   if (cfg) addRunCost(cfg, costUsd);
+}
+
+/**
+ * H20：某角色的 dossier 历史均价（killed spawn 成本估计的样本源）。
+ * 扫 dossier/<id>/<role>-r<n>.json，只取 cost_unknown!==true 且 cost_usd>0 的样本。
+ * 无样本返回 { avg: 0, samples: 0 }。
+ */
+export function estimateRoleCost(cfg, role) {
+  let ids = [];
+  try { ids = fs.readdirSync(cfg.dossierDir); } catch { return { avg: 0, samples: 0 }; }
+  const re = new RegExp(`^${role}-r\\d+\\.json$`);
+  const costs = [];
+  for (const id of ids) {
+    let names = [];
+    try { names = fs.readdirSync(path.join(cfg.dossierDir, id)); } catch { continue; }
+    for (const n of names) {
+      if (!re.test(n)) continue;
+      const rec = state.readJsonIf(path.join(cfg.dossierDir, id, n));
+      if (rec && rec.cost_unknown !== true && typeof rec.cost_usd === 'number' && rec.cost_usd > 0) {
+        costs.push(rec.cost_usd);
+      }
+    }
+  }
+  if (costs.length === 0) return { avg: 0, samples: 0 };
+  const avg = Math.round((costs.reduce((s, c) => s + c, 0) / costs.length) * 1e6) / 1e6;
+  return { avg, samples: costs.length };
+}
+
+/**
+ * H20 spawn 成本入账统一入口：cost 已知 → 原样入账（与旧 addCost 路径逐字节等价）；
+ * costUnknown（killed / 无 result 事件）→ 默认只留 lower-bound timeline（旧行为，记 0）；
+ * config `unknownSpawnCostEstimateEnabled=true` 且该角色有历史样本 → 按均价估计入账，
+ * runtime.estimated_cost_usd 独立累计（透明可审），timeline 标 estimated——预算闸不再被
+ * killed spawn 系统性放水。无样本时退回 lower-bound（绝不凭空造数）。
+ */
+export function accountSpawnCost(ts, cfg, role, round, res) {
+  if (!res.costUnknown) {
+    addCost(ts, res.costUsd, cfg);
+    return;
+  }
+  addCost(ts, res.costUsd, cfg); // unknown 时 costUsd 恒 0：保持旧行为的字面等价（no-op）
+  if (cfg.unknownSpawnCostEstimateEnabled === true) {
+    const est = estimateRoleCost(cfg, role);
+    if (est.samples > 0) {
+      addCost(ts, est.avg, cfg);
+      ts.runtime.estimated_cost_usd = Math.round(((ts.runtime.estimated_cost_usd ?? 0) + est.avg) * 1e6) / 1e6;
+      state.appendTimeline(cfg, ts.id, `${role} r${round} cost unknown → 按历史均价 $${est.avg} 估计入账（n=${est.samples}，estimated）`);
+      return;
+    }
+    state.appendTimeline(cfg, ts.id, `${role} r${round} cost unknown → 无历史样本可估计，spent_usd uses lower-bound accounting`);
+    return;
+  }
+  state.appendTimeline(cfg, ts.id, `${role} r${round} cost unknown; spent_usd uses lower-bound accounting`);
 }
 
 export function budgetExceeded(ts, cfg) {
@@ -1100,27 +1192,94 @@ export function buildMakerRepairPrompt(ts, cfg, round) {
  * diff 超 cfg.verifierDiffMaxBytes 时降级：只嵌 name-status 变更清单 + 按文件自查指令
  * （verifier 工具集本就有 Bash(git diff:*)），防大 diff 撑爆 verifier 上下文。
  */
-export function buildVerifierPrompt(ts, cfg, round, acList) {
+/**
+ * H16 测试改动守卫（config `testChangeGuardEnabled`，默认关）：机械 diff 出既有测试文件的
+ * 修改/删除/改名清单。关闭或清单全空返回 null。观测型防线：调用方只注入 verifier prompt
+ * 与 merge 摘要高亮，绝不 block。glob 口径与 test gate 探针同源（cfg.testGateTestGlobs）。
+ */
+export function computeTestChangeGuard(ts, cfg) {
+  if (cfg.testChangeGuardEnabled !== true) return null;
+  const wt = worktreePath(cfg, ts.id);
+  const nameStatus = diffNameStatusAgainstBase(wt, ts.task.baseBranch);
+  const changes = listExistingTestFileChanges(nameStatus, cfg.testGateTestGlobs ?? DEFAULT_TEST_GLOBS);
+  const total = changes.modified.length + changes.deleted.length + changes.renamed.length;
+  if (total === 0) return null;
+  return { ...changes, total };
+}
+
+/**
+ * merge 核心（cmdMerge 与 H33 auto-merge 共用；调用方必须已持任务锁且校验过 box/stage）。
+ * 舞步与文案保持 cmdMerge 原样：守卫高亮 → committer 提案 → --no-ff merge → 清 worktree/分支 →
+ * 归档 done + DONE 事件。返回 { ok, error? }，从不 throw；失败时任务保持原状（AWAIT_HUMAN_MERGE）。
+ * 边界（H33）：只做本地合并，绝不 push——远端操作永远人工。
+ */
+export async function performMerge(ts, cfg, { auto = false } = {}) {
   const id = ts.id;
-  const wt = worktreePath(cfg, id);
-  const base = ts.task.baseBranch;
+  const tcfg = taskCfg(ts, cfg);
+  const cur = currentBranch(tcfg.targetRepo);
+  if (cur !== ts.task.baseBranch) {
+    return { ok: false, error: `merge 拒绝：target 仓库当前分支 ${cur} ≠ 任务 baseBranch ${ts.task.baseBranch}（任务保持原状）` };
+  }
+  const branch = `task/${id}`;
+  const wt = path.join(cfg.worktreesDir, id);
+  // H16 测试改动守卫（观测型，绝不 block merge）：worktree 清理前算既有测试改动清单。
+  const guard = computeTestChangeGuard(ts, cfg);
+  if (guard) {
+    console.log(`⚠ 既有测试改动（机械 diff，共 ${guard.total} 处——审计是否弱化断言后再 merge）：`);
+    for (const f of guard.modified) console.log(`  M ${f}`);
+    for (const f of guard.deleted) console.log(`  D ${f}`);
+    for (const r of guard.renamed) console.log(`  R ${r.from} → ${r.to}`);
+    state.appendTimeline(cfg, id, `merge 摘要：既有测试改动 modified ${guard.modified.length} / deleted ${guard.deleted.length} / renamed ${guard.renamed.length}（观测，不 block）`);
+  }
+  const proposal = await runCommitterProposal(ts, cfg);
+  try {
+    mergeBranch(tcfg.targetRepo, branch, proposal ?? `merge ${branch} (conductor)`);
+  } catch (err) {
+    return { ok: false, error: `merge 失败（任务保持原状）：${err.message}` };
+  }
+  state.appendTimeline(cfg, id, `merged ${branch} → ${currentBranch(tcfg.targetRepo)}${auto ? '（auto-merge，机械全绿）' : ''}`);
+  removeWorktree(tcfg.targetRepo, wt);
+  deleteBranch(tcfg.targetRepo, branch);
+  // 归档：先产物（merge 已完成）后状态。
+  ts.runtime.stage = 'DONE';
+  state.saveRuntime(ts);
+  const dest = state.taskDir(cfg.doneDir, id);
+  fs.mkdirSync(cfg.doneDir, { recursive: true });
+  fs.renameSync(ts.dir, dest);
+  state.appendTimeline(cfg, id, '归档 → state/done/');
+  // 归档舞步不走 transitionState，stage 事件在此补记（H17）
+  state.appendEvent(cfg, id, 'stage', { stage: 'DONE', note: auto ? 'auto-merged' : 'merged' });
+  return { ok: true };
+}
+
+/** worktree diff prompt 段（verifier / reviewer 共用）：超 cfg.verifierDiffMaxBytes 降级清单。 */
+function buildDiffSection(wt, base, cfg) {
   const diff = diffAgainstBase(wt, base);
-  const acEnum = acList.map((a) => `${a.ac_id}: ${a.text}`).join('\n');
   const diffBytes = Buffer.byteLength(diff, 'utf8');
-  const diffSection = diffBytes <= cfg.verifierDiffMaxBytes
+  return diffBytes <= cfg.verifierDiffMaxBytes
     ? `# Worktree diff（git diff ${base}...HEAD）\n\n\`\`\`diff\n${diff}\n\`\`\``
     : `# Worktree diff（未内嵌：diff 共 ${diffBytes} 字节，超过上限 ${cfg.verifierDiffMaxBytes} 字节，降级为变更文件清单）\n\n` +
       `变更文件清单（git diff --name-status ${base}...HEAD）：\n\n\`\`\`\n${diffNameStatusAgainstBase(wt, base)}\`\`\`\n\n` +
       `请对清单中每个文件用 \`git diff ${base}...HEAD -- <file>\` 只读自查其改动，再逐条裁决验收标准。`;
-  // 当轮 test gate 探针记录存在时嵌入机械事实段（去 stdout/stderr tail，防 prompt 膨胀）；
-  // 缺失（testGateEnabled=false / 探针未跑）时不加该段。
+}
+
+/** 当轮 test gate 探针机械事实段（去 stdout/stderr tail 防膨胀）；无探针记录返回 null。 */
+function buildProbeSection(cfg, id, round) {
   const probe = state.readJsonIf(state.dossierPath(cfg, id, `test-gate-r${round}.json`));
-  let probeSection = null;
-  if (probe) {
-    const { stdout_tail: _stdout, stderr_tail: _stderr, ...mechanical } = probe;
-    probeSection = '# Test gate 探针结果（conductor 机械事实，审计测试证明力时以此为锚）\n\n' +
-      `\`\`\`json\n${JSON.stringify(mechanical, null, 2)}\n\`\`\``;
-  }
+  if (!probe) return null;
+  const { stdout_tail: _stdout, stderr_tail: _stderr, ...mechanical } = probe;
+  return '# Test gate 探针结果（conductor 机械事实，审计测试证明力时以此为锚）\n\n' +
+    `\`\`\`json\n${JSON.stringify(mechanical, null, 2)}\n\`\`\``;
+}
+
+export function buildVerifierPrompt(ts, cfg, round, acList, testChanges = null) {
+  const id = ts.id;
+  const wt = worktreePath(cfg, id);
+  const base = ts.task.baseBranch;
+  const acEnum = acList.map((a) => `${a.ac_id}: ${a.text}`).join('\n');
+  const diffSection = buildDiffSection(wt, base, cfg);
+  // 缺失（testGateEnabled=false / 探针未跑）时不加该段。
+  const probeSection = buildProbeSection(cfg, id, round);
   return [
     readAgentPrompt(cfg, 'verifier-agent.md'),
     `# 任务 ${id} 验收（第 ${round} 轮）`,
@@ -1128,6 +1287,17 @@ export function buildVerifierPrompt(ts, cfg, round, acList) {
     `# 验收标准枚举（必须逐条裁决，ac_id 必须与此处完全一致，无缺无多）\n\n${acEnum}`,
     diffSection,
     probeSection,
+    testChanges
+      ? '# 既有测试改动守卫（conductor 机械 diff；审计锚，非结论）\n' +
+        '以下**既有**测试文件被本次 diff 修改/删除/改名（新增测试文件不在此列）。裁决相关 AC 时' +
+        '专项审计这些改动是否弱化了原有保护（删除/放宽断言、skip/only、快照重写、删边界 case）；' +
+        '若存在弱化而相关 AC 仍判 pass，该 AC 的 reason 必须说明弱化为何正当：\n\n' +
+        `\`\`\`json\n${JSON.stringify(testChanges, null, 2)}\n\`\`\``
+      : null,
+    cfg.verifierEvidenceAnchorsMode === 'enforce'
+      ? '# Evidence 锚定（机械校验，enforce）\nevidence.file 必须真实存在（worktree 现文件或 base 基线版本），' +
+        'start_line/end_line 必须落在该文件真实行数范围内。虚构路径或越界行号 → verdict 机械拒收，烧一次重试预算。'
+      : null,
     `# Verdict contract\n${VERIFIER_VERDICT_CONTRACT.id} ` +
     `(schema_version=${VERIFIER_VERDICT_CONTRACT.schemaVersion})；唯一程序级校验在 ` +
     '`conductor/stages/decisions.mjs::validateVerifierVerdict`（该文件不在你的 worktree 内，' +
@@ -1141,6 +1311,43 @@ export function buildVerifierPrompt(ts, cfg, round, acList) {
     '探索、推理、自我核对都必须留在工具调用轮次里，不要出现在最终回复中；最终回复只能是符合 verdict contract 的严格 JSON。' +
     '不合规输出会被机械拒收，并烧掉一次重试预算。\n' +
     `conductor 会把合法 verdict 落盘为 dossier/${id}/verify-r${round}.verdict.json，并且只信该文件。`,
+  ].filter(Boolean).join('\n\n');
+}
+
+/**
+ * reviewer prompt（H21，契约 review-diff/v1）：独立正确性审查——与 verifier 同 diff 同机械
+ * 事实，但角色是「AC 之外的不变量/契约/回归」第二意见。不喂 verifier verdict（独立裁决，
+ * 对照在 conductor 侧做），不喂 maker 叙述。
+ */
+export function buildReviewerPrompt(ts, cfg, round, acList) {
+  const id = ts.id;
+  const wt = worktreePath(cfg, id);
+  const base = ts.task.baseBranch;
+  const acEnum = acList.map((a) => `${a.ac_id}: ${a.text}`).join('\n');
+  const testChanges = computeTestChangeGuard(ts, cfg);
+  return [
+    readAgentPrompt(cfg, 'reviewer-agent.md'),
+    `# 任务 ${id} 独立审查（第 ${round} 轮）`,
+    `# Spec（唯一契约）\n\n${readDossierSpec(ts, cfg)}`,
+    `# 验收标准枚举（acCoverage 必须逐条覆盖，acId 与此处完全一致，无缺无多）\n\n${acEnum}`,
+    buildDiffSection(wt, base, cfg),
+    buildProbeSection(cfg, id, round),
+    testChanges
+      ? '# 既有测试改动守卫（conductor 机械 diff；审计锚，非结论）\n' +
+        `\`\`\`json\n${JSON.stringify(testChanges, null, 2)}\n\`\`\``
+      : null,
+    `# Report contract\n${REVIEW_REPORT_CONTRACT.id} ` +
+    `(schemaVersion=${REVIEW_REPORT_CONTRACT.schemaVersion})；唯一程序级校验在 ` +
+    '`conductor/stages/decisions.mjs::validateReviewReport`（该文件不在你的 worktree 内，' +
+    '以下字段骨架由该契约生成，字段名必须逐字一致；`a|b` 表示枚举取值；gate 由 findings/acCoverage/tests/residualRisk 机械推导，声明值必须与推导一致）：\n\n' +
+    `\`\`\`json\n${JSON.stringify(reviewReportSkeleton(), null, 2)}\n\`\`\``,
+    '# 指令\n只做静态审查：可用 Read/Grep/Glob 与 `git diff` / `git log` 只读核查；不许跑测试，不许改文件。\n' +
+    '# 输出纪律（协议要求，机械校验，不可违反）\n' +
+    '最终回复的第一个字符必须是 `{`，最后一个字符必须是 `}`；`{` 之前与 `}` 之后不得有任何字符——' +
+    '不要输出任何说明、总结、Markdown 代码围栏（包括 ```json）、空行或提示语。' +
+    '探索、推理、自我核对都必须留在工具调用轮次里，不要出现在最终回复中。' +
+    '不合规输出会被机械拒收。\n' +
+    `conductor 会把合法 report 落盘为 dossier/${id}/review-r${round}.json，并且只信该文件。`,
   ].filter(Boolean).join('\n\n');
 }
 
@@ -1208,6 +1415,7 @@ export async function runCommitterProposal(ts, cfg) {
     const check = validateCommitMessage(parseStrictJson(res.result));
     if (check.ok) {
       state.appendTimeline(cfg, id, `committer 提案 a${attempt} 有效：${check.subject}`);
+      state.appendEvent(cfg, id, 'committer_attempt', { attempt, outcome: 'valid' });
       return `${check.subject}\n\n${check.body}`;
     }
     // 失败归因分两类：模型在输出提案前耗尽轮次（result 为空，subtype=error_max_turns）与提案本身
@@ -1215,13 +1423,16 @@ export async function runCommitterProposal(ts, cfg) {
     const noProposal = !res.result?.trim() && res.raw?.subtype === 'error_max_turns';
     if (noProposal) {
       state.appendTimeline(cfg, id, `committer 提案 a${attempt} invalid：轮次耗尽未输出提案（error_max_turns）`);
+      state.appendEvent(cfg, id, 'committer_attempt', { attempt, outcome: 'invalid', invalid_kind: 'turns_exhausted' });
       prompt += '\n\n# 上一轮失败：你在输出提案前耗尽了轮次\n本轮**禁止调用任何工具**，直接基于上文已给的材料输出严格 JSON 提案。';
     } else {
       state.appendTimeline(cfg, id, `committer 提案 a${attempt} invalid：${check.errors.join('; ')}`);
+      state.appendEvent(cfg, id, 'committer_attempt', { attempt, outcome: 'invalid', invalid_kind: 'malformed' });
       prompt += `\n\n# 上一轮提案校验失败（必须全部修复后重出）\n${check.errors.map((e) => `- ${e}`).join('\n')}`;
     }
   }
   state.appendTimeline(cfg, id, 'committer 提案两次 invalid，merge 降级机器文案');
+  state.appendEvent(cfg, id, 'committer_degraded', {});
   return null;
 }
 
@@ -1321,14 +1532,11 @@ export async function runMakerRound(ts, cfg, round, { mode, prompt, coldPrompt, 
   if (res.retriesExhausted) {
     state.appendTimeline(cfg, id, `maker r${round} transient retries exhausted`);
   }
-  if (res.costUnknown) {
-    state.appendTimeline(cfg, id, `maker r${round} cost unknown; spent_usd uses lower-bound accounting`);
-  }
 
   const marker = finishSpawnRecord(rec, res); // done 标记收尾 + 原始 CLI JSON 留档
 
   if (res.sessionId) ts.runtime.maker_session_id = res.sessionId;
-  addCost(ts, res.costUsd, cfg);
+  accountSpawnCost(ts, cfg, 'maker', round, res);
   state.saveRuntime(ts); // 产物（cost/session）先落盘，stage 仍未动
   state.appendTimeline(cfg, id, `maker r${round} done (ok=${res.ok}, cost=$${res.costUsd})`);
 
