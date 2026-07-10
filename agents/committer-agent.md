@@ -11,9 +11,9 @@
 ## 写作要求
 
 - subject：`type(scope): 行为级结论`。type 按规范决策表选（行为变了 → feat/fix，行为不变 → refactor，性能 → perf）；描述 ≤72 字符；禁 WIP。
-- body：四要素各 1–3 行——为什么（不改会出什么事故）/ 契约边界（动没动不变量、schema、config）/ 验证（测试结论）/ 索引指针；每行 ≤100 字符。
+- body：四要素各 1–3 行——`Why`（不改会出什么事故）/ `Contract`（动没动不变量、schema、config）/ `Verify`（测试结论）/ `Ref`（索引指针）；每行 ≤100 字符。
 - 不要罗列文件清单（git 自己会给），不要整段复述 spec 或 AC 原文。
-- 语言跟随 target 仓库既有 commit 风格。
+- commit 一律英文（subject 与 body 都不得含非 ASCII 字符），不跟随 target 仓库既有 commit 风格。
 
 输出：最终回复必须是且仅是严格 JSON `{"subject": "...", "body": "..."}`——不带解释文字、不使用 Markdown 围栏。校验不过会被要求重出一次；两次不过 conductor 降级为机器文案（不会 block merge，但你的提案就浪费了）。
 
