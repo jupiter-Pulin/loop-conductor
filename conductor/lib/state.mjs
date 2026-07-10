@@ -216,6 +216,20 @@ export function appendTimeline(cfg, id, msg) {
   writeFileAtomic(p, `${existing}- ${new Date().toISOString()} ${msg}\n`);
 }
 
+/**
+ * H17 结构化事件流（config `eventsLogEnabled`，默认关）：dossier/<id>/events.jsonl 逐行追加
+ * `{ ts, type, ...fields }`。机器消费面（dossier-stats 等）读这里，timeline.md 回归纯人读。
+ * best-effort：事件是观测面，写失败绝不打断状态机（全吞）；状态决策绝不解析它。
+ */
+export function appendEvent(cfg, id, type, fields = {}) {
+  if (cfg?.eventsLogEnabled !== true) return;
+  try {
+    const p = dossierPath(cfg, id, 'events.jsonl');
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.appendFileSync(p, `${JSON.stringify({ ts: new Date().toISOString(), type, ...fields })}\n`);
+  } catch { /* 观测面绝不打断主链 */ }
+}
+
 // ---- 状态转移（先产物后状态的「最后一步」） ----
 
 /**
@@ -237,6 +251,7 @@ export function transitionState(ts, cfg, nextStage, note, extra = {}) {
     }
   }
   appendTimeline(cfg, ts.id, `stage → ${nextStage}${note ? ` (${note})` : ''}`);
+  appendEvent(cfg, ts.id, 'stage', { stage: nextStage, note: note ?? null });
 }
 
 /**

@@ -25,6 +25,22 @@ function listTaskIds(boxDir) {
   }
 }
 
+/** 读 dossier/<id>/events.jsonl（H17 结构化事件流）。缺失返回 []；半行截断逐行容错。 */
+function readEvents(dossierDir) {
+  let text;
+  try {
+    text = fs.readFileSync(path.join(dossierDir, 'events.jsonl'), 'utf8');
+  } catch {
+    return [];
+  }
+  const events = [];
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    try { events.push(JSON.parse(line)); } catch { /* 截断残行忽略 */ }
+  }
+  return events;
+}
+
 /** 收集单任务：state 快照 + dossier 轮次证据。缺文件一律容错（历史任务布局可能不全）。 */
 export function collectTask(root, box, id) {
   const stateDir = path.join(root, 'state', box, id);
@@ -70,15 +86,28 @@ export function collectTask(root, box, id) {
     }
   }
 
-  // committer 提案有效性以 timeline 文案为准（validateCommitMessage 结果不单独落盘）
+  // committer 提案有效性：优先读结构化事件流（H17，events.jsonl）；legacy 任务（无事件文件
+  // 或无 committer 事件）回退 timeline 文案 grep（E8 口径，保持历史 11 任务可比）。
   let committerValidAttempt = null;
   let committerDegraded = false;
-  try {
-    const timeline = fs.readFileSync(path.join(dossierDir, 'timeline.md'), 'utf8');
-    const valid = timeline.match(/committer 提案 a(\d+) 有效/);
-    if (valid) committerValidAttempt = Number(valid[1]);
-    committerDegraded = timeline.includes('降级机器文案');
-  } catch { /* timeline 缺失 */ }
+  let sawCommitterEvents = false;
+  for (const ev of readEvents(dossierDir)) {
+    if (ev.type === 'committer_attempt') {
+      sawCommitterEvents = true;
+      if (ev.outcome === 'valid' && committerValidAttempt === null) committerValidAttempt = ev.attempt ?? null;
+    } else if (ev.type === 'committer_degraded') {
+      sawCommitterEvents = true;
+      committerDegraded = true;
+    }
+  }
+  if (!sawCommitterEvents) {
+    try {
+      const timeline = fs.readFileSync(path.join(dossierDir, 'timeline.md'), 'utf8');
+      const valid = timeline.match(/committer 提案 a(\d+) 有效/);
+      if (valid) committerValidAttempt = Number(valid[1]);
+      committerDegraded = timeline.includes('降级机器文案');
+    } catch { /* timeline 缺失 */ }
+  }
 
   return {
     id,

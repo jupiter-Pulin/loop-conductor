@@ -9,17 +9,15 @@ import path from 'node:path';
 import { runClaude } from '../lib/claude.mjs';
 import * as state from '../lib/state.mjs';
 import { validateFeasibilityDoc } from '../lib/feasibility-contract.mjs';
-import { taskCfg } from '../lib/task-cfg.mjs';
 import { needsFeasibilityAction, feasibilityContractInvalidNext } from './decisions.mjs';
 import {
-  addCost, archiveFeasibilityDraft, budgetExceeded, buildFeasibilityPrompt, failToBox,
+  accountSpawnCost, archiveFeasibilityDraft, budgetExceeded, buildFeasibilityPrompt, failToBox,
   feasibilityDraftPath, FEASIBILITY_AGENT_TOOLS, nextRoleRound, runFeasibilityContractGate,
-  startSpawnRecord, finishSpawnRecord, writeFeasibilityAgentSettings, canStartSpawn,
+  startSpawnRecord, finishSpawnRecord, writeFeasibilityAgentSettings, canStartSpawn, acquireSpecChainCwd,
 } from './shared.mjs';
 
 export default async function needsFeasibilityHandler(ts, cfg) {
   const id = ts.id;
-  const tRepo = taskCfg(ts, cfg).targetRepo;
   const draftPath = feasibilityDraftPath(ts);
   let action = needsFeasibilityAction(fs.existsSync(draftPath), ts.runtime.feasibility_approval ?? null);
 
@@ -50,21 +48,26 @@ export default async function needsFeasibilityHandler(ts, cfg) {
     const rec = startSpawnRecord(cfg, id, 'feasibility-agent', round, {
       stream_file: path.relative(cfg.root, streamFile),
     });
-    const res = await runClaude({
-      cwd: tRepo,
-      prompt: buildFeasibilityPrompt(ts, cfg, round),
-      maxTurns: cfg.maxTurns,
-      model: cfg.models?.feasibility ?? null,
-      tools: FEASIBILITY_AGENT_TOOLS,
-      allowedTools: FEASIBILITY_AGENT_TOOLS,
-      settings,
-      streamFile,
-      inactivityTimeoutMs: cfg.inactivityTimeoutMs,
-      wallClockMs: cfg.spawnWallClockMs,
-    });
+    const iso = acquireSpecChainCwd(ts, cfg, 'feasibility-agent');
+    let res;
+    try {
+      res = await runClaude({
+        cwd: iso.cwd,
+        prompt: buildFeasibilityPrompt(ts, cfg, round),
+        maxTurns: cfg.maxTurns,
+        model: cfg.models?.feasibility ?? null,
+        tools: FEASIBILITY_AGENT_TOOLS,
+        allowedTools: FEASIBILITY_AGENT_TOOLS,
+        settings,
+        streamFile,
+        inactivityTimeoutMs: cfg.inactivityTimeoutMs,
+        wallClockMs: cfg.spawnWallClockMs,
+      });
+    } finally {
+      iso.cleanup();
+    }
     finishSpawnRecord(rec, res);
-    addCost(ts, res.costUsd, cfg);
-    if (res.costUnknown) state.appendTimeline(cfg, id, `feasibility-agent r${round} cost unknown; spent_usd uses lower-bound accounting`);
+    accountSpawnCost(ts, cfg, 'feasibility-agent', round, res);
     if (!res.ok) {
       state.saveRuntime(ts);
       state.appendTimeline(cfg, id, `feasibility-agent spawn failed: ${res.error ?? 'unknown'}`);
@@ -104,6 +107,12 @@ export default async function needsFeasibilityHandler(ts, cfg) {
 
   if (action === 'skip-spawn' && !ts.runtime.current_feasibility_round) {
     ts.runtime.current_feasibility_round = nextRoleRound(cfg, id, 'feasibility-agent') - 1 || 1;
+  }
+  // probe 链（H26）：调查报告即最终交付，人读后 close 归档——不进 option 点名闸门。
+  if (ts.task.kind === 'probe') {
+    state.transitionState(ts, cfg, 'AWAIT_PROBE_CLOSE', action === 'skip-spawn' ? 'probe 报告已存在' : 'probe 报告就绪');
+    console.log(`[${id}] probe 调查报告就绪：${path.relative(cfg.root, draftPath)}（人读后 conductor close ${id} 归档）`);
+    return { changed: true };
   }
   state.transitionState(ts, cfg, 'AWAIT_FEASIBILITY_APPROVAL', action === 'skip-spawn' ? 'feasibility 草稿已存在' : 'feasibility 草稿就绪');
   console.log(`[${id}] feasibility memo 进入人审闸门：${path.relative(cfg.root, draftPath)}（approve-feasibility ${id} --option O-X）`);
