@@ -1,24 +1,28 @@
 {
-  "budgetUsd": 5,
-  "maxTurns": 30,
-  "testCommand": "node --test",
-  "targetRepo": "./target",
+  "budgetUsd": 100,
+  "maxTurns": 70,
+  "testCommand": "npm test",
+  "targetRepo": ".",
   "feasibilityEnabled": false,
   "models": {
-    "setup": null,
-    "feasibility": null,
-    "spec": null,
-    "specVerifier": null,
-    "maker": null,
-    "verifier": null,
-    "committer": null
+    "setup": "claude-sonnet-5",
+    "feasibility": "claude-opus-4-8",
+    "spec": "claude-opus-4-8",
+    "specVerifier": "claude-opus-4-8",
+    "maker": "claude-sonnet-5",
+    "verifier": "claude-opus-4-8",
+    "committer": "claude-sonnet-5",
+    "reviewer": "claude-sonnet-5"
   },
-  "spawnRetries": 4,
+  "reviewStage": "shadow",
+  "spawnRetries": 6,
   "spawnBackoffMs": [
     15000,
     30000,
     60000,
-    120000
+    120000,
+    300000,
+    600000
   ],
   "maxConcurrentTasks": 3,
   "inactivityTimeoutMs": 600000,
@@ -26,5 +30,20 @@
   "greenGateTimeoutMs": 1800000,
   "lockHeartbeatMs": 60000,
   "maxStepsPerTask": 20,
-  "runBudgetUsd": null
+  "runBudgetUsd": null,
+  "verifierShadowEnabled": true,
+  "verifierShadowBackend": "codex-exec",
+  "verifierShadowModel": null,
+  "verifierShadowTimeoutMs": 1800000,
+  "verifierEvidenceAnchorsMode": "observe",
+  "testChangeGuardEnabled": true,
+  "eventsLogEnabled": true,
+  "specChainIsolationEnabled": true,
+  "unknownSpawnCostEstimateEnabled": true,
+  "specMaxAcs": 12,
+  "autoMergeEnabled": false,
+  "autoMergeKinds": ["bugfix"],
+  "autoMergeMaxDiffLines": 400,
+  "autoMergeMaxAcs": 8,
+  "autoMergeDeniedPaths": ["conductor/", "package.json", ".github/", "agents/", "conductor.config.json", ".claude/"]
 }

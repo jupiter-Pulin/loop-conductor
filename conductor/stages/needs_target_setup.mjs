@@ -7,7 +7,7 @@ import { hasApprovedSetupProfile, setupProfilePaths } from '../lib/profile.mjs';
 import { taskCfg } from '../lib/task-cfg.mjs';
 import * as state from '../lib/state.mjs';
 import {
-  addCost, budgetExceeded, buildSetupPrompt, entryStageAfterSetup, failToBox,
+  accountSpawnCost, budgetExceeded, buildSetupPrompt, entryStageAfterSetup, failToBox,
   finishSpawnRecord, nextRoleRound, READONLY_TOOLS, startSpawnRecord, canStartSpawn,
 } from './shared.mjs';
 
@@ -62,9 +62,8 @@ export default async function needsTargetSetupHandler(ts, cfg) {
       wallClockMs: cfg.spawnWallClockMs,
     });
     finishSpawnRecord(rec, res);
-    addCost(ts, res.costUsd, cfg);
+    accountSpawnCost(ts, cfg, 'setup', round, res);
     state.saveRuntime(ts);
-    if (res.costUnknown) state.appendTimeline(cfg, id, `setup r${round} cost unknown; spent_usd uses lower-bound accounting`);
     if (!res.ok || !res.result?.trim()) {
       state.appendTimeline(cfg, id, `setup-agent failed: ${res.error ?? 'empty result'}`);
       console.error(`[${id}] setup-agent 失败（${res.error ?? 'empty result'}），任务停留在 NEEDS_TARGET_SETUP`);

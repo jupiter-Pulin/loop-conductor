@@ -7,7 +7,7 @@ import {
   fixingMode, parseStrictJson, specMissNext, specVerifierInvalidNext,
   needsFeasibilityAction, feasibilityApprovalNext, feasibilityContractInvalidNext,
   validateSpecVerifierVerdict, validateVerifierVerdict, MAX_MISS, STAGES,
-  sameSignatureStreak,
+  sameSignatureStreak, checkEvidenceAnchors, validateReviewReport,
 } from '../../conductor/stages/decisions.mjs';
 
 test('markerStatus：双标记四态', () => {
@@ -388,4 +388,148 @@ test('sameSignatureStreak：undefined（旧记录/无签名）打断连续', () 
   assert.equal(sameSignatureStreak(['A', undefined, 'A']), 1, '紧邻的 undefined 打断连续');
   assert.equal(sameSignatureStreak(['A', 'A', undefined]), 1, '尾元素本身 undefined，只算自身长度 1');
   assert.equal(sameSignatureStreak([undefined, undefined]), 1, '两个 undefined 不视为彼此相等');
+});
+
+// ---- checkEvidenceAnchors（H15）：hard=客观幻觉，soft=diff 外引用（合法，只观测） ----
+
+function anchorVerdict(criteria) {
+  return { schema_version: 1, round: 1, overall: 'pass', criteria_results: criteria, non_ac_findings: [] };
+}
+
+test('checkEvidenceAnchors：hard/soft 分类全谱', () => {
+  const verdict = anchorVerdict([
+    {
+      ac_id: 'AC-001',
+      status: 'pass',
+      reason: 'ok',
+      evidence: [
+        { type: 'code', file: 'lib/a.mjs', summary: 's', start_line: 3, end_line: 10 },   // 在 diff 内、行数内 → 无记录
+        { type: 'code', file: 'lib/gone.mjs', summary: 's', start_line: 1, end_line: 2 }, // 哪都不存在 → hard file_missing
+      ],
+    },
+    {
+      ac_id: 'AC-002',
+      status: 'pass',
+      reason: 'ok',
+      evidence: [
+        { type: 'code', file: 'lib/a.mjs', summary: 's', start_line: 9, end_line: 11 },   // 越界（10 行）→ hard line_out_of_range
+        { type: 'code', file: 'README.md', summary: 's', start_line: 1, end_line: 2 },    // 存在但 diff 外 → soft outside_diff
+        { type: 'code', file: '../etc/passwd', summary: 's', start_line: 1, end_line: 1 }, // 越狱路径 → hard unsafe_path（index 侧标注）
+      ],
+    },
+  ]);
+  const index = {
+    'lib/a.mjs': { lines: 10, in_diff: true },
+    'README.md': { lines: 3, in_diff: false },
+    '../etc/passwd': { lines: null, in_diff: false, missing_reason: 'unsafe_path' },
+    // lib/gone.mjs 故意不在 index：调用方解析不到 → 视同 lines null
+  };
+  const { hard, soft } = checkEvidenceAnchors(verdict, index);
+  assert.equal(hard.length, 3);
+  assert.deepEqual(hard.map((h) => [h.ac_id, h.file, h.reason]), [
+    ['AC-001', 'lib/gone.mjs', 'file_missing'],
+    ['AC-002', 'lib/a.mjs', 'line_out_of_range'],
+    ['AC-002', '../etc/passwd', 'unsafe_path'],
+  ]);
+  assert.equal(hard[1].file_lines, 10, '越界记录附真实行数');
+  assert.equal(soft.length, 1);
+  assert.deepEqual([soft[0].ac_id, soft[0].file, soft[0].reason], ['AC-002', 'README.md', 'outside_diff']);
+});
+
+test('checkEvidenceAnchors：边界不炸——空 evidence（unknown）、行号恰等行数、空 verdict', () => {
+  const okVerdict = anchorVerdict([
+    { ac_id: 'AC-001', status: 'unknown', reason: 'n/a', evidence: [] },
+    { ac_id: 'AC-002', status: 'pass', reason: 'ok', evidence: [{ type: 'code', file: 'f.mjs', summary: 's', start_line: 10, end_line: 10 }] },
+  ]);
+  const r = checkEvidenceAnchors(okVerdict, { 'f.mjs': { lines: 10, in_diff: true } });
+  assert.equal(r.hard.length + r.soft.length, 0, 'end_line == 行数是合法锚定');
+  const empty = checkEvidenceAnchors(undefined, undefined);
+  assert.deepEqual(empty, { hard: [], soft: [] });
+});
+
+// ---- validateReviewReport（H21）：review-diff/v1 契约移植 + gate 机械推导 ----
+
+const REVIEW_ACS = ['AC-001', 'AC-002'];
+
+function reviewReport(over = {}) {
+  return {
+    schemaVersion: 1,
+    stage: 'review-diff',
+    gate: 'ready',
+    findings: [],
+    acCoverage: [
+      { acId: 'AC-001', status: 'pass', evidence: 'diff 第 8 行取平均' },
+      { acId: 'AC-002', status: 'pass', evidence: '探针 falsifies' },
+    ],
+    tests: { run: [], suggested: [] },
+    residualRisk: false,
+    ...over,
+  };
+}
+
+function p1Finding() {
+  return {
+    severity: 'P1', file: 'lib/stats.mjs', line: 8, title: '空数组未防护',
+    impact: 'median([]) 返回 NaN 而非抛错', trigger: '空数组输入',
+    evidence: 'diff 未见空输入分支', fix: '入口加空数组守卫',
+  };
+}
+
+test('validateReviewReport：合法 ready 报告 → ok + 机械推导 metrics/blockers', () => {
+  const r = validateReviewReport(reviewReport(), REVIEW_ACS);
+  assert.equal(r.ok, true, JSON.stringify(r.errors ?? []));
+  assert.equal(r.report.gate, 'ready');
+  assert.deepEqual(r.report.blockers, []);
+  assert.equal(r.report.metrics.p1, 0);
+});
+
+test('validateReviewReport：gate 是机械推导——P1 声明 ready 拒收；blocked 声明一致才过', () => {
+  const bad = validateReviewReport(reviewReport({ findings: [p1Finding()] }), REVIEW_ACS);
+  assert.equal(bad.ok, false);
+  assert.ok(bad.errors.some((e) => e.includes("gate 必须为机械推导值 'blocked'")));
+
+  const good = validateReviewReport(
+    reviewReport({ findings: [p1Finding()], gate: 'blocked' }), REVIEW_ACS,
+  );
+  assert.equal(good.ok, true, JSON.stringify(good.errors ?? []));
+  assert.deepEqual(good.report.blockers, [{ code: 'P1_FINDINGS', count: 1 }]);
+
+  // 仅 P2 / residualRisk → ready_with_concerns
+  const concerns = validateReviewReport(
+    reviewReport({ residualRisk: true, gate: 'ready_with_concerns' }), REVIEW_ACS,
+  );
+  assert.equal(concerns.ok, true);
+  assert.equal(concerns.report.gate, 'ready_with_concerns');
+});
+
+test('validateReviewReport：finding 七字段 / acCoverage 覆盖纪律 / tests 形态逐项拒收', () => {
+  const missingField = validateReviewReport(
+    reviewReport({ findings: [{ ...p1Finding(), fix: '' , line: 0 }], gate: 'blocked' }), REVIEW_ACS,
+  );
+  assert.equal(missingField.ok, false);
+  assert.ok(missingField.errors.some((e) => e.includes('.fix 必须非空')));
+  assert.ok(missingField.errors.some((e) => e.includes('.line 必须是正整数')));
+
+  const acProblems = validateReviewReport(
+    reviewReport({
+      acCoverage: [
+        { acId: 'AC-001', status: 'pass', evidence: 'x' },
+        { acId: 'AC-001', status: 'pass', evidence: 'x' }, // 重复
+        { acId: 'AC-999', status: 'pass', evidence: 'x' }, // 多余
+      ],
+    }), REVIEW_ACS,
+  );
+  assert.equal(acProblems.ok, false);
+  assert.ok(acProblems.errors.some((e) => e.includes('重复')));
+  assert.ok(acProblems.errors.some((e) => e.includes('多余 AC：AC-999')));
+  assert.ok(acProblems.errors.some((e) => e.includes('缺 AC：AC-002')));
+
+  const badTests = validateReviewReport(
+    reviewReport({ tests: { run: [{ command: '', status: 'maybe' }], suggested: [] } }), REVIEW_ACS,
+  );
+  assert.equal(badTests.ok, false);
+  assert.ok(badTests.errors.some((e) => e.includes('tests.run[1].command')));
+  assert.ok(badTests.errors.some((e) => e.includes('tests.run[1].status')));
+
+  assert.equal(validateReviewReport(null, REVIEW_ACS).ok, false);
 });

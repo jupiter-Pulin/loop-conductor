@@ -135,3 +135,28 @@ export function diffStatAgainstBase(wtPath, baseBranch) {
   if (r.status === 0) return r.stdout;
   return git(['diff', '--stat', 'HEAD'], wtPath).stdout ?? '';
 }
+
+/** 同上的 --numstat（每行 added\tdeleted\tpath；二进制为 -\t-；H33 自动合并规模判定用）。 */
+export function diffNumstatAgainstBase(wtPath, baseBranch) {
+  const r = git(['diff', '--numstat', `${baseBranch}...HEAD`], wtPath);
+  if (r.status === 0) return r.stdout;
+  return git(['diff', '--numstat', 'HEAD'], wtPath).stdout ?? '';
+}
+
+/** 解析 --name-status 输出中出现过的全部路径（rename/copy 的旧新两侧都算；H15 锚定用）。 */
+export function parseNameStatusPaths(text) {
+  const files = new Set();
+  for (const line of (text ?? '').split('\n')) {
+    if (line.trim() === '') continue;
+    for (const col of line.split('\t').slice(1)) {
+      if (col.trim() !== '') files.add(col.trim());
+    }
+  }
+  return files;
+}
+
+/** 读 ref 上某文件内容（evidence 引用已删除/改名旧路径时锚定 base 版本用）。不存在返回 null。 */
+export function showFileAtRef(wtPath, ref, file) {
+  const r = git(['show', `${ref}:${file}`], wtPath);
+  return r.status === 0 ? r.stdout : null;
+}
