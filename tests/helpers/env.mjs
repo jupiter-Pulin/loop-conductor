@@ -138,6 +138,7 @@ export function makeEnv(t, { config = {}, trackedHarness = false } = {}) {
       targetRepo = path.join(root, 'target'), // 任务级 targetRepo 快照；缺省与 cfg.targetRepo 一致
       bodyAc,        // 自定义 spec.md 草稿正文（含 ## 验收标准）；不给用默认
       specDraft,     // 直接给 spec.md 全文（优先于 bodyAc）
+      gateCommands,  // 不传 = task.json 完全不含该字段（区别于显式空数组，AC-1/AC-5 靠这个区分）
     } = {}) {
       const dir = path.join(queueDir, id);
       fs.mkdirSync(dir, { recursive: true });
@@ -150,6 +151,7 @@ export function makeEnv(t, { config = {}, trackedHarness = false } = {}) {
         targetRepo,
         baseBranch,
         testCommand,
+        ...(gateCommands !== undefined ? { gateCommands } : {}),
         created_at: '2026-06-11T00:00:00.000Z',
       };
       const runtime = {
@@ -173,7 +175,7 @@ export function makeEnv(t, { config = {}, trackedHarness = false } = {}) {
       return dir;
     },
 
-    writeApprovedSetupProfile(markdown = '# Setup Profile\n\n- test: node --test\n', { targetRepo = path.join(root, 'target') } = {}) {
+    writeApprovedSetupProfile(markdown = '# Setup Profile\n\n- test: node --test\n', { targetRepo = path.join(root, 'target'), gateCommands } = {}) {
       const key = setupProfileKey(targetRepo);
       const dir = path.join(root, 'target-profiles', key);
       fs.mkdirSync(dir, { recursive: true });
@@ -185,6 +187,7 @@ export function makeEnv(t, { config = {}, trackedHarness = false } = {}) {
         approved: true,
         approved_at: '2026-06-11T00:00:00.000Z',
         source_task_id: 'test',
+        ...(gateCommands !== undefined ? { gateCommands } : {}),
       }, null, 2)}\n`);
       return dir;
     },

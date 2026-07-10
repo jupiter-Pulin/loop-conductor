@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   readRejectNotes, buildRepairContext, writeGreenGateResult, readGreenGateSignatures,
+  gateCommandName, writeGateCommandResult,
 } from '../../conductor/stages/shared.mjs';
 
 /** 造一个含 reject_notes.md 的临时任务目录，返回 { dir } 形态的 ts。 */
@@ -128,6 +129,54 @@ test('writeGreenGateResult：绿门通过（exit 0）不写 signature', (t) => {
   assert.equal(rec.signature, undefined);
   const onDisk = JSON.parse(fs.readFileSync(path.join(cfg.dossierDir, 'task-x', 'green-gate-r1.json'), 'utf8'));
   assert.equal(onDisk.signature, undefined);
+});
+
+test('gateCommandName：从命令文本稳定派生 slug（AC-4）', () => {
+  assert.equal(gateCommandName('npm run typecheck'), 'npm-run-typecheck');
+  assert.equal(gateCommandName('npm run typecheck'), gateCommandName('npm run typecheck'), '同一命令稳定派生同一 name');
+  assert.equal(gateCommandName('  yarn  build  '), 'yarn-build');
+  assert.equal(gateCommandName(''), 'cmd', '空命令兜底 cmd，不产出空文件名');
+  assert.ok(gateCommandName('a'.repeat(200)).length <= 60, 'name 有长度上限，防离谱文件名');
+});
+
+test('writeGateCommandResult：字段与 green-gate-r<n>.json 同构，文件名含派生 name 与轮次（AC-4）', (t) => {
+  const cfg = makeGreenGateCfg(t);
+  const rec = writeGateCommandResult(cfg, 'task-x', 2, {
+    command: 'npm run typecheck',
+    exitCode: 1,
+    timedOut: false,
+    stdout: '',
+    stderr: 'error TS2322: type mismatch',
+    startedAt: '2026-01-01T00:00:00.000Z',
+    finishedAt: '2026-01-01T00:00:01.000Z',
+  });
+  assert.equal(rec.command, 'npm run typecheck');
+  assert.equal(rec.exit_code, 1);
+  assert.equal(rec.round, 2);
+  assert.equal(rec.name, 'npm-run-typecheck');
+  assert.match(rec.stderr_tail, /type mismatch/);
+  const onDiskPath = path.join(cfg.dossierDir, 'task-x', 'gate-npm-run-typecheck-r2.json');
+  assert.ok(fs.existsSync(onDiskPath), '落盘文件名 = gate-<name>-r<round>.json');
+  const onDisk = JSON.parse(fs.readFileSync(onDiskPath, 'utf8'));
+  assert.equal(onDisk.command, rec.command);
+  assert.equal(onDisk.exit_code, 1);
+});
+
+test('buildRepairContext(green_gate)：refFile/instruction 可覆盖，供 gateCommands 复用同一回喂通道（AC-3）', () => {
+  const ctx = buildRepairContext({
+    source: 'green_gate', round: 1,
+    refFile: 'gate-npm-run-typecheck-r1.json',
+    instruction: 'Fix the failing gate command so it exits 0.',
+  });
+  assert.equal(ctx.green_gate_ref, 'gate-npm-run-typecheck-r1.json');
+  assert.equal(ctx.instruction, 'Fix the failing gate command so it exits 0.');
+  assert.equal(ctx.green_gate, null);
+});
+
+test('buildRepairContext(green_gate)：不传 refFile/instruction 时默认行为不变（AC-5 不变量的单测侧覆盖）', () => {
+  const ctx = buildRepairContext({ source: 'green_gate', round: 3 });
+  assert.equal(ctx.green_gate_ref, 'green-gate-r3.json');
+  assert.equal(ctx.instruction, 'Fix the failing tests so the test command exits 0. Keep unrelated code intact.');
 });
 
 test('readGreenGateSignatures：无 signature 字段的旧记录/缺失记录读取不报错，记为 undefined（AC-003）', (t) => {
