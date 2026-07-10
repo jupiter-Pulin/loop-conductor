@@ -62,6 +62,37 @@ export function classifyTestFileChanges(nameStatus, globs) {
   return { copy, remove };
 }
 
+/**
+ * H16 测试改动守卫：从 name-status 挑出「既有测试文件」被动过的痕迹——
+ * M/T → modified、D → deleted、R → renamed（旧或新路径任一命中测试 glob 都算：
+ * 改名进/出测试目录同样可疑）。A/C（新增/拷贝出新路径）不入清单：新增测试是期望行为，
+ * 守卫只审计对既有测试的动作。非测试文件一律忽略。观测型口径，消费方绝不据此 block。
+ */
+export function listExistingTestFileChanges(nameStatus, globs) {
+  const modified = [];
+  const deleted = [];
+  const renamed = [];
+  for (const line of String(nameStatus ?? '').split('\n')) {
+    if (!line.trim()) continue;
+    const parts = line.split('\t');
+    const status = parts[0];
+    if (status.startsWith('C')) continue; // copy：旧路径原样保留，既有侧无损
+    if (status.startsWith('R')) {
+      const [, oldPath, newPath] = parts;
+      if ((oldPath && matchesTestGlobs(oldPath, globs)) || (newPath && matchesTestGlobs(newPath, globs))) {
+        renamed.push({ from: oldPath, to: newPath });
+      }
+      continue;
+    }
+    const p = parts[1];
+    if (!p || !matchesTestGlobs(p, globs)) continue;
+    if (status.startsWith('D')) deleted.push(p);
+    else if (status.startsWith('M') || status.startsWith('T')) modified.push(p);
+    // A：新增测试不入守卫清单
+  }
+  return { modified, deleted, renamed };
+}
+
 // ---- 约定 2（B 批）：maker 交付的 AC→测试映射（per-AC 定向探针的输入） ----
 
 /** 映射文件在任务 worktree 内的相对路径（约定即常量，不新增配置项；harness exclude 已覆盖）。 */

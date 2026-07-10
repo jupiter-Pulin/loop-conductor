@@ -1,5 +1,5 @@
-// NEEDS_SPEC（feature 专用）：spawn spec-agent（只读探索 + 受限写，cwd=targetRepo，
-// hook 护栏经 --settings 注入）→ agent 直写 specs/<id>.md → conductor 契约门终审
+// NEEDS_SPEC（feature 专用）：spawn spec-agent（只读探索 + 受限写，cwd=targetRepo 或
+// H19 隔离 worktree，hook 护栏经 --settings 注入）→ agent 直写 specs/<id>.md → conductor 契约门终审
 // （spec-doc/v1）→ SPEC_VERIFY。
 // 契约门 fail：留在 NEEDS_SPEC 原地重试（草稿归档、错误进下轮 prompt），超额收箱。
 // 幂等：specs/<id>.md 已存在且未被打回且过契约门 → 跳过 spawn；未过（崩溃残留半成品）→
@@ -9,17 +9,15 @@ import path from 'node:path';
 import { runClaude } from '../lib/claude.mjs';
 import * as state from '../lib/state.mjs';
 import { validateSpecDoc } from '../lib/spec-contract.mjs';
-import { taskCfg } from '../lib/task-cfg.mjs';
 import { needsSpecAction, specContractInvalidNext } from './decisions.mjs';
 import {
-  addCost, archiveSpecDraft, budgetExceeded, buildSpecAgentPrompt, failToBox,
+  accountSpawnCost, archiveSpecDraft, budgetExceeded, buildSpecAgentPrompt, failToBox,
   nextRoleRound, runSpecContractGate, SPEC_AGENT_TOOLS, specDraftPath,
-  startSpawnRecord, finishSpawnRecord, writeSpecAgentSettings, canStartSpawn,
+  startSpawnRecord, finishSpawnRecord, writeSpecAgentSettings, canStartSpawn, acquireSpecChainCwd,
 } from './shared.mjs';
 
 export default async function needsSpecHandler(ts, cfg) {
   const id = ts.id;
-  const tRepo = taskCfg(ts, cfg).targetRepo;
   const specPath = specDraftPath(cfg, id);
   let action = needsSpecAction(fs.existsSync(specPath), ts.runtime.approval ?? null);
 
@@ -51,21 +49,26 @@ export default async function needsSpecHandler(ts, cfg) {
       mode: 'draft',
       stream_file: path.relative(cfg.root, streamFile),
     });
-    const res = await runClaude({
-      cwd: tRepo,
-      prompt: buildSpecAgentPrompt(ts, cfg, round, { mode: 'draft' }),
-      maxTurns: cfg.maxTurns,
-      model: cfg.models?.spec ?? null,
-      tools: SPEC_AGENT_TOOLS,
-      allowedTools: SPEC_AGENT_TOOLS,
-      settings,
-      streamFile,
-      inactivityTimeoutMs: cfg.inactivityTimeoutMs,
-      wallClockMs: cfg.spawnWallClockMs,
-    });
+    const iso = acquireSpecChainCwd(ts, cfg, 'spec-agent');
+    let res;
+    try {
+      res = await runClaude({
+        cwd: iso.cwd,
+        prompt: buildSpecAgentPrompt(ts, cfg, round, { mode: 'draft' }),
+        maxTurns: cfg.maxTurns,
+        model: cfg.models?.spec ?? null,
+        tools: SPEC_AGENT_TOOLS,
+        allowedTools: SPEC_AGENT_TOOLS,
+        settings,
+        streamFile,
+        inactivityTimeoutMs: cfg.inactivityTimeoutMs,
+        wallClockMs: cfg.spawnWallClockMs,
+      });
+    } finally {
+      iso.cleanup();
+    }
     finishSpawnRecord(rec, res);
-    addCost(ts, res.costUsd, cfg);
-    if (res.costUnknown) state.appendTimeline(cfg, id, `spec-agent r${round} cost unknown; spent_usd uses lower-bound accounting`);
+    accountSpawnCost(ts, cfg, 'spec-agent', round, res);
     if (!res.ok) {
       state.saveRuntime(ts);
       state.appendTimeline(cfg, id, `spec-agent spawn failed: ${res.error ?? 'unknown'}`);

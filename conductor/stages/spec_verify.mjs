@@ -4,18 +4,17 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { runClaudeWithRetry } from '../lib/claude.mjs';
 import * as state from '../lib/state.mjs';
-import { taskCfg } from '../lib/task-cfg.mjs';
 import {
   parseStrictJson, specMissNext, specVerifierInvalidNext, validateSpecVerifierVerdict,
 } from './decisions.mjs';
 import {
-  addCost, archiveSpecDraft, budgetExceeded, buildSpecVerifierPrompt, failToBox,
+  accountSpawnCost, archiveSpecDraft, budgetExceeded, buildSpecVerifierPrompt, failToBox,
   finishSpawnRecord, renderSpecVerifyReport, SPEC_TOOLS, startSpawnRecord, writeSpecRepairContext, canStartSpawn,
+  acquireSpecChainCwd,
 } from './shared.mjs';
 
 export default async function specVerifyHandler(ts, cfg) {
   const id = ts.id;
-  const tRepo = taskCfg(ts, cfg).targetRepo;
   const round = ts.runtime.current_spec_round ?? 0;
   if (round < 1) {
     return failToBox(ts, cfg, 'SPEC_VERIFY 缺 current_spec_round', 'spec_state_invalid');
@@ -37,29 +36,48 @@ export default async function specVerifyHandler(ts, cfg) {
   }
   if (!canStartSpawn(ts, cfg, 'spec-verifier')) return { changed: false };
 
+  // H18 规模闸（软档，config specMaxAcs，null=关）：机械数 AC，超限只注入 prompt 段 +
+  // 留痕，绝不改路由——拆分决定权在人审闸门。
+  let scaleGate = null;
+  if (Number.isFinite(cfg.specMaxAcs)) {
+    let draftMd = '';
+    try { draftMd = fs.readFileSync(specPath, 'utf8'); } catch { /* 上方已验存在性 */ }
+    const acCount = state.extractAcceptanceCriteria(draftMd).length;
+    if (acCount > cfg.specMaxAcs) {
+      scaleGate = { acCount, max: cfg.specMaxAcs };
+      state.appendTimeline(cfg, id, `spec 规模闸（软档）：AC×${acCount} > 阈值 ${cfg.specMaxAcs}，已要求 spec-verifier 附拆分建议（不 block）`);
+      state.appendEvent(cfg, id, 'spec_scale_gate', { round, ac_count: acCount, max: cfg.specMaxAcs });
+    }
+  }
+
   const streamFile = state.dossierPath(cfg, id, `spec-verifier-r${round}.stream.jsonl`);
   const rec = startSpawnRecord(cfg, id, 'spec-verifier', round, {
     stream_file: path.relative(cfg.root, streamFile),
   });
-  const res = await runClaudeWithRetry({
-    cwd: tRepo,
-    prompt: buildSpecVerifierPrompt(ts, cfg, round),
-    maxTurns: cfg.maxTurns,
-    model: cfg.models?.specVerifier ?? null,
-    tools: SPEC_TOOLS,
-    allowedTools: SPEC_TOOLS,
-    streamFile,
-    inactivityTimeoutMs: cfg.inactivityTimeoutMs,
-    wallClockMs: cfg.spawnWallClockMs,
-  }, {
-    retries: cfg.spawnRetries,
-    backoffMs: cfg.spawnBackoffMs,
-    onRetry: ({ attempt, status }) =>
-      state.appendTimeline(cfg, id, `spec-verifier r${round} transient retry attempt ${attempt} (status=${status ?? 'spawn-error'})`),
-  });
+  const iso = acquireSpecChainCwd(ts, cfg, 'spec-verifier');
+  let res;
+  try {
+    res = await runClaudeWithRetry({
+      cwd: iso.cwd,
+      prompt: buildSpecVerifierPrompt(ts, cfg, round, scaleGate),
+      maxTurns: cfg.maxTurns,
+      model: cfg.models?.specVerifier ?? null,
+      tools: SPEC_TOOLS,
+      allowedTools: SPEC_TOOLS,
+      streamFile,
+      inactivityTimeoutMs: cfg.inactivityTimeoutMs,
+      wallClockMs: cfg.spawnWallClockMs,
+    }, {
+      retries: cfg.spawnRetries,
+      backoffMs: cfg.spawnBackoffMs,
+      onRetry: ({ attempt, status }) =>
+        state.appendTimeline(cfg, id, `spec-verifier r${round} transient retry attempt ${attempt} (status=${status ?? 'spawn-error'})`),
+    });
+  } finally {
+    iso.cleanup();
+  }
   finishSpawnRecord(rec, res);
-  addCost(ts, res.costUsd, cfg);
-  if (res.costUnknown) state.appendTimeline(cfg, id, `spec-verifier r${round} cost unknown; spent_usd uses lower-bound accounting`);
+  accountSpawnCost(ts, cfg, 'spec-verifier', round, res);
   state.saveRuntime(ts);
 
   if (!res.ok) {
