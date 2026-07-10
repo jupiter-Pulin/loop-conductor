@@ -19,7 +19,7 @@ import { FEASIBILITY_DOC_CONTRACT, validateFeasibilityDoc } from '../lib/feasibi
 import { buildSignature } from '../lib/failure-signature.mjs';
 import {
   overBudget, testGateVerdict, perAcProbeVerdict, perAcGateVerdict, greenGatePassed,
-  parseStrictJson, validateCommitMessage, verifierVerdictSkeleton, reviewReportSkeleton,
+  parseStrictJson, validateCommitMessage, verifierVerdictSkeleton, resolveGateCommands, reviewReportSkeleton,
   SPEC_VERIFIER_CONTRACT, VERIFIER_VERDICT_CONTRACT, COMMIT_MESSAGE_CONTRACT, REVIEW_REPORT_CONTRACT,
 } from './decisions.mjs';
 
@@ -203,6 +203,76 @@ export function readGreenGateSignatures(cfg, id, uptoRound) {
   return sigs;
 }
 
+// ---- gateCommands（可选）：green gate 通过后，在同一 worktree 按序跑 typecheck/build/boot 类命令
+// （task-20260708-005）。缺省/空数组时完全不进入本节代码路径（AC-5：与旧版逐字节等价）。
+
+/** gateCommands 落盘文件名的稳定派生：命令文本 slugify，供 gate-<name>-r<n>.json 命名（AC-4）。 */
+export function gateCommandName(command) {
+  const slug = String(command ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return (slug || 'cmd').slice(0, 60);
+}
+
+/**
+ * gateCommands 解析（AC-1）：task.json 显式值优先，否则退回 target-profile 默认
+ * （approved setup profile 的 setup-profile.json meta.gateCommands，可选字段）。
+ */
+export function resolveGateCommandsForTask(ts, cfg) {
+  const meta = readApprovedSetupProfile(taskCfg(ts, cfg))?.meta;
+  return resolveGateCommands(ts.task, meta?.gateCommands);
+}
+
+/** 写 gate-<name>-r<n>.json（AC-4）：字段与 green-gate-r<n>.json 同构，pass/fail 都写。 */
+export function writeGateCommandResult(cfg, id, round, fields, tailBytes) {
+  const tail = tailBytes ?? cfg.greenGateOutputTailBytes;
+  const name = gateCommandName(fields.command);
+  const record = {
+    schema_version: 1,
+    round,
+    name,
+    command: fields.command,
+    cwd: path.join('worktrees', id),
+    exit_code: fields.exitCode,
+    ...(fields.timedOut ? { timed_out: true } : {}),
+    stdout_tail: tailBytesOf(fields.stdout, tail),
+    stderr_tail: tailBytesOf(fields.stderr, tail),
+    started_at: fields.startedAt,
+    finished_at: fields.finishedAt,
+  };
+  state.writeJson(state.dossierPath(cfg, id, `gate-${name}-r${round}.json`), record);
+  return record;
+}
+
+/**
+ * 按序跑 gateCommands（AC-2）：同一 worktree 内顺序执行，第一条非 0 即短路，后续不再执行。
+ * 每条实际执行的命令落 gate-<name>-r<n>.json（AC-4）。全部通过返回 { failed:false }；
+ * 否则返回失败记录与其 dossier 文件名（供 buildRepairContext 复用 green_gate 回喂通道，AC-3）。
+ */
+export async function runGateCommands(cfg, id, round, wt, commands) {
+  for (const command of commands) {
+    const startedAt = new Date().toISOString();
+    const result = await runGreenGate(command, wt, { timeoutMs: cfg.greenGateTimeoutMs });
+    const finishedAt = new Date().toISOString();
+    const record = writeGateCommandResult(cfg, id, round, {
+      command,
+      exitCode: result.exitCode,
+      timedOut: result.timedOut,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      startedAt,
+      finishedAt,
+    });
+    state.appendTimeline(cfg, id, `gate ${record.name} r${round}: ${result.timedOut ? 'timed out' : `exit ${result.exitCode}`}`);
+    if (!greenGatePassed(result.exitCode)) {
+      return { failed: true, record, refFile: `gate-${record.name}-r${round}.json` };
+    }
+  }
+  return { failed: false };
+}
+
 // ---- test gate（基线空转测试探针，docs/features/test-gate/tech-spec.md）----
 // green gate 之后的第二道确定性闸：基线代码 + 当前测试（改动的测试文件叠加/删除）。
 // suite 模式（v1，映射缺失/非法时的降级）：复跑 testCommand，基线仍 exit 0 ⇒ vacuous。
@@ -364,12 +434,16 @@ export async function runTestGateProbe(ts, cfg, round) {
  *                        prompt 层再展开摘要；instruction 改为修测试版。sameSignatureStreak>=2
  *                        （代码类同签名连败，见 isEnvFailureSignature 短路分支）时额外注入
  *                        same_signature_streak 字段 + 人类可读提示（失败签名未变，附失败测试清单）。
+ *                        refFile/instruction 可选覆盖（复用同一回喂通道：gateCommands 失败时指向
+ *                        gate-<name>-r<n>.json 并换一版更贴切的 instruction，见 runGateCommands 调用方）。
  * source==='test_gate'：存 test_gate_ref（同 green_gate_ref 的去重策略）；per-ac 模式探针
  *                       （probe.mode==='per-ac'）把 vacuous 条目精确填进 failed_criteria，
  *                       suite 模式（降级）保持 v1 形态 failed_criteria=[]；
  *                       instruction 要求补/强化在基线上会失败的测试，禁止削弱换绿。
  */
-export function buildRepairContext({ source, round, verdict, probe, sameSignatureStreak, failingTests }) {
+export function buildRepairContext({
+  source, round, verdict, probe, sameSignatureStreak, failingTests, refFile, instruction,
+}) {
   if (source === 'green_gate') {
     return {
       schema_version: 1,
@@ -378,12 +452,12 @@ export function buildRepairContext({ source, round, verdict, probe, sameSignatur
       overall: 'fail',
       failed_criteria: [],
       green_gate: null,
-      green_gate_ref: `green-gate-r${round}.json`,
+      green_gate_ref: refFile ?? `green-gate-r${round}.json`,
       ...(sameSignatureStreak >= 2 ? {
         same_signature_streak: sameSignatureStreak,
         same_signature_hint: `上一轮修复后失败签名完全未变：${(failingTests ?? []).join(', ') || '(无法解析具体失败测试名)'}——考虑未命中根因或原因在代码之外。`,
       } : {}),
-      instruction: 'Fix the failing tests so the test command exits 0. Keep unrelated code intact.',
+      instruction: instruction ?? 'Fix the failing tests so the test command exits 0. Keep unrelated code intact.',
     };
   }
   if (source === 'test_gate') {

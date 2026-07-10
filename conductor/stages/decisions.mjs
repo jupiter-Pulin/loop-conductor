@@ -153,6 +153,22 @@ export function greenGatePassed(exitCode) {
   return exitCode === 0;
 }
 
+/** gateCommands 规范化：非数组或含非字符串元素 → []（保守处理，不得抛错中断状态机）。 */
+export function normalizeGateCommands(value) {
+  if (!Array.isArray(value)) return [];
+  return value.every((c) => typeof c === 'string') ? value : [];
+}
+
+/**
+ * gateCommands 来源优先级（AC-1）：task.json 显式提供该字段（即使值非法）即完全覆盖
+ * target-profile 默认，不做合并；task.json 未提供该字段时才退回 profile 默认。
+ * 两侧值均经 normalizeGateCommands 保守处理。
+ */
+export function resolveGateCommands(task, profileDefault) {
+  if (task && Object.hasOwn(task, 'gateCommands')) return normalizeGateCommands(task.gateCommands);
+  return normalizeGateCommands(profileDefault);
+}
+
 /**
  * test gate（基线空转测试探针）单侧判定：只有「当前测试叠加到基线后 testCommand 仍
  * exit 0」才是 vacuous（测试没钉住 spec 要求的新行为）；红/超时（exit_code=null）/

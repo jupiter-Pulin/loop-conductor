@@ -7,7 +7,7 @@ import {
   fixingMode, parseStrictJson, specMissNext, specVerifierInvalidNext,
   needsFeasibilityAction, feasibilityApprovalNext, feasibilityContractInvalidNext,
   validateSpecVerifierVerdict, validateVerifierVerdict, MAX_MISS, STAGES,
-  sameSignatureStreak, checkEvidenceAnchors, validateReviewReport,
+  sameSignatureStreak, normalizeGateCommands, resolveGateCommands, checkEvidenceAnchors, validateReviewReport,
 } from '../../conductor/stages/decisions.mjs';
 
 test('markerStatus：双标记四态', () => {
@@ -388,6 +388,39 @@ test('sameSignatureStreak：undefined（旧记录/无签名）打断连续', () 
   assert.equal(sameSignatureStreak(['A', undefined, 'A']), 1, '紧邻的 undefined 打断连续');
   assert.equal(sameSignatureStreak(['A', 'A', undefined]), 1, '尾元素本身 undefined，只算自身长度 1');
   assert.equal(sameSignatureStreak([undefined, undefined]), 1, '两个 undefined 不视为彼此相等');
+});
+
+test('normalizeGateCommands：非数组 / 含非字符串元素 → []，不抛错（AC-1）', () => {
+  assert.deepEqual(normalizeGateCommands(undefined), []);
+  assert.deepEqual(normalizeGateCommands(null), []);
+  assert.deepEqual(normalizeGateCommands('npm run build'), []);
+  assert.deepEqual(normalizeGateCommands({ 0: 'npm run build' }), []);
+  assert.deepEqual(normalizeGateCommands(['npm run build', 42]), []);
+  assert.deepEqual(normalizeGateCommands([]), []);
+  assert.deepEqual(normalizeGateCommands(['npm run typecheck', 'npm run build']), ['npm run typecheck', 'npm run build']);
+});
+
+test('resolveGateCommands：task.json 未提供该字段 → 退回 target-profile 默认（AC-1）', () => {
+  assert.deepEqual(resolveGateCommands({ id: 't1' }, ['npm run build']), ['npm run build']);
+  assert.deepEqual(resolveGateCommands({ id: 't1' }, undefined), [], '两侧都缺省 → 空数组');
+  assert.deepEqual(resolveGateCommands({ id: 't1' }, 'not-an-array'), [], 'profile 默认非法同样保守处理为 []');
+});
+
+test('resolveGateCommands：task.json 显式提供该字段即完全覆盖 profile，不做合并（AC-1）', () => {
+  assert.deepEqual(
+    resolveGateCommands({ gateCommands: ['npm run typecheck'] }, ['npm run build']),
+    ['npm run typecheck'],
+  );
+  assert.deepEqual(
+    resolveGateCommands({ gateCommands: [] }, ['npm run build']),
+    [],
+    'task.json 显式空数组仍完全覆盖 profile 默认，不合并',
+  );
+  assert.deepEqual(
+    resolveGateCommands({ gateCommands: 'not-an-array' }, ['npm run build']),
+    [],
+    'task.json 字段存在但非法 → []，且不退回 profile（字段存在即覆盖）',
+  );
 });
 
 // ---- checkEvidenceAnchors（H15）：hard=客观幻觉，soft=diff 外引用（合法，只观测） ----
