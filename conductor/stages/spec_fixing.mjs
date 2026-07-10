@@ -4,17 +4,15 @@
 import path from 'node:path';
 import { runClaude } from '../lib/claude.mjs';
 import * as state from '../lib/state.mjs';
-import { taskCfg } from '../lib/task-cfg.mjs';
 import { specContractInvalidNext } from './decisions.mjs';
 import {
-  addCost, budgetExceeded, buildSpecAgentPrompt, failToBox,
+  accountSpawnCost, budgetExceeded, buildSpecAgentPrompt, failToBox,
   finishSpawnRecord, nextRoleRound, runSpecContractGate, SPEC_AGENT_TOOLS,
-  startSpawnRecord, writeSpecAgentSettings, canStartSpawn,
+  startSpawnRecord, writeSpecAgentSettings, canStartSpawn, acquireSpecChainCwd,
 } from './shared.mjs';
 
 export default async function specFixingHandler(ts, cfg) {
   const id = ts.id;
-  const tRepo = taskCfg(ts, cfg).targetRepo;
   if (budgetExceeded(ts, cfg)) {
     return failToBox(ts, cfg, `budget exceeded: $${ts.runtime.spent_usd} >= $${cfg.budgetUsd}，拒绝 spawn spec-agent`, 'budget_exceeded');
   }
@@ -26,21 +24,26 @@ export default async function specFixingHandler(ts, cfg) {
     mode: 'repair',
     stream_file: path.relative(cfg.root, streamFile),
   });
-  const res = await runClaude({
-    cwd: tRepo,
-    prompt: buildSpecAgentPrompt(ts, cfg, round, { mode: 'repair' }),
-    maxTurns: cfg.maxTurns,
-    model: cfg.models?.spec ?? null,
-    tools: SPEC_AGENT_TOOLS,
-    allowedTools: SPEC_AGENT_TOOLS,
-    settings,
-    streamFile,
-    inactivityTimeoutMs: cfg.inactivityTimeoutMs,
-    wallClockMs: cfg.spawnWallClockMs,
-  });
+  const iso = acquireSpecChainCwd(ts, cfg, 'spec-agent');
+  let res;
+  try {
+    res = await runClaude({
+      cwd: iso.cwd,
+      prompt: buildSpecAgentPrompt(ts, cfg, round, { mode: 'repair' }),
+      maxTurns: cfg.maxTurns,
+      model: cfg.models?.spec ?? null,
+      tools: SPEC_AGENT_TOOLS,
+      allowedTools: SPEC_AGENT_TOOLS,
+      settings,
+      streamFile,
+      inactivityTimeoutMs: cfg.inactivityTimeoutMs,
+      wallClockMs: cfg.spawnWallClockMs,
+    });
+  } finally {
+    iso.cleanup();
+  }
   finishSpawnRecord(rec, res);
-  addCost(ts, res.costUsd, cfg);
-  if (res.costUnknown) state.appendTimeline(cfg, id, `spec-agent r${round} cost unknown; spent_usd uses lower-bound accounting`);
+  accountSpawnCost(ts, cfg, 'spec-agent', round, res);
   if (!res.ok) {
     state.saveRuntime(ts);
     state.appendTimeline(cfg, id, `spec-agent repair failed: ${res.error ?? 'unknown'}`);

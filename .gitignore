@@ -6,6 +6,11 @@ target/
 .claude/settings.local.json
 .claude_review_state.json
 
+# 密钥/环境变量，绝不入库（Slack token 等）
+.env
+.env.*
+!.env.example
+
 # 运行时任务数据，只保留目录骨架（.gitkeep）
 state/queue/*
 state/done/*
@@ -13,8 +18,14 @@ state/failed/*
 state/parked/
 specs/*
 dossier/*
+target-profiles/*
 !state/queue/.gitkeep
 !state/done/.gitkeep
 !state/failed/.gitkeep
 !specs/.gitkeep
 !dossier/.gitkeep
+!target-profiles/.gitkeep
+
+# loop 传感层运行时数据（R7-3 已批）
+state/alerts-cursor.json
+state/cron-*.log

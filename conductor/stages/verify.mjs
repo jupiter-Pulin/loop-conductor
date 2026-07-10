@@ -9,14 +9,17 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import * as state from '../lib/state.mjs';
-import { runClaudeWithRetry } from '../lib/claude.mjs';
+import { runClaude, runClaudeWithRetry } from '../lib/claude.mjs';
 import { runCodexExec } from '../lib/codex.mjs';
+import { mergeBaseWith, diffNameStatusAgainstBase, parseNameStatusPaths, showFileAtRef, diffNumstatAgainstBase } from '../lib/git.mjs';
 import {
   parseStrictJson, validateVerifierVerdict, verdictNext, verifierInvalidNext, makerMissNext, makerRound,
+  checkEvidenceAnchors, validateReviewReport, evaluateAutoMerge, parseNumstat,
 } from './decisions.mjs';
 import {
-  worktreePath, buildVerifierPrompt, buildRepairContext, writeRepairContext, renderVerifyReport,
-  addCost, budgetExceeded, failToBox, startSpawnRecord, finishSpawnRecord, VERIFIER_TOOLS, canStartSpawn,
+  worktreePath, buildVerifierPrompt, buildReviewerPrompt, buildRepairContext, writeRepairContext, renderVerifyReport,
+  budgetExceeded, failToBox, startSpawnRecord, finishSpawnRecord, VERIFIER_TOOLS, canStartSpawn,
+  computeTestChangeGuard, accountSpawnCost, performMerge,
 } from './shared.mjs';
 
 export default async function verifyHandler(ts, cfg) {
@@ -41,7 +44,12 @@ export default async function verifyHandler(ts, cfg) {
   const acList = state.extractAcceptanceCriteria(specMd);
   const expectedAcIds = acList.map((a) => a.ac_id);
 
-  const prompt = buildVerifierPrompt(ts, cfg, round, acList);
+  // H16 测试改动守卫（观测型）：非空时注入 prompt 段 + timeline，绝不影响路由。
+  const testChanges = computeTestChangeGuard(ts, cfg);
+  if (testChanges) {
+    state.appendTimeline(cfg, id, `verifier r${round} test-change guard：modified ${testChanges.modified.length} / deleted ${testChanges.deleted.length} / renamed ${testChanges.renamed.length}（已注入 prompt，观测不 block）`);
+  }
+  const prompt = buildVerifierPrompt(ts, cfg, round, acList, testChanges);
   const streamFile = state.dossierPath(cfg, id, `verifier-r${round}.stream.jsonl`);
   const rec = startSpawnRecord(cfg, id, 'verifier', round, {
     stream_file: path.relative(cfg.root, streamFile),
@@ -63,8 +71,7 @@ export default async function verifyHandler(ts, cfg) {
       state.appendTimeline(cfg, id, `verifier r${round} transient retry attempt ${attempt} (status=${status ?? 'spawn-error'})`),
   });
   finishSpawnRecord(rec, res);
-  addCost(ts, res.costUsd, cfg);
-  if (res.costUnknown) state.appendTimeline(cfg, id, `verifier r${round} cost unknown; spent_usd uses lower-bound accounting`);
+  accountSpawnCost(ts, cfg, 'verifier', round, res);
   state.saveRuntime(ts); // 成本先落盘
 
   if (!res.ok) {
@@ -78,18 +85,48 @@ export default async function verifyHandler(ts, cfg) {
   const parsed = parseStrictJson(res.result);
   const check = validateVerifierVerdict(parsed, expectedAcIds);
 
-  if (!check.ok) {
-    // ---- invalid verifier 输出：不是 maker 失败 ----
+  // ---- H15 evidence 机械锚定核验（config 开关，默认 off = 旧行为）----
+  // observe：只落对照产物 + timeline，不影响任何路由；
+  // enforce：hard 错误（文件不存在 / 行号越界，客观幻觉）走协议 invalid 阶梯；
+  //          soft（引用 diff 外文件）任何模式都只记录——verifier 有全树只读权，合法。
+  let invalidErrors = check.ok ? null : check.errors;
+  let anchors = null;
+  const anchorsMode = cfg.verifierEvidenceAnchorsMode ?? 'off';
+  if (check.ok && (anchorsMode === 'observe' || anchorsMode === 'enforce')) {
+    anchors = computeEvidenceAnchors(ts, cfg, check.verdict);
+    if (anchorsMode === 'enforce' && anchors.hard.length > 0) {
+      invalidErrors = anchors.hard.map((h) => (h.reason === 'line_out_of_range'
+        ? `evidence 行号越界：${h.ac_id} ${h.file}:${h.start_line}-${h.end_line}（文件共 ${h.file_lines} 行）`
+        : `evidence 文件不存在（worktree 与 base 均无）：${h.ac_id} ${h.file}`));
+    } else {
+      state.writeJson(state.dossierPath(cfg, id, `verify-r${round}.evidence-anchors.json`), {
+        schema_version: 1,
+        round,
+        mode: anchorsMode,
+        hard_count: anchors.hard.length,
+        soft_count: anchors.soft.length,
+        hard: anchors.hard,
+        soft: anchors.soft,
+      });
+      state.appendTimeline(cfg, id, `verifier r${round} evidence anchors ${anchorsMode}：hard ${anchors.hard.length} / soft ${anchors.soft.length}`);
+    }
+  }
+
+  if (invalidErrors) {
+    // ---- invalid verifier 输出（协议失败或 enforce 锚定硬错误）：不是 maker 失败 ----
     const m = (ts.runtime.verifier_invalid_count ?? 0) + 1;
     state.writeJson(state.dossierPath(cfg, id, `verify-r${round}.invalid-a${m}.json`), {
       schema_version: 1,
       round,
       attempt: m,
-      errors: check.errors,
+      errors: invalidErrors,
+      // enforce 锚定拒收时附全量锚定明细（含 soft），供分析误杀率
+      ...(check.ok && anchors ? { anchor_mismatches: anchors } : {}),
       raw_result: res.result ?? null,
     });
     const next = verifierInvalidNext(ts.runtime.verifier_invalid_count ?? 0, cfg.maxVerifierInvalidRetries);
-    state.appendTimeline(cfg, id, `verifier r${round} invalid 第 ${m} 次：${check.errors.join('; ')}`);
+    state.appendTimeline(cfg, id, `verifier r${round} invalid 第 ${m} 次：${invalidErrors.join('; ')}`);
+    state.appendEvent(cfg, id, 'verifier_invalid', { round, attempt: m, errors_count: invalidErrors.length, anchors_enforced: Boolean(check.ok && anchors) });
     if (next.stage === 'FAILED_BOX') {
       return failToBox(
         ts, cfg,
@@ -114,6 +151,7 @@ export default async function verifyHandler(ts, cfg) {
   ts.runtime.verifier_invalid_count = 0;
   state.saveRuntime(ts);
   state.appendTimeline(cfg, id, `verifier r${round} verdict: ${check.verdict.overall} (cost=$${res.costUsd})`);
+  state.appendEvent(cfg, id, 'verifier_verdict', { round, overall: check.verdict.overall, cost_usd: res.costUsd ?? null });
 
   // ---- verifier shadow（opt-in 观测实验，契约：默认关闭；开启也绝不影响状态机）----
   // 主 verdict 已落盘后才跑；shadow 的任何失败（spawn/协议/异常）只留 shadow 证据与 timeline，
@@ -125,7 +163,98 @@ export default async function verifyHandler(ts, cfg) {
       state.appendTimeline(cfg, id, `verifier shadow 异常（已忽略，不影响主链）：${String(err)}`);
     }
   }
+
+  // ---- H21 Reviewer shadow（config reviewStage='shadow'，默认 off）----
+  // 只在主 verdict pass 后跑（false-pass 猎手）；best-effort：任何失败只留证据与 timeline，
+  // 不影响 stage、不计 verifier_invalid_count、不产生 repair-context。幂等：compare 已存在不重跑。
+  if (cfg.reviewStage === 'shadow' && check.verdict.overall === 'pass') {
+    try {
+      await runReviewerShadow(ts, cfg, round, check.verdict, { acList, expectedAcIds });
+    } catch (err) {
+      state.appendTimeline(cfg, id, `reviewer shadow 异常（已忽略，不影响主链）：${String(err)}`);
+    }
+  }
   return consumeValidVerdict(ts, cfg, round, check.verdict);
+}
+
+/**
+ * H21：独立 Reviewer 影子轮。同 worktree 冷读 diff（不喂 verifier verdict / maker 叙述），
+ * 契约 review-diff/v1（validateReviewReport 唯一裁判）。产物（dossier/<id>/）：
+ *   review-r<n>.json          —— 合法 report（含机械推导 metrics/blockers）
+ *   review-r<n>.invalid.json  —— 基建/协议失败证据（不计主 invalid）
+ *   reviewer-r<n>.json/.stream.jsonl —— spawn 双标记与事件流
+ *   review-r<n>.compare.json  —— 与主 verdict 的分歧对照（H22 升 gate 的数据源）
+ * disagreement = review gate ≠ ready（verifier pass 前提下）；high_risk = gate = blocked。
+ */
+async function runReviewerShadow(ts, cfg, round, mainVerdict, { acList, expectedAcIds }) {
+  const id = ts.id;
+  const comparePath = state.dossierPath(cfg, id, `review-r${round}.compare.json`);
+  if (state.readJsonIf(comparePath)) return; // 幂等重入不重跑
+  if (budgetExceeded(ts, cfg)) {
+    state.appendTimeline(cfg, id, `reviewer shadow r${round} 跳过（budget exceeded），不影响主链`);
+    return;
+  }
+  state.appendTimeline(cfg, id, `reviewer shadow r${round} spawn (model=${cfg.models?.reviewer ?? 'default'})`);
+  const streamFile = state.dossierPath(cfg, id, `reviewer-r${round}.stream.jsonl`);
+  const rec = startSpawnRecord(cfg, id, 'reviewer', round, {
+    stream_file: path.relative(cfg.root, streamFile),
+  });
+  // best-effort 单次 spawn（无瞬态重试阶梯——shadow 不值得吃退避；失败即记 infra）
+  const res = await runClaude({
+    cwd: worktreePath(cfg, id),
+    prompt: buildReviewerPrompt(ts, cfg, round, acList),
+    maxTurns: cfg.maxTurns,
+    model: cfg.models?.reviewer ?? null,
+    tools: VERIFIER_TOOLS,
+    allowedTools: VERIFIER_TOOLS,
+    streamFile,
+    inactivityTimeoutMs: cfg.inactivityTimeoutMs,
+    wallClockMs: cfg.spawnWallClockMs,
+  });
+  finishSpawnRecord(rec, res);
+  accountSpawnCost(ts, cfg, 'reviewer', round, res);
+  state.saveRuntime(ts);
+
+  let review = { valid: false, gate: null, metrics: null, invalid_kind: null };
+  if (!res.ok) {
+    review.invalid_kind = 'infra';
+    state.writeJson(state.dossierPath(cfg, id, `review-r${round}.invalid.json`), {
+      schema_version: 1, round, kind: 'infra', error: res.error ?? 'unknown',
+    });
+    state.appendTimeline(cfg, id, `reviewer shadow r${round} 基建失败（不影响主链）：${res.error ?? 'unknown'}`);
+  } else {
+    const check = validateReviewReport(parseStrictJson(res.result), expectedAcIds);
+    if (!check.ok) {
+      review.invalid_kind = 'protocol';
+      state.writeJson(state.dossierPath(cfg, id, `review-r${round}.invalid.json`), {
+        schema_version: 1, round, kind: 'protocol', errors: check.errors, raw_result: res.result ?? null,
+      });
+      state.appendTimeline(cfg, id, `reviewer shadow r${round} 协议失败（不计主 invalid）：${check.errors.join('; ')}`);
+    } else {
+      review = { valid: true, gate: check.report.gate, metrics: check.report.metrics, invalid_kind: null };
+      state.writeJson(state.dossierPath(cfg, id, `review-r${round}.json`), check.report);
+    }
+  }
+
+  const disagreement = review.valid ? review.gate !== 'ready' : null;
+  const highRisk = review.valid ? review.gate === 'blocked' : null;
+  state.writeJson(comparePath, {
+    schema_version: 1,
+    round,
+    main: { overall: mainVerdict.overall },
+    review: { ...review, cost_usd: res.costUsd ?? null },
+    disagreement,
+    high_risk: highRisk,
+  });
+  state.appendEvent(cfg, id, 'review_shadow', {
+    round, valid: review.valid, gate: review.gate, disagreement, high_risk: highRisk, invalid_kind: review.invalid_kind,
+  });
+  state.appendTimeline(
+    cfg, id,
+    review.valid
+      ? `reviewer shadow r${round} 对照落盘：main=pass / review gate=${review.gate}（P0×${review.metrics.p0} P1×${review.metrics.p1} P2×${review.metrics.p2}）${highRisk ? ' ⚠ HIGH-RISK（false-pass 候选）' : ''}`
+      : `reviewer shadow r${round} 无有效 report（${review.invalid_kind}），compare 记录 review 无效`,
+  );
 }
 
 /**
@@ -219,16 +348,76 @@ async function runVerifierShadow(ts, cfg, round, mainVerdict, { prompt, expected
 }
 
 /** 消费一个「有效」verdict（幂等分支与新产出分支共用）：按 verdictNext 路由。 */
-function consumeValidVerdict(ts, cfg, round, verdict) {
+async function consumeValidVerdict(ts, cfg, round, verdict) {
   const id = ts.id;
   const overall = verdict.overall;
   if (overall === 'pass') {
     state.transitionState(ts, cfg, 'AWAIT_HUMAN_MERGE', `verdict pass r${round}`, { current_round: round });
     console.log(`[${id}] verdict pass → AWAIT_HUMAN_MERGE。人工看 diff：worktrees/${id}，然后 conductor merge ${id}`);
+    await maybeAutoMerge(ts, cfg, round, verdict);
     return { changed: true };
   }
 
   // fail（或含 unknown 的 fail）：写最小 repair-context（verifier 源），按 miss 阶梯路由。
+  return consumeFailVerdict(ts, cfg, round, verdict);
+}
+
+/**
+ * H33 机械全绿自动本地合并（config `autoMergeEnabled`，默认关=零行为差异）。
+ * 裁决点：pass 转移到 AWAIT_HUMAN_MERGE 之后——不放行/失败都停在人审闸门（fail-open to human）。
+ * 谓词是 decisions.evaluateAutoMerge（纯函数唯一裁判，输入全部机械产物）；本函数只收集输入、
+ * 落 `verify-r<n>.automerge-decision.json` + timeline + `automerge_decision` 事件，eligible 才 performMerge。
+ * 绝不 push：performMerge 只做本地合并（H33 边界）。评估路径任何异常全吞（任务保持人审闸门）。
+ */
+async function maybeAutoMerge(ts, cfg, round, verdict) {
+  if (cfg.autoMergeEnabled !== true) return;
+  const id = ts.id;
+  try {
+    const wt = worktreePath(cfg, id);
+    const decision = evaluateAutoMerge({
+      kind: ts.task.kind,
+      allowedKinds: cfg.autoMergeKinds,
+      verdictOverall: verdict.overall,
+      acCount: Array.isArray(verdict.criteria_results) ? verdict.criteria_results.length : null,
+      maxAcs: cfg.autoMergeMaxAcs,
+      testGate: state.readJsonIf(state.dossierPath(cfg, id, `test-gate-r${round}.json`)),
+      guardEnabled: cfg.testChangeGuardEnabled === true,
+      guardChanges: computeTestChangeGuard(ts, cfg),
+      anchorsMode: cfg.verifierEvidenceAnchorsMode,
+      anchors: state.readJsonIf(state.dossierPath(cfg, id, `verify-r${round}.evidence-anchors.json`)),
+      shadowEnabled: cfg.verifierShadowEnabled === true,
+      shadowCompare: state.readJsonIf(state.dossierPath(cfg, id, `verify-r${round}.shadow-compare.json`)),
+      reviewCompare: state.readJsonIf(state.dossierPath(cfg, id, `review-r${round}.compare.json`)),
+      diff: parseNumstat(diffNumstatAgainstBase(wt, ts.task.baseBranch)),
+      maxDiffLines: cfg.autoMergeMaxDiffLines,
+      deniedPaths: cfg.autoMergeDeniedPaths,
+    });
+    state.writeJson(state.dossierPath(cfg, id, `verify-r${round}.automerge-decision.json`), {
+      schema_version: 1, round, ...decision,
+    });
+    state.appendTimeline(
+      cfg, id,
+      decision.eligible
+        ? `auto-merge r${round}：机械全绿谓词通过，执行本地合并（push 仍人工）`
+        : `auto-merge r${round}：不放行（${decision.reasons.join('；')}）——留人审`,
+    );
+    state.appendEvent(cfg, id, 'automerge_decision', { round, eligible: decision.eligible, reasons: decision.reasons });
+    if (!decision.eligible) return;
+
+    const res = await performMerge(ts, cfg, { auto: true });
+    if (res.ok) {
+      console.log(`[${id}] auto-merge 完成（机械全绿，本地合并已归档 done；push 仍人工）`);
+    } else {
+      state.appendTimeline(cfg, id, `auto-merge 执行失败（任务保持 AWAIT_HUMAN_MERGE）：${res.error}`);
+      console.error(`[${id}] auto-merge 失败：${res.error}`);
+    }
+  } catch (err) {
+    state.appendTimeline(cfg, id, `auto-merge 评估异常（任务保持 AWAIT_HUMAN_MERGE）：${err?.message ?? err}`);
+  }
+}
+
+function consumeFailVerdict(ts, cfg, round, verdict) {
+  const id = ts.id;
   const ctx = buildRepairContext({ source: 'verifier', round, verdict });
   writeRepairContext(cfg, id, round, ctx);
   const next = makerMissNext(ts.runtime.maker_miss_count ?? 0, cfg.maxMakerMisses);
@@ -251,4 +440,39 @@ function consumeValidVerdict(ts, cfg, round, verdict) {
 function readDossierSpecRaw(ts, cfg) {
   const p = state.dossierPath(cfg, ts.id, 'spec.md');
   try { return fs.readFileSync(p, 'utf8'); } catch { return ''; }
+}
+
+/**
+ * H15：为 verdict 引用的每个 evidence 文件建锚定索引并核验（checkEvidenceAnchors 是唯一裁判）。
+ * 行数来源：worktree 现文件；不在 worktree（已删除 / rename 旧路径）时回退 merge-base 的
+ * base blob——与 verifier 看到的三点 diff（base...HEAD）同基线。绝不解析 worktree 外路径：
+ * 绝对路径或含 `..` 段一律记 unsafe_path 硬错误，不碰文件系统。
+ */
+function computeEvidenceAnchors(ts, cfg, verdict) {
+  const wt = worktreePath(cfg, ts.id);
+  const baseBranch = ts.task.baseBranch;
+  const baseRef = mergeBaseWith(wt, baseBranch) ?? baseBranch;
+  const diffFiles = parseNameStatusPaths(diffNameStatusAgainstBase(wt, baseBranch));
+  const files = new Set();
+  for (const c of verdict.criteria_results) {
+    for (const ev of c.evidence ?? []) files.add(ev.file);
+  }
+  const fileIndex = {};
+  for (const f of files) {
+    if (path.isAbsolute(f) || f.split(/[\\/]/).includes('..')) {
+      fileIndex[f] = { lines: null, in_diff: false, missing_reason: 'unsafe_path' };
+      continue;
+    }
+    let content = null;
+    try { content = fs.readFileSync(path.join(wt, f), 'utf8'); } catch { /* 不在 worktree：回退 base blob */ }
+    if (content === null) content = showFileAtRef(wt, baseRef, f);
+    fileIndex[f] = { lines: content === null ? null : countLines(content), in_diff: diffFiles.has(f) };
+  }
+  return checkEvidenceAnchors(verdict, fileIndex);
+}
+
+/** 行数口径：尾随换行不多算一行；空文件 0 行。 */
+function countLines(content) {
+  if (content === '') return 0;
+  return content.split('\n').length - (content.endsWith('\n') ? 1 : 0);
 }

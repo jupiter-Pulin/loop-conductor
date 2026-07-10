@@ -104,3 +104,50 @@ test('collectTask：完全空目录（无 state 文件、无 dossier）返回容
   assert.deepEqual(rec.maker_rounds, []);
   assert.equal(rec.committer_degraded, false);
 });
+
+// ---- H17：committer 有效性双读——events.jsonl 优先，legacy 回退 timeline grep ----
+
+function writeEvents(root, id, lines) {
+  fs.writeFileSync(path.join(root, 'dossier', id, 'events.jsonl'), lines.map((e) => JSON.stringify(e)).join('\n') + '\n');
+}
+
+test('collectTask（H17）：events.jsonl 有 committer 事件时以事件为准（timeline 矛盾也不看）', (t) => {
+  const root = makeRoot(t);
+  writeTaskFixture(root, 'done', 'task-20260701-010', {
+    timeline: '- committer 提案 a1 有效：fix(x): 旧文案（legacy 干扰项）\n',
+  });
+  writeEvents(root, 'task-20260701-010', [
+    { ts: 't0', type: 'stage', stage: 'VERIFY' },
+    { ts: 't1', type: 'committer_attempt', attempt: 1, outcome: 'invalid', invalid_kind: 'malformed' },
+    { ts: 't2', type: 'committer_attempt', attempt: 2, outcome: 'valid' },
+  ]);
+  const rec = collectTask(root, 'done', 'task-20260701-010');
+  assert.equal(rec.committer_valid_attempt, 2, '事件流优先：a2 才是有效提案');
+  assert.equal(rec.committer_degraded, false);
+});
+
+test('collectTask（H17）：events.jsonl 存在但无 committer 事件 → 回退 timeline grep（legacy 口径）', (t) => {
+  const root = makeRoot(t);
+  writeTaskFixture(root, 'done', 'task-20260701-011', {
+    timeline: '- committer 提案 a1 有效：fix(x): y\n',
+  });
+  writeEvents(root, 'task-20260701-011', [{ ts: 't0', type: 'stage', stage: 'DONE' }]);
+  const rec = collectTask(root, 'done', 'task-20260701-011');
+  assert.equal(rec.committer_valid_attempt, 1, '无 committer 事件时回退 grep');
+});
+
+test('collectTask（H17）：committer_degraded 事件 + 半行截断容错', (t) => {
+  const root = makeRoot(t);
+  writeTaskFixture(root, 'done', 'task-20260701-012', {});
+  const p = path.join(root, 'dossier', 'task-20260701-012', 'events.jsonl');
+  fs.writeFileSync(
+    p,
+    `${JSON.stringify({ ts: 't1', type: 'committer_attempt', attempt: 1, outcome: 'invalid', invalid_kind: 'turns_exhausted' })}\n` +
+    `${JSON.stringify({ ts: 't2', type: 'committer_attempt', attempt: 2, outcome: 'invalid', invalid_kind: 'malformed' })}\n` +
+    `${JSON.stringify({ ts: 't3', type: 'committer_degraded' })}\n` +
+    '{"ts":"t4","type":"stage","stage":"DO', // 进程被杀留下的半行：必须容错忽略
+  );
+  const rec = collectTask(root, 'done', 'task-20260701-012');
+  assert.equal(rec.committer_valid_attempt, null);
+  assert.equal(rec.committer_degraded, true, 'degraded 以事件为准');
+});

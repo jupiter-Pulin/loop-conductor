@@ -3,7 +3,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  DEFAULT_TEST_GLOBS, matchesTestGlobs, classifyTestFileChanges,
+  DEFAULT_TEST_GLOBS, matchesTestGlobs, classifyTestFileChanges, listExistingTestFileChanges,
   AC_TESTS_MAPPING_PATH, validateAcTestsMapping,
 } from '../../conductor/lib/test-gate.mjs';
 import { testGateVerdict, perAcProbeVerdict, perAcGateVerdict } from '../../conductor/stages/decisions.mjs';
@@ -50,6 +50,38 @@ test('classifyTestFileChanges：空输入 / 全非测试文件 → 空 overlay',
     classifyTestFileChanges('M\tlib/a.mjs\nD\tsrc/b.mjs\n', DEFAULT_TEST_GLOBS),
     { copy: [], remove: [] },
   );
+});
+
+test('listExistingTestFileChanges（H16）：M/T/D/R 入清单，A/C/非测试忽略', () => {
+  const nameStatus = [
+    'M\ttest/a.test.mjs',
+    'T\ttest/b.test.mjs',           // typechange 也算 modified
+    'D\ttests/c.spec.js',
+    'R100\ttest/old.test.mjs\ttest/new.test.mjs',
+    'R90\ttest/into-src.test.mjs\tsrc/helper.mjs', // 改名「出」测试目录 → 同样可疑
+    'R80\tsrc/util.mjs\ttest/from-src.test.mjs',   // 改名「进」测试目录 → 同样可疑
+    'A\ttest/brand-new.test.mjs',   // 新增测试是期望行为，不入清单
+    'C75\ttest/base.test.mjs\ttest/copy.test.mjs', // copy 既有侧无损，不入清单
+    'M\tlib/stats.mjs',             // 非测试忽略
+    'D\tsrc/gone.mjs',
+    '',
+  ].join('\n');
+  const r = listExistingTestFileChanges(nameStatus, DEFAULT_TEST_GLOBS);
+  assert.deepEqual(r.modified, ['test/a.test.mjs', 'test/b.test.mjs']);
+  assert.deepEqual(r.deleted, ['tests/c.spec.js']);
+  assert.deepEqual(r.renamed, [
+    { from: 'test/old.test.mjs', to: 'test/new.test.mjs' },
+    { from: 'test/into-src.test.mjs', to: 'src/helper.mjs' },
+    { from: 'src/util.mjs', to: 'test/from-src.test.mjs' },
+  ]);
+});
+
+test('listExistingTestFileChanges（H16）：空输入 / 全新增 / 全非测试 → 三清单皆空', () => {
+  const empty = { modified: [], deleted: [], renamed: [] };
+  assert.deepEqual(listExistingTestFileChanges('', DEFAULT_TEST_GLOBS), empty);
+  assert.deepEqual(listExistingTestFileChanges(null, DEFAULT_TEST_GLOBS), empty);
+  assert.deepEqual(listExistingTestFileChanges('A\ttest/x.test.mjs\nA\ttest/y.test.mjs', DEFAULT_TEST_GLOBS), empty);
+  assert.deepEqual(listExistingTestFileChanges('M\tlib/a.mjs\nD\tsrc/b.mjs', DEFAULT_TEST_GLOBS), empty);
 });
 
 test('testGateVerdict：单侧闸门，只有基线 exit 0 判 vacuous', () => {
