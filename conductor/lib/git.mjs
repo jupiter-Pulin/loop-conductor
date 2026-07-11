@@ -106,9 +106,17 @@ export function commitAll(wtPath, message) {
   git(['commit', '-m', message, '--allow-empty', '--no-verify'], wtPath);
 }
 
-/** 在 target 仓库（当前在主分支）合入任务分支。冲突/失败抛错，任务留在原地。 */
+/**
+ * 在 target 仓库（当前在主分支）合入任务分支。冲突/失败抛错，任务留在原地。
+ * F15/E28：失败必须先 `merge --abort` 还原——半合并状态会把冲突标记留在工作区；
+ * dogfood 自举仓（targetRepo=.）时 conductor 自身源码被污染，后续任何命令直接语法崩溃。
+ */
 export function mergeBranch(repo, branch, message) {
-  gitOk(['merge', '--no-ff', branch, '-m', message], repo);
+  const r = git(['merge', '--no-ff', branch, '-m', message], repo);
+  if (r.status !== 0) {
+    git(['merge', '--abort'], repo); // best-effort 还原；无 MERGE_HEAD 时失败无害
+    throw new Error(`git merge --no-ff ${branch} failed (cwd=${repo}): ${(r.stderr || r.stdout || '').trim()}`);
+  }
 }
 
 export function deleteBranch(repo, branch) {
