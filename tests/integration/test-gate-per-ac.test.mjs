@@ -312,7 +312,10 @@ test('fail-open：guard_broken 与单条命令超时（error）均放行进 VERI
 test('fail-open：per-AC 模式探针 worktree 创建失败 → 顶层 error 放行（AC-011）', (t) => {
   const env = makeEnv(t);
   const id = 'task-20260704-806';
-  // baseBranch 不存在 → merge-base 取不到 → detached worktree add 失败（探针基建失败）
+  // 探针基建失败模拟：baseBranch 不存在 → merge-base 取不到 → 探针 detached worktree add 失败。
+  // E29 后 maker worktree 会用 baseBranch 作起点（bogus 基线在 READY 就 fail-fast），
+  // 故预建任务分支让 maker 走「分支已存在」路径——失败面收窄回探针本身（原始测试意图）。
+  execFileSync('git', ['-C', env.targetDir, 'branch', `task/${id}`, 'main'], { encoding: 'utf8' });
   env.writeTask(id, { baseBranch: 'no-such-branch' });
   env.setScenario([
     {

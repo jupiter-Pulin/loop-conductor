@@ -48,7 +48,7 @@ export function installWorktreeExcludes(wtPath, patterns) {
 }
 
 /** 幂等：worktree 已存在则复用；分支残留（上次崩溃）则复用分支。末尾装 harness excludes。 */
-export function ensureWorktree(repo, wtPath, branch, excludePatterns = []) {
+export function ensureWorktree(repo, wtPath, branch, excludePatterns = [], startPoint = null) {
   if (fs.existsSync(path.join(wtPath, '.git'))) {
     // 复用既有 worktree，但仍确保 exclude 已装（契约 §8 / 边界「Worktree 已存在」）。
     if (excludePatterns.length > 0) installWorktreeExcludes(wtPath, excludePatterns);
@@ -62,7 +62,9 @@ export function ensureWorktree(repo, wtPath, branch, excludePatterns = []) {
   if (branchExists(repo, branch)) {
     gitOk(['worktree', 'add', wtPath, branch], repo);
   } else {
-    gitOk(['worktree', 'add', '-b', branch, wtPath], repo);
+    // F18/E29：新建任务分支必须显式给起点（task.baseBranch）。不传时 git 默认用活体仓
+    // 瞬时 HEAD——基线随人切分支漂移，diff/探针/verifier 全部错档（20260710-001 真实事故）。
+    gitOk(['worktree', 'add', '-b', branch, wtPath, ...(startPoint ? [startPoint] : [])], repo);
   }
   if (excludePatterns.length > 0) installWorktreeExcludes(wtPath, excludePatterns);
   return wtPath;
