@@ -36,7 +36,7 @@ description: 团队 git 提交与分支命名规范：选 commit type、写 subj
 
 - 写「行为变了什么」，不写「改了哪些文件」（文件列表 git 自己会给）。
 - 描述部分 ≤72 字符；单行；无首尾空白；不含 WIP。
-- 语言跟随仓库既有 commit（本仓库为中文）。
+- 语言**一律英文**（团队政策 2026-07-08；conductor 侧由 `commitLanguage: 'en'` 语言门机械执行，中文提案判 invalid——F13/task-20260708-006）。历史中文 commit 不追改。
 - scope 用子系统名（如 `conductor`、`agents`、`test-gate`），供 `git log --grep '^feat(test-gate)'` 检索。
 
 ## Body（四要素，各 1–3 行，行宽 ≤100 字符）
