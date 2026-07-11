@@ -30,3 +30,8 @@ target-profiles/*
 state/alerts-cursor.json
 state/cron-*.log
 state/conductor-run.log
+
+# 本地需求底稿与传感层运行数据（R9-2 整理）
+briefs/
+reports/
+.DS_Store
