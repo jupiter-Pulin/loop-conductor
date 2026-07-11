@@ -20,8 +20,11 @@ const AGING_THRESHOLD_MS = 72 * 3600_000;
  * | await_entered      | events: stage 进入 AWAIT_*                  | info     | 否  |
  * | await_aging        | queue 任务停靠 AWAIT_* 超 72h               | warn     | 是  |
  * | task_failed        | state/failed 新增（含 spawn_failed/budget_exceeded 等 failure_type） | error | 是 |
+ * | merge_failed       | events: merge_failed（E30/F14——「以为合了」类脱节的即时纠偏） | error | 是 |
  * | shadow_high_risk   | shadow-compare: agreement.high_risk_count>0 | critical | 是  |
  * | shadow_disagree    | shadow-compare: 分歧>0 且无 high-risk       | warn     | 否  |
+ * | review_high_risk   | review-compare: high_risk=true（verifier pass 但 reviewer blocked——-001 拦截曾只留 timeline 的补课） | critical | 是 |
+ * | review_disagree    | review-compare: disagreement=true 且非 high-risk | warn  | 否  |
  */
 const SEVERITY_ICON = { info: 'ℹ️', warn: '⚠️', error: '🔴', critical: '🚨' };
 
@@ -74,22 +77,40 @@ export function scanAlerts(root, cursor = { seen: {} }, { nowMs = Date.now() } =
       add(`${id}:await:${runtime.stage}:${enteredAt}`, 'info', false, `${id} 进入 ${runtime.stage}${enterEv?.note ? `（${enterEv.note}）` : ''} — 待人工处理`);
     }
 
+    // 规则 merge_failed（E30/F14）：merge 失败事件即时纠偏「以为合了」。每次失败独立报（key 带 ts）。
+    for (const ev of events) {
+      if (ev.type === 'merge_failed') {
+        add(`${id}:merge_failed:${ev.ts}`, 'error', true, `${id} merge 失败（${ev.reason ?? '?'}${ev.auto ? ',auto' : ''}）：${(ev.detail ?? '').slice(0, 120)} — 任务留在闸门,需人处置`);
+      }
+    }
+
     // 规则 shadow_high_risk / shadow_disagree
     let entries = [];
     try {
       entries = fs.readdirSync(dossierDir);
     } catch { /* dossier 缺失容错 */ }
     for (const name of entries.sort()) {
-      if (!/^verify-r\d+\.shadow-compare\.json$/.test(name)) continue;
-      const ag = readJsonIf(path.join(dossierDir, name))?.agreement;
-      if (!ag) continue;
-      const ds = ag.disagreements ?? [];
-      if ((ag.high_risk_count ?? 0) > 0) {
-        const detail = ds.filter((d) => d.high_risk).map((d) => `${d.ac_id} ${d.main}→${d.shadow}`).join('、');
-        add(`${id}:${name}:high_risk`, 'critical', true, `${id} shadow HIGH-RISK 分歧：${detail || `${ag.high_risk_count} 处`} — 立即人工核`);
-      } else if (ds.length > 0) {
-        const detail = ds.map((d) => `${d.ac_id} ${d.main}→${d.shadow}`).join('、');
-        add(`${id}:${name}:disagree`, 'warn', false, `${id} shadow 分歧（非 high-risk）：${detail} — merge 前必看`);
+      if (/^verify-r\d+\.shadow-compare\.json$/.test(name)) {
+        const ag = readJsonIf(path.join(dossierDir, name))?.agreement;
+        if (!ag) continue;
+        const ds = ag.disagreements ?? [];
+        if ((ag.high_risk_count ?? 0) > 0) {
+          const detail = ds.filter((d) => d.high_risk).map((d) => `${d.ac_id} ${d.main}→${d.shadow}`).join('、');
+          add(`${id}:${name}:high_risk`, 'critical', true, `${id} shadow HIGH-RISK 分歧：${detail || `${ag.high_risk_count} 处`} — 立即人工核`);
+        } else if (ds.length > 0) {
+          const detail = ds.map((d) => `${d.ac_id} ${d.main}→${d.shadow}`).join('、');
+          add(`${id}:${name}:disagree`, 'warn', false, `${id} shadow 分歧（非 high-risk）：${detail} — merge 前必看`);
+        }
+      } else if (/^review-r\d+\.compare\.json$/.test(name)) {
+        // 规则 review_high_risk / review_disagree（E30）：reviewer 第二意见的拦截必须进告警——
+        // -001 的真拦截（gate=blocked）当时只留在 timeline,人若不翻案卷就错过。
+        const c = readJsonIf(path.join(dossierDir, name));
+        if (!c || c.review?.valid !== true) continue;
+        if (c.high_risk === true) {
+          add(`${id}:${name}:review_high_risk`, 'critical', true, `${id} reviewer HIGH-RISK：verifier pass 但 review gate=${c.review?.gate ?? '?'}（false-pass 候选）— merge 前必须人工核`);
+        } else if (c.disagreement === true) {
+          add(`${id}:${name}:review_disagree`, 'warn', false, `${id} reviewer 分歧（gate=${c.review?.gate ?? '?'}，非 high-risk）— merge 前一看`);
+        }
       }
     }
   }
