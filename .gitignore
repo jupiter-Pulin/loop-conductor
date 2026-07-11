@@ -35,3 +35,7 @@ state/conductor-run.log
 briefs/
 reports/
 .DS_Store
+
+# loop 记忆域(研究记忆含业务上下文,存私有记忆库,经 tools/link-loop-memory.sh 装配)
+fable-loop-STATE.md
+fable-loop-ARCHIVE.md
