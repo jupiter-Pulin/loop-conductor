@@ -1292,7 +1292,12 @@ export async function performMerge(ts, cfg, { auto = false } = {}) {
   const tcfg = taskCfg(ts, cfg);
   const cur = currentBranch(tcfg.targetRepo);
   if (cur !== ts.task.baseBranch) {
-    return { ok: false, error: `merge 拒绝：target 仓库当前分支 ${cur} ≠ 任务 baseBranch ${ts.task.baseBranch}（任务保持原状）` };
+    const error = `merge 拒绝：target 仓库当前分支 ${cur} ≠ 任务 baseBranch ${ts.task.baseBranch}（任务保持原状）`;
+    // H34/E30：merge 失败必须三面留痕（console 由调用方打）——F14 教训：只打 console 时
+    // 人的心智模型与状态机脱节（「以为合了」）。事件供 alerts-scan 即时播报。
+    state.appendTimeline(cfg, id, error);
+    state.appendEvent(cfg, id, 'merge_failed', { reason: 'branch_mismatch', auto, detail: `${cur} != ${ts.task.baseBranch}` });
+    return { ok: false, error };
   }
   const branch = `task/${id}`;
   const wt = path.join(cfg.worktreesDir, id);
@@ -1309,7 +1314,10 @@ export async function performMerge(ts, cfg, { auto = false } = {}) {
   try {
     mergeBranch(tcfg.targetRepo, branch, proposal ?? `merge ${branch} (conductor)`);
   } catch (err) {
-    return { ok: false, error: `merge 失败（任务保持原状）：${err.message}` };
+    const error = `merge 失败（任务保持原状）：${err.message}`;
+    state.appendTimeline(cfg, id, error);
+    state.appendEvent(cfg, id, 'merge_failed', { reason: 'git_merge_failed', auto, detail: String(err.message ?? '').slice(0, 300) });
+    return { ok: false, error };
   }
   state.appendTimeline(cfg, id, `merged ${branch} → ${currentBranch(tcfg.targetRepo)}${auto ? '（auto-merge，机械全绿）' : ''}`);
   removeWorktree(tcfg.targetRepo, wt);

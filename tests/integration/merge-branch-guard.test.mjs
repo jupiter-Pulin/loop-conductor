@@ -19,7 +19,7 @@ function driveToAwaitMerge(env, id) {
 }
 
 test('target 仓库当前分支 ≠ task.baseBranch → merge 拒绝，任务与仓库状态不动', (t) => {
-  const env = makeEnv(t);
+  const env = makeEnv(t, { config: { eventsLogEnabled: true } });
   const id = 'task-20260704-801';
   driveToAwaitMerge(env, id);
 
@@ -47,10 +47,20 @@ test('target 仓库当前分支 ≠ task.baseBranch → merge 拒绝，任务与
   assert.ok(env.exists(env.worktree(id)), '任务 worktree 不应被清理');
   const branches = execFileSync('git', ['-C', env.targetDir, 'branch', '--list', `task/${id}`], { encoding: 'utf8' });
   assert.match(branches, new RegExp(`task/${id}`), '任务分支不应被删除');
+
+  // E30/H34：失败必须留痕——timeline + merge_failed 事件（F14「以为合了」的纠偏面）
+  const timeline = fs.readFileSync(path.join(env.root, 'dossier', id, 'timeline.md'), 'utf8');
+  assert.match(timeline, /merge 拒绝/, '失败要写 timeline');
+  const events = fs.readFileSync(path.join(env.root, 'dossier', id, 'events.jsonl'), 'utf8')
+    .split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
+  const mf = events.filter((e) => e.type === 'merge_failed');
+  assert.equal(mf.length, 1);
+  assert.equal(mf[0].reason, 'branch_mismatch');
+  assert.equal(mf[0].auto, false);
 });
 
 test('合并冲突 → merge 失败但现场必须还原：无 MERGE_HEAD、无冲突标记、任务原地（E28/F15）', (t) => {
-  const env = makeEnv(t);
+  const env = makeEnv(t, { config: { eventsLogEnabled: true } });
   const id = 'task-20260704-803';
   driveToAwaitMerge(env, id);
 
@@ -78,6 +88,16 @@ test('合并冲突 → merge 失败但现场必须还原：无 MERGE_HEAD、无�
   assert.equal(after.box, 'queue');
   assert.equal(after.runtime.stage, 'AWAIT_HUMAN_MERGE');
   assert.ok(env.exists(env.worktree(id)));
+
+  // E30/H34：冲突失败同样三面留痕
+  const timeline = fs.readFileSync(path.join(env.root, 'dossier', id, 'timeline.md'), 'utf8');
+  assert.match(timeline, /merge 失败（任务保持原状）/);
+  const events = fs.readFileSync(path.join(env.root, 'dossier', id, 'events.jsonl'), 'utf8')
+    .split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
+  const mf = events.filter((e) => e.type === 'merge_failed');
+  assert.equal(mf.length, 1);
+  assert.equal(mf[0].reason, 'git_merge_failed');
+  assert.ok(mf[0].detail.length > 0, '事件带 git 错误摘要供告警展示');
 });
 
 test('target 仓库当前分支 == task.baseBranch → merge 照常成功归档', (t) => {
