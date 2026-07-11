@@ -59,6 +59,7 @@ function collectTaskWindow(root, t, { sinceMs, untilMs, nowMs }) {
   let windowCost = 0;
   const shadow = { rounds: 0, acs: 0, agreed: 0, disagreements: [], high_risk: 0 };
   const anchors = { rounds: 0, hard: 0, soft: 0 };
+  const guard = { rounds: 0, files: 0 };
 
   let entries = [];
   try {
@@ -109,6 +110,16 @@ function collectTaskWindow(root, t, { sinceMs, untilMs, nowMs }) {
       anchors.rounds++;
       anchors.hard += a.hard?.length ?? a.hard_count ?? 0;
       anchors.soft += a.soft?.length ?? a.soft_count ?? 0;
+    } else if (/^verify-r\d+\.test-change-guard\.json$/.test(name)) {
+      let ms = null;
+      try {
+        ms = fs.statSync(p).mtimeMs;
+      } catch { /* 同上 */ }
+      if (ms === null || ms < sinceMs || ms >= untilMs) continue;
+      const g = readJsonIf(p);
+      if (!g) continue;
+      guard.rounds++;
+      guard.files += (g.modified?.length ?? 0) + (g.deleted?.length ?? 0) + (g.renamed?.length ?? 0);
     }
   }
 
@@ -137,6 +148,7 @@ function collectTaskWindow(root, t, { sinceMs, untilMs, nowMs }) {
     cost_by_role: costByRole,
     shadow,
     anchors,
+    guard,
     await_aging_days: t.stage?.startsWith('AWAIT_') && stageSinceMs !== null
       ? round2((nowMs - stageSinceMs) / 86400_000)
       : null,
@@ -183,6 +195,7 @@ export function collectWeekly(root, { sinceMs, untilMs, nowMs = Date.now() } = {
 
   const shadow = { rounds: 0, acs: 0, agreed: 0, disagreements: [], high_risk: 0 };
   const anchors = { rounds: 0, hard: 0, soft: 0 };
+  const guard = { rounds: 0, files: 0 };
   for (const r of active) {
     shadow.rounds += r.win.shadow.rounds;
     shadow.acs += r.win.shadow.acs;
@@ -192,6 +205,8 @@ export function collectWeekly(root, { sinceMs, untilMs, nowMs = Date.now() } = {
     anchors.rounds += r.win.anchors.rounds;
     anchors.hard += r.win.anchors.hard;
     anchors.soft += r.win.anchors.soft;
+    guard.rounds += r.win.guard.rounds;
+    guard.files += r.win.guard.files;
   }
 
   // 待人动作：AWAIT_* 停靠任务；若该任务本身带 shadow 分歧 → merge 前必看。
@@ -233,6 +248,7 @@ export function collectWeekly(root, { sinceMs, untilMs, nowMs = Date.now() } = {
     switches: {
       evidence_anchors: anchors,
       shadow,
+      test_change_guard: guard,
       tasks_with_events: active.filter((r) => r.win.has_events).length,
     },
     failure_types: failureTypes,
@@ -282,6 +298,7 @@ export function renderMarkdown(rep) {
   for (const d of s.shadow.disagreements) {
     L.push(`  - ${d.task} r${d.round} ${d.ac}：main=${d.main} → shadow=${d.shadow}${d.high_risk ? '（high-risk）' : ''}`);
   }
+  L.push(`- 测试改动守卫：命中 ${s.test_change_guard.rounds} 轮 / ${s.test_change_guard.files} 个既有测试文件`);
   L.push(`- 事件流覆盖：${s.tasks_with_events}/${rep.throughput.active} 活跃任务有 events.jsonl`);
   L.push('');
   const ft = Object.entries(rep.failure_types).map(([k, v]) => `${k}×${v}`).join('，');

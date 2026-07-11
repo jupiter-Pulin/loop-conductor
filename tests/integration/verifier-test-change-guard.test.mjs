@@ -44,6 +44,7 @@ test('契约1：默认关——既有测试被改也无守卫段/守卫 timeline
   const verifierPrompt = promptOf(env.calls()[1]);
   assert.ok(!verifierPrompt.includes('既有测试改动守卫'), '默认关闭不得注入守卫段');
   assert.ok(!timelineOf(env, id).includes('test-change guard'), '默认关闭不得写守卫 timeline');
+  assert.ok(!env.exists(env.dossier(id, 'verify-r1.test-change-guard.json')), '默认关闭零守卫产物（E27）');
 });
 
 test('契约2：开启且命中——prompt 守卫段 + timeline + stage 照常 + merge 高亮', (t) => {
@@ -63,6 +64,15 @@ test('契约2：开启且命中——prompt 守卫段 + timeline + stage 照常 
   assert.ok(verifierPrompt.includes('既有测试改动守卫'), 'prompt 应含守卫段');
   assert.ok(verifierPrompt.includes('"test/stats.test.mjs"'), '守卫段应列出被改的既有测试文件');
   assert.match(timelineOf(env, id), /test-change guard：modified 1 \/ deleted 0 \/ renamed 0/);
+
+  // E27/H32：命中同步落机械产物（周报/签名台账的聚合源）
+  const guardArtifact = env.readJson(env.dossier(id, 'verify-r1.test-change-guard.json'));
+  assert.equal(guardArtifact.schema_version, 1);
+  assert.equal(guardArtifact.round, 1);
+  assert.deepEqual(guardArtifact.modified, ['test/stats.test.mjs']);
+  assert.deepEqual(guardArtifact.deleted, []);
+  assert.deepEqual(guardArtifact.renamed, []);
+  assert.equal(guardArtifact.total, 1);
 
   const merge = env.run('merge', id);
   assert.equal(merge.status, 0, merge.stderr);
@@ -86,4 +96,5 @@ test('契约3：开启但只新增测试——A 不入清单，无守卫段无 t
   const verifierPrompt = promptOf(env.calls()[1]);
   assert.ok(!verifierPrompt.includes('既有测试改动守卫'), '仅新增测试不触发守卫段');
   assert.ok(!timelineOf(env, id).includes('test-change guard'), '仅新增测试不写守卫 timeline');
+  assert.ok(!env.exists(env.dossier(id, 'verify-r1.test-change-guard.json')), '仅新增测试零守卫产物（E27 不制造噪声）');
 });

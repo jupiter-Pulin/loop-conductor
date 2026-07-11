@@ -45,8 +45,13 @@ export default async function verifyHandler(ts, cfg) {
   const expectedAcIds = acList.map((a) => a.ac_id);
 
   // H16 测试改动守卫（观测型）：非空时注入 prompt 段 + timeline，绝不影响路由。
+  // H32/E27：命中同步落机械产物 verify-r<n>.test-change-guard.json——周报/签名台账的聚合源
+  // （此前只有 timeline/prompt/merge stdout 三面人读出证，机器无从消费）。
   const testChanges = computeTestChangeGuard(ts, cfg);
   if (testChanges) {
+    state.writeJson(state.dossierPath(cfg, id, `verify-r${round}.test-change-guard.json`), {
+      schema_version: 1, round, ...testChanges,
+    });
     state.appendTimeline(cfg, id, `verifier r${round} test-change guard：modified ${testChanges.modified.length} / deleted ${testChanges.deleted.length} / renamed ${testChanges.renamed.length}（已注入 prompt，观测不 block）`);
   }
   const prompt = buildVerifierPrompt(ts, cfg, round, acList, testChanges);
