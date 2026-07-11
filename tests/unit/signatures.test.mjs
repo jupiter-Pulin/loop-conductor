@@ -110,6 +110,7 @@ test('extractOccurrences：全库机械提取九族签名', (t) => {
     'test-gate-r1.json': { mode: 'suite', verdict: 'vacuous' },
     'verify-r2.shadow-compare.json': { agreement: { disagreements: [{ ac_id: 'AC-004', main: 'pass', shadow: 'fail' }] } },
     'verify-r2.evidence-anchors.json': { hard_count: 2, hard: [{}, {}] },
+    'verify-r2.test-change-guard.json': { schema_version: 1, round: 2, modified: ['test/x.test.mjs'], deleted: [], renamed: [], total: 1 },
   }, '- committer 提案两次 invalid，merge 降级机器文案\n');
 
   const occs = extractOccurrences(root);
@@ -119,6 +120,7 @@ test('extractOccurrences：全库机械提取九族签名', (t) => {
     'anchors:hard|task-20260701-002:r2:h2',
     'committer:degraded|task-20260701-002',
     'failed:budget_exceeded|task-20260701-001',
+    'guard:existing_test_change|task-20260701-002:r2',
     'maker:cold_degraded|task-20260701-002:r2',
     'maker:error_max_turns|task-20260701-002:r1',
     'shadow:disagreement|task-20260701-002:r2:AC-004',

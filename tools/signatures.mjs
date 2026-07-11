@@ -22,6 +22,7 @@ export const SIGNATURE_ROUTES = {
   'testgate:vacuous': 'addendum',
   'shadow:disagreement': 'guard',
   'anchors:hard': 'guard',
+  'guard:existing_test_change': 'guard', // E27：既有测试被改（reward hacking 可见性信号）
   'failed:': 'guard', // 前缀族：failed:budget_exceeded / failed:spawn_failed / …
 };
 
@@ -84,6 +85,8 @@ export function extractOccurrences(root) {
         for (let i = 1; i <= hardN; i++) {
           occs.push({ sig: 'anchors:hard', key: `${t.id}:r${m[1]}:h${i}` });
         }
+      } else if ((m = name.match(/^verify-r(\d+)\.test-change-guard\.json$/))) {
+        occs.push({ sig: 'guard:existing_test_change', key: `${t.id}:r${m[1]}` });
       }
     }
   }

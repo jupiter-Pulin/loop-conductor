@@ -63,6 +63,7 @@ test('collectWeekly：窗口归属、成本按角色、shadow/anchors 收账、A
       'verifier-r1.json': { cost_usd: 1.1 },
       'verify-r1.verdict.json': { overall: 'pass' },
       'verify-r1.evidence-anchors.json': { mode: 'observe', hard: [], soft: [{ x: 1 }, { x: 2 }] },
+      'verify-r1.test-change-guard.json': { schema_version: 1, round: 1, modified: ['test/a.test.mjs', 'test/b.test.mjs'], deleted: [], renamed: [], total: 2 },
       'committer-r1.json': { cost_usd: 0.02 },
     },
     events: [
@@ -126,6 +127,7 @@ test('collectWeekly：窗口归属、成本按角色、shadow/anchors 收账、A
 
   // 开关收账
   assert.deepEqual(rep.switches.evidence_anchors, { rounds: 1, hard: 0, soft: 2 });
+  assert.deepEqual(rep.switches.test_change_guard, { rounds: 1, files: 2 }, 'E27 守卫产物入周报');
   assert.equal(rep.switches.shadow.acs, 6);
   assert.equal(rep.switches.shadow.agreed, 5);
   assert.deepEqual(rep.switches.shadow.disagreements, [
