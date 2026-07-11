@@ -29,3 +29,4 @@ target-profiles/*
 # loop 传感层运行时数据（R7-3 已批）
 state/alerts-cursor.json
 state/cron-*.log
+state/conductor-run.log
