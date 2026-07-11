@@ -11,9 +11,11 @@ import { FIXED_STATS } from '../helpers/target-fixture.mjs';
 import { collectTask } from '../../tools/dossier-stats.mjs';
 
 const FIX = { type: 'writeFile', path: 'lib/stats.mjs', content: FIXED_STATS };
+// 提案用英文：F13/006 语言门默认 commitLanguage='en'（中文提案会被判 invalid——
+// 该测试与 006 各自绿、合入后才暴露的语义冲突，2026-07-10 修正）。
 const GOOD_PROPOSAL = JSON.stringify({
-  subject: 'fix(stats): median 偶数分支取平均',
-  body: '事件流集成测试提案。\n\n验证：node --test 全绿。',
+  subject: 'fix(stats): average the two middle values for even-length median',
+  body: 'Events-log integration fixture proposal.\n\nVerified: node --test all green.',
 });
 
 function readEvents(env, id) {
