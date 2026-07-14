@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dashboard",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["conductor/dashboard/server.mjs", "--port", "4401", "--no-auto-run"],
+      "port": 4401
+    },
+    {
+      "name": "dashboard-drawerfix",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["worktrees/task-20260713-007/conductor/dashboard/server.mjs", "--port", "4408", "--no-auto-run"],
+      "port": 4408
+    }
+  ]
+}
