@@ -11,15 +11,24 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { loadCfg, resolveRoot } from '../conductor.mjs';
 import {
-  isValidTaskId, buildBoard, buildTaskDetail, formatCliMessage,
+  isValidTaskId, buildBoard, buildTaskDetail, buildTaskDiff, formatCliMessage,
   buildSyncActionArgv, SYNC_ACTIONS, parseNewTaskId, buildNewTaskArgv,
+  listActiveSpawns, buildStreamTail,
 } from './model.mjs';
+import { buildMetrics } from './metrics.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CONDUCTOR_BIN = path.join(HERE, '..', 'conductor.mjs');
 const INDEX_HTML = path.join(HERE, 'index.html');
+const STATIC_DIR = path.join(HERE, 'static');
+const STATIC_PREFIX = '/static/';
+const STATIC_CONTENT_TYPES = {
+  '.css': 'text/css; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+};
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   let port = 4400;
   let autoRun = true;
   for (let i = 0; i < argv.length; i++) {
@@ -77,6 +86,175 @@ function spawnDetachedConductor(argv) {
   child.unref();
 }
 
+// ---- SSE 失效通知总线（P4-G1/AC-001/002/003）：只广播 { type, id? } 信号，绝不承载 board/task 数据（INV-1）。 ----
+
+const SSE_DEBOUNCE_MS = 200;
+const SSE_HEARTBEAT_MS = 15000;
+const SSE_SCAN_INTERVAL_MS = 2000; // ≤3s（AC-003）
+
+/** state/{queue,done,failed} 各任务 runtime.json 的 mtime 签名；扫描兜底模式靠签名变化判定 board-dirty。 */
+function boardSignature(cfg) {
+  const parts = [];
+  for (const dir of [cfg.queueDir, cfg.doneDir, cfg.failedDir]) {
+    let names = [];
+    try { names = fs.readdirSync(dir).sort(); } catch { continue; }
+    for (const name of names) {
+      let mtimeMs = -1;
+      try { mtimeMs = fs.statSync(path.join(dir, name, 'runtime.json')).mtimeMs; } catch { /* 缺失即签名恒定值 */ }
+      parts.push(`${dir}::${name}::${mtimeMs}`);
+    }
+  }
+  return parts.join('|');
+}
+
+/**
+ * 创建一个 SSE 变更总线：fs.watch 可用则 watch state/{queue,done,failed}（board-dirty）与
+ * dossier/（按顶层 <id> 段推 task-dirty），watch 报错/不可用时降级为周期扫描（AC-003）。
+ * forceScan 显式跳过 watch 直接进扫描模式，供集成测试验证降级路径。
+ */
+function createChangeBus(cfg, { forceScan = false } = {}) {
+  const clients = new Set();
+  let boardTimer = null;
+  const taskTimers = new Map();
+  let usingScan = false;
+  const watchers = [];
+  let scanTimer = null;
+  let lastSignature = null;
+
+  function broadcastEvent(event) {
+    const line = `data: ${JSON.stringify(event)}\n\n`;
+    for (const res of clients) {
+      try { res.write(line); } catch { /* 客户端已断开，close 回调会摘除 */ }
+    }
+  }
+
+  function emitBoardDirty() {
+    if (boardTimer) return;
+    boardTimer = setTimeout(() => { boardTimer = null; broadcastEvent({ type: 'board-dirty' }); }, SSE_DEBOUNCE_MS);
+    boardTimer.unref?.();
+  }
+
+  function emitTaskDirty(id) {
+    if (taskTimers.has(id)) return;
+    const timer = setTimeout(() => { taskTimers.delete(id); broadcastEvent({ type: 'task-dirty', id }); }, SSE_DEBOUNCE_MS);
+    timer.unref?.();
+    taskTimers.set(id, timer);
+  }
+
+  function stopWatch() {
+    for (const w of watchers) { try { w.close(); } catch { /* 已关闭 */ } }
+    watchers.length = 0;
+  }
+
+  function startScan() {
+    if (scanTimer) return;
+    lastSignature = boardSignature(cfg);
+    scanTimer = setInterval(() => {
+      const sig = boardSignature(cfg);
+      if (sig !== lastSignature) {
+        lastSignature = sig;
+        emitBoardDirty();
+      }
+    }, SSE_SCAN_INTERVAL_MS);
+    scanTimer.unref?.();
+  }
+
+  function switchToScan() {
+    if (usingScan) return;
+    usingScan = true;
+    stopWatch();
+    startScan();
+  }
+
+  function startWatch() {
+    try {
+      for (const dir of [cfg.queueDir, cfg.doneDir, cfg.failedDir]) {
+        const w = fs.watch(dir, { recursive: true }, () => emitBoardDirty());
+        w.on('error', switchToScan);
+        watchers.push(w);
+      }
+      const dw = fs.watch(cfg.dossierDir, { recursive: true }, (evt, filename) => {
+        const id = filename ? String(filename).split(path.sep)[0] : null;
+        if (id && isValidTaskId(id)) emitTaskDirty(id);
+        else emitBoardDirty();
+      });
+      dw.on('error', switchToScan);
+      watchers.push(dw);
+      return true;
+    } catch {
+      stopWatch();
+      return false;
+    }
+  }
+
+  if (forceScan || !startWatch()) switchToScan();
+
+  return {
+    addClient(res) { clients.add(res); },
+    removeClient(res) { clients.delete(res); },
+    broadcastJob(job) {
+      broadcastEvent({ type: 'job', jobId: job.id, action: job.action, taskId: job.taskId, state: job.state, message: job.message });
+    },
+  };
+}
+
+function handleEvents(req, res, changeBus) {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+  res.write(': connected\n\n'); // 连接建立即发一行心跳注释（AC-001）
+  changeBus.addClient(res);
+  const heartbeat = setInterval(() => { try { res.write(': hb\n\n'); } catch { /* 客户端已断开 */ } }, SSE_HEARTBEAT_MS);
+  heartbeat.unref?.();
+  const cleanup = () => { clearInterval(heartbeat); changeBus.removeClient(res); };
+  req.on('close', cleanup);
+  res.on('error', cleanup);
+}
+
+// ---- merge/retry 异步 job（P4-G4/AC-009/010/011）：立即 202+jobId，job 只存内存，完成后经 SSE 推 job 事件。 ----
+
+const ASYNC_ACTIONS = ['merge', 'retry'];
+const jobs = new Map(); // jobId -> { id, action, taskId, state:'running'|'ok'|'fail', message }
+const runningJobKeys = new Set(); // `${taskId}:${action}`，同任务同动作互斥
+let jobSeq = 0;
+
+function jobKey(taskId, action) { return `${taskId}:${action}`; }
+
+function jobPublic(job) {
+  return { id: job.id, action: job.action, taskId: job.taskId, state: job.state, message: job.message };
+}
+
+function buildAsyncActionArgv(action, id) {
+  return [action, id];
+}
+
+/** 立即注册 job 并 detach 出 runConductor；成功/失败均只在完成后更新 job 并经 SSE 推送。 */
+function startJob(cfg, action, id, changeBus, autoRun) {
+  const key = jobKey(id, action);
+  if (runningJobKeys.has(key)) return null;
+  jobSeq += 1;
+  const job = { id: `job-${jobSeq}`, action, taskId: id, state: 'running', message: null };
+  jobs.set(job.id, job);
+  runningJobKeys.add(key);
+  runConductor(buildAsyncActionArgv(action, id)).then((result) => {
+    job.state = result.exitCode === 0 ? 'ok' : 'fail';
+    job.message = formatCliMessage(result);
+    runningJobKeys.delete(key);
+    // merge 历来不触发后台 run（committer 舞步已在 conductor 内完成推进）；仅 retry 沿用旧同步语义。
+    if (job.state === 'ok' && autoRun && action === 'retry') spawnDetachedConductor(['run']);
+    changeBus.broadcastJob(job);
+  });
+  return job;
+}
+
+function handleAsyncAction(cfg, id, action, res, changeBus, autoRun) {
+  const job = startJob(cfg, action, id, changeBus, autoRun);
+  if (!job) { sendJson(res, 409, { error: `job already running: ${action} ${id}` }); return; }
+  sendJson(res, 202, { jobId: job.id });
+}
+
 async function handleSyncAction(cfg, id, action, req, res, autoRun) {
   const raw = await readBody(req);
   const parsed = parseJsonBody(raw);
@@ -88,10 +266,26 @@ async function handleSyncAction(cfg, id, action, req, res, autoRun) {
   sendJson(res, 200, { ok, exitCode: result.exitCode, message: formatCliMessage(result) });
 }
 
-async function handleMerge(id, res) {
-  const result = await runConductor(['merge', id]);
-  const ok = result.exitCode === 0;
-  sendJson(res, 200, { ok, exitCode: result.exitCode, message: formatCliMessage(result) });
+/** `/static/<rel>` → 磁盘绝对路径；逃逸白名单目录 STATIC_DIR 一律返回 null（供 404）。 */
+function resolveStaticFile(pathname) {
+  const rawRel = pathname.slice(STATIC_PREFIX.length);
+  let rel;
+  try { rel = decodeURIComponent(rawRel); } catch { return null; }
+  const resolved = path.resolve(STATIC_DIR, rel);
+  if (resolved !== STATIC_DIR && !resolved.startsWith(STATIC_DIR + path.sep)) return null;
+  return resolved;
+}
+
+function serveStatic(res, pathname) {
+  const filePath = resolveStaticFile(pathname);
+  if (!filePath) { sendJson(res, 404, { error: 'not found' }); return; }
+  let stat;
+  try { stat = fs.statSync(filePath); } catch { sendJson(res, 404, { error: 'not found' }); return; }
+  if (!stat.isFile()) { sendJson(res, 404, { error: 'not found' }); return; }
+  const contentType = STATIC_CONTENT_TYPES[path.extname(filePath)] || 'application/octet-stream';
+  const data = fs.readFileSync(filePath);
+  res.writeHead(200, { 'Content-Type': contentType });
+  res.end(data);
 }
 
 async function handleNewTask(req, res, autoRun) {
@@ -121,7 +315,8 @@ async function handleNewTask(req, res, autoRun) {
   }
 }
 
-export function createDashboardServer(cfg, { autoRun = true } = {}) {
+export function createDashboardServer(cfg, { autoRun = true, forceScan = false } = {}) {
+  const changeBus = createChangeBus(cfg, { forceScan });
   return http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url, 'http://127.0.0.1');
@@ -134,8 +329,33 @@ export function createDashboardServer(cfg, { autoRun = true } = {}) {
         return;
       }
 
+      if (req.method === 'GET' && url.pathname.startsWith(STATIC_PREFIX)) {
+        serveStatic(res, url.pathname);
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === '/api/events') {
+        handleEvents(req, res, changeBus);
+        return;
+      }
+
       if (req.method === 'GET' && url.pathname === '/api/board') {
         sendJson(res, 200, buildBoard(cfg));
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === '/api/metrics') {
+        sendJson(res, 200, buildMetrics(cfg));
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === '/api/activity') {
+        sendJson(res, 200, { active: listActiveSpawns(cfg) });
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === '/api/jobs') {
+        sendJson(res, 200, { jobs: [...jobs.values()].map(jobPublic) });
         return;
       }
 
@@ -148,11 +368,27 @@ export function createDashboardServer(cfg, { autoRun = true } = {}) {
         return;
       }
 
+      if (parts[0] === 'api' && parts[1] === 'task' && parts.length === 4 && parts[3] === 'diff' && req.method === 'GET') {
+        const id = parts[2];
+        if (!isValidTaskId(id)) { sendJson(res, 400, { error: 'invalid task id' }); return; }
+        const diff = buildTaskDiff(cfg, id);
+        if (!diff) { sendJson(res, 404, { error: `task not found: ${id}` }); return; }
+        sendJson(res, 200, diff);
+        return;
+      }
+
+      if (parts[0] === 'api' && parts[1] === 'task' && parts.length === 4 && parts[3] === 'stream-tail' && req.method === 'GET') {
+        const id = parts[2];
+        if (!isValidTaskId(id)) { sendJson(res, 400, { error: 'invalid task id' }); return; }
+        sendJson(res, 200, { lines: buildStreamTail(cfg, id) });
+        return;
+      }
+
       if (parts[0] === 'api' && parts[1] === 'task' && parts.length === 4 && req.method === 'POST') {
         const id = parts[2];
         const action = parts[3];
         if (!isValidTaskId(id)) { sendJson(res, 400, { error: 'invalid task id' }); return; }
-        if (action === 'merge') { await handleMerge(id, res); return; }
+        if (ASYNC_ACTIONS.includes(action)) { handleAsyncAction(cfg, id, action, res, changeBus, autoRun); return; }
         if (!SYNC_ACTIONS.includes(action)) { sendJson(res, 400, { error: `unknown action: ${action}` }); return; }
         await handleSyncAction(cfg, id, action, req, res, autoRun);
         return;
@@ -173,7 +409,8 @@ export function createDashboardServer(cfg, { autoRun = true } = {}) {
 export function startDashboardServer(argv = process.argv.slice(2)) {
   const { port, autoRun } = parseArgs(argv);
   const cfg = loadCfg(resolveRoot());
-  const server = createDashboardServer(cfg, { autoRun });
+  const forceScan = process.env.DASHBOARD_FORCE_SCAN === '1';
+  const server = createDashboardServer(cfg, { autoRun, forceScan });
   server.listen(port, '127.0.0.1', () => {
     const actualPort = server.address().port;
     console.log(`dashboard listening on http://127.0.0.1:${actualPort}`);

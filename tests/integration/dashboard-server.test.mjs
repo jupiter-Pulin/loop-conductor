@@ -5,6 +5,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
@@ -37,22 +38,23 @@ const FEASIBILITY_MD = [
   '',
 ].join('\n');
 
-function dashboardChildEnv(env) {
+function dashboardChildEnv(env, extraEnv = {}) {
   const e = {
     ...process.env,
     CONDUCTOR_ROOT: env.root,
     CLAUDE_BIN: FAKE_CLAUDE,
     FAKE_CLAUDE_SCRIPT: env.scenarioPath,
     FAKE_CLAUDE_LOG: env.logPath,
+    ...extraEnv,
   };
   delete e.NODE_TEST_CONTEXT;
   return e;
 }
 
 /** 起一个 dashboard server 子进程，解析 stdout 地址行拿到实际 baseUrl/port，测试结束自动 kill。 */
-function startDashboard(t, env, extraArgs = []) {
+function startDashboard(t, env, extraArgs = [], extraEnv = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [DASHBOARD_BIN, ...extraArgs], { env: dashboardChildEnv(env) });
+    const child = spawn(process.execPath, [DASHBOARD_BIN, ...extraArgs], { env: dashboardChildEnv(env, extraEnv) });
     let stdout = '';
     let stderr = '';
     let settled = false;
@@ -102,18 +104,65 @@ async function waitFor(fn, timeoutMs = 4000, stepMs = 30) {
   }
 }
 
-// ---- AC-002：默认端口 / --port 覆盖 / --port 0 随机端口 / host 恒 127.0.0.1 / 地址行格式 ----
+/** 打开 `/api/events` SSE 连接：按 `\n\n` 切帧，支持等待某一帧满足断言的谓词；测试结束自动断开连接。 */
+function openSse(t, baseUrl) {
+  return new Promise((resolve, reject) => {
+    const req = http.get(`${baseUrl}/api/events`, (res) => {
+      const frames = [];
+      const waiters = [];
+      let buf = '';
+      res.on('data', (chunk) => {
+        buf += chunk.toString('utf8');
+        let idx;
+        while ((idx = buf.indexOf('\n\n')) !== -1) {
+          const frame = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          frames.push(frame);
+          for (let i = waiters.length - 1; i >= 0; i--) {
+            if (waiters[i].pred(frame)) {
+              waiters[i].resolve(frame);
+              waiters.splice(i, 1);
+            }
+          }
+        }
+      });
+      t.after(() => { try { req.destroy(); } catch { /* 已断开 */ } });
+      resolve({
+        res,
+        frames,
+        waitForFrame(pred, timeoutMs = 5000) {
+          const existing = frames.find(pred);
+          if (existing) return Promise.resolve(existing);
+          return new Promise((res2, rej2) => {
+            const timer = setTimeout(() => rej2(new Error('waitForFrame timeout')), timeoutMs);
+            waiters.push({ pred, resolve: (f) => { clearTimeout(timer); res2(f); } });
+          });
+        },
+      });
+    });
+    req.on('error', reject);
+  });
+}
 
-test('AC-002: 默认端口 4400，--port 0 用随机可用端口且互不相同，listen host 恒 127.0.0.1', async (t) => {
+/** SSE 帧（含结尾的两个 `\n\n` 已被 openSse 切掉）里的 `data: ` 行 → 解析出的 JSON 对象；无 data 行返回 null。 */
+function sseData(frame) {
+  const line = frame.split('\n').find((l) => l.startsWith('data: '));
+  return line ? JSON.parse(line.slice('data: '.length)) : null;
+}
+
+/** 轮询 `/api/jobs` 直到目标 jobId 到达终态（ok/fail），返回该 job 记录。 */
+async function waitForJobTerminal(baseUrl, jobId, timeoutMs = 6000) {
+  return waitFor(async () => {
+    const { body } = await getJson(baseUrl, '/api/jobs');
+    const job = body.jobs.find((j) => j.id === jobId);
+    return job && job.state !== 'running' ? job : null;
+  }, timeoutMs);
+}
+
+// ---- AC-007：--port 0 随机端口 / host 恒 127.0.0.1 / 地址行格式 ----
+
+test('AC-007: --port 0 用随机可用端口且互不相同，listen host 恒 127.0.0.1，地址行格式正确', async (t) => {
   const env = makeEnv(t);
-
-  const defaultSrv = await startDashboard(t, env, ['--no-auto-run']);
-  assert.equal(defaultSrv.port, 4400);
-  assert.equal(defaultSrv.baseUrl, 'http://127.0.0.1:4400');
-  assert.match(defaultSrv.stdoutLine, /^dashboard listening on http:\/\/127\.0\.0\.1:4400$/);
-  const board = await getJson(defaultSrv.baseUrl, '/api/board');
-  assert.equal(board.status, 200);
-  defaultSrv.child.kill('SIGTERM');
 
   const rand1 = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
   const rand2 = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
@@ -121,6 +170,89 @@ test('AC-002: 默认端口 4400，--port 0 用随机可用端口且互不相同�
   assert.notEqual(rand2.port, 4400);
   assert.notEqual(rand1.port, rand2.port, '两个 --port 0 实例应各自拿到不同的随机端口');
   assert.match(rand1.baseUrl, /^http:\/\/127\.0\.0\.1:\d+$/);
+  assert.match(rand1.stdoutLine, /^dashboard listening on http:\/\/127\.0\.0\.1:\d+$/);
+});
+
+// ---- AC-002/AC-008：默认端口 4400 被占用时，--port 0 实例仍正常工作（不再真实监听 4400 证明默认值） ----
+
+test('AC-002/AC-009: 4400 被占用时，--port 0 启动的 dashboard 实例仍正常工作（不真实监听 4400）', async (t) => {
+  const env = makeEnv(t);
+
+  // 尽力自建占位监听来模拟"4400 已被占用"；若 4400 本就已被外部进程占用（真实 AC-009
+  // 场景，例如常驻 dashboard），EADDRINUSE 本身已经证明前提成立，不应导致用例失败。
+  const placeholder = http.createServer((req, res) => res.end('placeholder'));
+  let ownsPlaceholder = false;
+  await new Promise((resolve, reject) => {
+    placeholder.once('error', (err) => {
+      if (err.code === 'EADDRINUSE') { resolve(); return; }
+      reject(err);
+    });
+    placeholder.once('listening', () => { ownsPlaceholder = true; resolve(); });
+    placeholder.listen(4400, '127.0.0.1');
+  });
+  t.after(() => {
+    if (!ownsPlaceholder) return undefined;
+    return new Promise((resolve) => placeholder.close(() => resolve()));
+  });
+
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+  const board = await getJson(srv.baseUrl, '/api/board');
+  assert.equal(board.status, 200);
+});
+
+// ---- AC-003/AC-004/AC-005：静态文件路由 ----
+
+test('AC-003: GET /static/<file> 命中白名单目录内存在的文件，返回 200 与正确 Content-Type，内容与磁盘一致', async (t) => {
+  const env = makeEnv(t);
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+  const staticDir = path.join(REPO_ROOT, 'conductor', 'dashboard', 'static');
+
+  const cssRes = await fetch(`${srv.baseUrl}/static/tokens.css`);
+  assert.equal(cssRes.status, 200);
+  assert.match(cssRes.headers.get('content-type'), /^text\/css; charset=utf-8$/);
+  assert.equal(await cssRes.text(), fs.readFileSync(path.join(staticDir, 'tokens.css'), 'utf8'));
+
+  const mjsRes = await fetch(`${srv.baseUrl}/static/view.mjs`);
+  assert.equal(mjsRes.status, 200);
+  assert.match(mjsRes.headers.get('content-type'), /^text\/javascript; charset=utf-8$/);
+  assert.equal(await mjsRes.text(), fs.readFileSync(path.join(staticDir, 'view.mjs'), 'utf8'));
+});
+
+test('AC-004: 静态路由防路径穿越，逃逸白名单目录的请求一律 404 且不读取目录外内容', async (t) => {
+  const env = makeEnv(t);
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+
+  const sanity = await fetch(`${srv.baseUrl}/static/tokens.css`);
+  assert.equal(sanity.status, 200, '静态路由应先能命中白名单内的合法文件，穿越防护才有意义');
+
+  for (const p of [
+    '/static/../server.mjs',
+    '/static/../../package.json',
+    '/static/%2e%2e/server.mjs',
+    '/static/%2e%2e%2fserver.mjs',
+    '/static/%2e%2e%2f%2e%2e/package.json',
+  ]) {
+    const res = await fetch(`${srv.baseUrl}${p}`);
+    assert.equal(res.status, 404, p);
+  }
+});
+
+test('AC-005: 静态路由对白名单目录内不存在的路径 404；既有 GET / 与 /api/* 不受影响', async (t) => {
+  const env = makeEnv(t);
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+
+  const sanity = await fetch(`${srv.baseUrl}/static/tokens.css`);
+  assert.equal(sanity.status, 200, '静态路由应存在，才能断言"目录内不存在的路径"这一区分');
+
+  const missing = await fetch(`${srv.baseUrl}/static/nope.css`);
+  assert.equal(missing.status, 404);
+
+  const indexRes = await fetch(`${srv.baseUrl}/`);
+  assert.equal(indexRes.status, 200);
+  assert.match(indexRes.headers.get('content-type'), /text\/html/);
+
+  const boardRes = await getJson(srv.baseUrl, '/api/board');
+  assert.equal(boardRes.status, 200);
 });
 
 // ---- AC-001：loadCfg(resolveRoot()) 读写作用于 CONDUCTOR_ROOT 指向的根目录 ----
@@ -278,9 +410,273 @@ test('AC-012: AWAIT_HUMAN_MERGE 详情 review 含 git diff --shortstat；无有�
   assert.ok(failDetail.body.review.error, 'git diff 失败应给出可读错误文本');
 });
 
+// ==== P2：GET /api/task/:id/diff（分文件 diff） ============================
+
+function gitNumstat(repo, baseBranch, branch) {
+  const out = execFileSync('git', ['-C', repo, 'diff', '--numstat', `${baseBranch}...${branch}`], { encoding: 'utf8' });
+  return out.split('\n').filter((l) => l.trim() !== '').map((line) => {
+    const [added, deleted, ...rest] = line.split('\t');
+    return { added, deleted, path: rest.join('\t') };
+  });
+}
+
+test('P2-AC-001: GET /api/task/:id/diff 的 files 路径集合/+N-N 计数与 git diff --numstat 逐项一致，非降级文件 patch 等于 git diff -- <path>', async (t) => {
+  const env = makeEnv(t);
+  const id = 'task-20260705-500';
+  env.writeTask(id, { stage: 'AWAIT_HUMAN_MERGE' });
+
+  execFileSync('git', ['-C', env.targetDir, 'checkout', '-b', `task/${id}`], { stdio: 'pipe' });
+  fs.writeFileSync(path.join(env.targetDir, 'DIFF_NEW.md'), 'brand new file\nline 2\n');
+  fs.appendFileSync(path.join(env.targetDir, 'README.md'), '追加一行用于 P2-AC-001。\n');
+  execFileSync('git', ['-C', env.targetDir, 'add', '-A'], { stdio: 'pipe' });
+  execFileSync('git', ['-C', env.targetDir, 'commit', '-m', 'fixture: P2-AC-001 diff'], { stdio: 'pipe' });
+  execFileSync('git', ['-C', env.targetDir, 'checkout', 'main'], { stdio: 'pipe' });
+
+  const expected = gitNumstat(env.targetDir, 'main', `task/${id}`);
+  assert.ok(expected.length >= 2, '夹具应至少产生两个改动文件');
+
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+  const { status, body } = await getJson(srv.baseUrl, `/api/task/${id}/diff`);
+  assert.equal(status, 200);
+  assert.equal(body.cleaned, false);
+  assert.deepEqual(
+    body.files.map((f) => f.path).sort(),
+    expected.map((e) => e.path).sort(),
+  );
+  for (const exp of expected) {
+    const got = body.files.find((f) => f.path === exp.path);
+    assert.ok(got, exp.path);
+    assert.equal(got.added, Number(exp.added));
+    assert.equal(got.deleted, Number(exp.deleted));
+    assert.equal(got.binary, false);
+    assert.equal(got.oversize, false);
+    const rawPatch = execFileSync(
+      'git', ['-C', env.targetDir, 'diff', `main...task/${id}`, '--', exp.path], { encoding: 'utf8' },
+    );
+    assert.equal(got.patch, rawPatch, `${exp.path} patch 应与 git diff -- <path> 逐字一致`);
+  }
+});
+
+test('P2-AC-002: 超 verifierDiffMaxBytes 的文件降级 oversize:true/patch:null 但保留计数；二进制文件 binary:true/patch:null', async (t) => {
+  const env = makeEnv(t, { config: { verifierDiffMaxBytes: 80 } });
+  const id = 'task-20260705-501';
+  env.writeTask(id, { stage: 'AWAIT_HUMAN_MERGE' });
+
+  execFileSync('git', ['-C', env.targetDir, 'checkout', '-b', `task/${id}`], { stdio: 'pipe' });
+  const bigLines = Array.from({ length: 30 }, (_, i) => `line ${i} 足够长以撑大 unified diff 字节数`).join('\n');
+  fs.writeFileSync(path.join(env.targetDir, 'OVERSIZE.md'), `${bigLines}\n`);
+  fs.writeFileSync(path.join(env.targetDir, 'BINARY.bin'), Buffer.from([0, 1, 2, 3, 0, 255, 254, 253, 0, 0]));
+  execFileSync('git', ['-C', env.targetDir, 'add', '-A'], { stdio: 'pipe' });
+  execFileSync('git', ['-C', env.targetDir, 'commit', '-m', 'fixture: P2-AC-002 oversize + binary'], { stdio: 'pipe' });
+  execFileSync('git', ['-C', env.targetDir, 'checkout', 'main'], { stdio: 'pipe' });
+
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+  const { status, body } = await getJson(srv.baseUrl, `/api/task/${id}/diff`);
+  assert.equal(status, 200);
+  assert.equal(body.cleaned, false);
+
+  const big = body.files.find((f) => f.path === 'OVERSIZE.md');
+  assert.ok(big, 'OVERSIZE.md 应出现在 files 中');
+  assert.equal(big.oversize, true);
+  assert.equal(big.patch, null);
+  assert.ok(big.added > 0, '超限文件仍应带 +N 计数');
+
+  const bin = body.files.find((f) => f.path === 'BINARY.bin');
+  assert.ok(bin, 'BINARY.bin 应出现在 files 中');
+  assert.equal(bin.binary, true);
+  assert.equal(bin.patch, null);
+});
+
+test('P2-AC-003: task/<id> 分支不存在或已清理时返回 200 { cleaned:true, files:[] }，绝不 500', async (t) => {
+  const env = makeEnv(t);
+
+  const noBranchId = 'task-20260705-502';
+  env.writeTask(noBranchId, { stage: 'AWAIT_HUMAN_MERGE' }); // 从未创建 task/<id> 分支
+
+  const doneId = 'task-20260705-503';
+  env.writeTask(doneId, { stage: 'READY' });
+  const doneDir = path.join(env.root, 'state', 'done', doneId);
+  fs.mkdirSync(doneDir, { recursive: true });
+  fs.renameSync(path.join(env.root, 'state', 'queue', doneId, 'task.json'), path.join(doneDir, 'task.json'));
+  fs.renameSync(path.join(env.root, 'state', 'queue', doneId, 'runtime.json'), path.join(doneDir, 'runtime.json'));
+  fs.rmSync(path.join(env.root, 'state', 'queue', doneId), { recursive: true, force: true });
+
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+
+  const noBranchRes = await getJson(srv.baseUrl, `/api/task/${noBranchId}/diff`);
+  assert.equal(noBranchRes.status, 200);
+  assert.deepEqual(noBranchRes.body, { cleaned: true, files: [] });
+
+  const doneRes = await getJson(srv.baseUrl, `/api/task/${doneId}/diff`);
+  assert.equal(doneRes.status, 200);
+  assert.deepEqual(doneRes.body, { cleaned: true, files: [] });
+
+  const badId = await getJson(srv.baseUrl, '/api/task/not-a-task-id/diff');
+  assert.equal(badId.status, 400);
+
+  const notFound = await getJson(srv.baseUrl, '/api/task/task-20260101-999/diff');
+  assert.equal(notFound.status, 404);
+});
+
+test('P3-AC-002: GET /api/task/:id/diff 对含中文文件名与 rename 的真实 git fixture 输出正确路径与 patch', async (t) => {
+  const env = makeEnv(t);
+  const id = 'task-20260713-500';
+  env.writeTask(id, { stage: 'AWAIT_HUMAN_MERGE' });
+
+  const renamedPath = 'lib/stats-renamed.mjs';
+  const chinesePath = '中文文件名.md';
+
+  execFileSync('git', ['-C', env.targetDir, 'checkout', '-b', `task/${id}`], { stdio: 'pipe' });
+  execFileSync('git', ['-C', env.targetDir, 'mv', 'lib/stats.mjs', renamedPath], { stdio: 'pipe' });
+  fs.appendFileSync(path.join(env.targetDir, renamedPath), '\n// P3-AC-002 rename fixture 追加一行\n');
+  fs.writeFileSync(path.join(env.targetDir, chinesePath), '中文文件名 fixture 内容\n第二行\n');
+  execFileSync('git', ['-C', env.targetDir, 'add', '-A'], { stdio: 'pipe' });
+  execFileSync('git', ['-C', env.targetDir, 'commit', '-m', 'fixture: P3-AC-002 rename + 中文文件名'], { stdio: 'pipe' });
+  execFileSync('git', ['-C', env.targetDir, 'checkout', 'main'], { stdio: 'pipe' });
+
+  // 用真实 git 校验夹具确实触发了 rename 检测（否则这条测试本身没验证到 rename 场景）。
+  const nameStatus = execFileSync(
+    'git', ['-C', env.targetDir, 'diff', '--name-status', `main...task/${id}`], { encoding: 'utf8' },
+  );
+  assert.match(nameStatus, /^R\d+\t/m, 'git 应把该改动识别为 rename');
+
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+  const { status, body } = await getJson(srv.baseUrl, `/api/task/${id}/diff`);
+  assert.equal(status, 200);
+  assert.equal(body.cleaned, false);
+
+  const paths = body.files.map((f) => f.path).sort();
+  assert.deepEqual(paths, [chinesePath, renamedPath].sort(), 'files 路径集合应为新路径本身，既无残留旧路径也无 "old => new" 合并伪路径');
+  for (const p of paths) assert.doesNotMatch(p, /=>/, `${p} 不应是 "old => new" 合并伪路径`);
+
+  const renamed = body.files.find((f) => f.path === renamedPath);
+  assert.ok(renamed, 'rename 后的新路径应出现在 files 中');
+  assert.match(renamed.status, /^R/, 'rename 文件的 status 应以 R 开头');
+  assert.equal(renamed.binary, false);
+  assert.ok(renamed.patch && renamed.patch.length > 0, 'rename 文件的 patch 不应为空');
+  assert.match(renamed.patch, /rename from lib\/stats\.mjs/);
+  assert.match(renamed.patch, new RegExp(`rename to ${renamedPath.replace('.', '\\.')}`));
+  assert.match(renamed.patch, /P3-AC-002 rename fixture 追加一行/, 'rename 文件的 patch 应含真实新增内容，而非伪造的整文件新增');
+
+  const chinese = body.files.find((f) => f.path === chinesePath);
+  assert.ok(chinese, '中文文件名应以真实未转义路径出现在 files 中');
+  assert.equal(chinese.binary, false);
+  assert.ok(chinese.patch && chinese.patch.length > 0, '中文文件名文件的 patch 不应为空');
+  assert.match(chinese.patch, new RegExp(`\\+\\+\\+ b/${chinesePath}`), 'patch 头部应含真实未转义的中文路径');
+  assert.match(chinese.patch, /中文文件名 fixture 内容/);
+});
+
+// ==== P4：SSE 失效通知（AC-001/002/003） ============================
+
+test('P4-AC-001: GET /api/events 响应头为 text/event-stream，连接建立即写出心跳注释行，且不立即关闭', async (t) => {
+  const env = makeEnv(t);
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+
+  const sse = await openSse(t, srv.baseUrl);
+  assert.match(sse.res.headers['content-type'], /text\/event-stream/);
+  const first = await sse.waitForFrame((f) => f.startsWith(':'));
+  assert.match(first, /^:/);
+  assert.equal(sse.res.complete, false, '连接建立后不应立即关闭');
+});
+
+test('P4-AC-002: state/queue 变更推 board-dirty，dossier/<id> 变更推 task-dirty；事件体只含 type(+id)，不含 board/task 数据（INV-1）', async (t) => {
+  const env = makeEnv(t);
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+  const sse = await openSse(t, srv.baseUrl);
+  await sse.waitForFrame((f) => f.startsWith(':')); // 先确认已连上再触发变更
+
+  const id = 'task-20260713-800';
+  env.writeTask(id, { stage: 'READY' });
+
+  const boardFrame = await sse.waitForFrame((f) => sseData(f)?.type === 'board-dirty');
+  assert.deepEqual(Object.keys(sseData(boardFrame)).sort(), ['type']);
+
+  fs.mkdirSync(env.dossier(id), { recursive: true });
+  fs.writeFileSync(
+    env.dossier(id, 'maker-r1.json'),
+    JSON.stringify({ role: 'maker', round: 1, started: '2026-07-13T00:00:00.000Z' }),
+  );
+
+  const taskFrame = await sse.waitForFrame((f) => sseData(f)?.type === 'task-dirty');
+  const taskData = sseData(taskFrame);
+  assert.deepEqual(Object.keys(taskData).sort(), ['id', 'type']);
+  assert.equal(taskData.id, id);
+});
+
+test('P4-AC-003: DASHBOARD_FORCE_SCAN=1 强制降级为周期扫描时仍在数秒内推送 board-dirty，连接保持存活', async (t) => {
+  const env = makeEnv(t);
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run'], { DASHBOARD_FORCE_SCAN: '1' });
+  const sse = await openSse(t, srv.baseUrl);
+  await sse.waitForFrame((f) => f.startsWith(':'));
+
+  const id = 'task-20260713-801';
+  env.writeTask(id, { stage: 'READY' });
+
+  const boardFrame = await sse.waitForFrame((f) => sseData(f)?.type === 'board-dirty', 6000);
+  assert.ok(boardFrame);
+  assert.equal(sse.res.complete, false, '扫描降级路径下连接也应保持存活');
+});
+
+// ==== P4：实时活动面（AC-005） ============================
+
+test('P4-AC-005: GET /api/activity 无活跃任务时返回 200 { active: [] }', async (t) => {
+  const env = makeEnv(t);
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+  const { status, body } = await getJson(srv.baseUrl, '/api/activity');
+  assert.equal(status, 200);
+  assert.deepEqual(body, { active: [] });
+});
+
+test('P4-AC-005: GET /api/activity 对新鲜 stream.jsonl 产出活跃条目，形状与 model 层一致', async (t) => {
+  const env = makeEnv(t);
+  const id = 'task-20260713-810';
+  env.writeTask(id, { stage: 'READY' });
+  const dossierDir = env.dossier(id);
+  fs.mkdirSync(dossierDir, { recursive: true });
+  fs.writeFileSync(path.join(dossierDir, 'maker-r1.json'), JSON.stringify({ role: 'maker', round: 1, started: new Date().toISOString() }));
+  fs.writeFileSync(path.join(dossierDir, 'maker-r1.stream.jsonl'), '{}\n');
+
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+  const { status, body } = await getJson(srv.baseUrl, '/api/activity');
+  assert.equal(status, 200);
+  assert.equal(body.active.length, 1);
+  assert.equal(body.active[0].taskId, id);
+  assert.equal(body.active[0].role, 'maker');
+  assert.equal(body.active[0].round, 1);
+  assert.equal(typeof body.active[0].lastActivity, 'string');
+});
+
+// ==== P4：stream tail（AC-008） ============================
+
+test('P4-AC-008: GET /api/task/:id/stream-tail 非法 id 400；任务/文件缺失 200 { lines: [] }；合法内容返回解析行', async (t) => {
+  const env = makeEnv(t);
+  const id = 'task-20260713-811';
+  env.writeTask(id, { stage: 'READY' });
+  const dossierDir = env.dossier(id);
+  fs.mkdirSync(dossierDir, { recursive: true });
+  const line = JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'hello from stream tail' }] } });
+  fs.writeFileSync(path.join(dossierDir, 'maker-r1.stream.jsonl'), `${line}\n`);
+
+  const noStreamId = 'task-20260713-812';
+  env.writeTask(noStreamId, { stage: 'READY' });
+
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+
+  const badId = await getJson(srv.baseUrl, '/api/task/not-a-task-id/stream-tail');
+  assert.equal(badId.status, 400);
+
+  const missingRes = await getJson(srv.baseUrl, `/api/task/${noStreamId}/stream-tail`);
+  assert.equal(missingRes.status, 200);
+  assert.deepEqual(missingRes.body, { lines: [] });
+
+  const okRes = await getJson(srv.baseUrl, `/api/task/${id}/stream-tail`);
+  assert.equal(okRes.status, 200);
+  assert.deepEqual(okRes.body, { lines: ['hello from stream tail'] });
+});
+
 // ---- AC-013/AC-014：六个同步动作 argv 透传 + 非零退出/锁忙以 200+ok:false 呈现 ----
 
-test('AC-013/AC-014: 六个同步动作 spawn CLI 并同步回传；非法 option 与锁忙均 200 且 ok:false', async (t) => {
+test('AC-013/AC-014: 五个同步动作 spawn CLI 并同步回传；retry 已 job 化（P4-AC-014③）；非法 option 与锁忙均 200 且 ok:false', async (t) => {
   const env = makeEnv(t);
   const cfg = loadCfg(env.root);
 
@@ -355,8 +751,11 @@ test('AC-013/AC-014: 六个同步动作 spawn CLI 并同步回传；非法 optio
   assert.equal(setupRes.body.ok, true);
   assert.match(setupRes.body.message, /setup_approval=approved/);
 
-  const retryRes = await postJson(srv.baseUrl, `/api/task/${retryId}/retry`, {});
-  assert.equal(retryRes.body.ok, true);
+  const retryJobRes = await postJson(srv.baseUrl, `/api/task/${retryId}/retry`, {});
+  assert.equal(retryJobRes.status, 202, 'retry 应立即 202，不再同步等待（P4-AC-014③）');
+  assert.ok(retryJobRes.body.jobId && typeof retryJobRes.body.jobId === 'string');
+  const retryJob = await waitForJobTerminal(srv.baseUrl, retryJobRes.body.jobId);
+  assert.equal(retryJob.state, 'ok');
   assert.equal(env.findTask(retryId).runtime.stage, 'READY');
 
   const lock = tryAcquireTaskLock(cfg, busyId);
@@ -424,7 +823,7 @@ test('AC-015: --no-auto-run 启动时，同步动作成功后不触发后台 run
 
 // ---- AC-016：merge 与其余 6 个动作一致，同步等待 conductor merge 并回传真实结果 ----
 
-test('AC-016: POST .../merge 同步等待 conductor merge 并回传真实结果；无有效分支时失败但任务保持原状', async (t) => {
+test('AC-016: POST .../merge 立即 202+jobId；job 终态经 GET /api/jobs 为 fail 且 message 含 stderr；任务保持原状（P4-AC-014①）', async (t) => {
   const env = makeEnv(t);
   const id = 'task-20260705-160';
   // spent_usd >= 默认 budgetUsd=5：committer 提案 fail-open 直接跳过，merge 失败路径不依赖 fake-claude。
@@ -432,20 +831,24 @@ test('AC-016: POST .../merge 同步等待 conductor merge 并回传真实结果�
 
   const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
 
+  const startedAt = Date.now();
   const res = await postJson(srv.baseUrl, `/api/task/${id}/merge`, {});
-  assert.equal(res.status, 200);
-  assert.equal(res.body.ok, false, '无 task/<id> 分支，merge 应真实失败而非恒 ok:true');
-  assert.notEqual(res.body.exitCode, 0);
-  assert.match(res.body.message, /merge 失败/);
+  assert.equal(res.status, 202, '无 task/<id> 分支的 merge 也应立即 202，不同步等待子进程');
+  assert.ok(res.body.jobId && typeof res.body.jobId === 'string');
+  assert.ok(Date.now() - startedAt < 500, '响应不应等待 conductor merge 子进程完成');
+
+  const job = await waitForJobTerminal(srv.baseUrl, res.body.jobId);
+  assert.equal(job.state, 'fail', '无 task/<id> 分支，merge 应真实失败而非恒 ok');
+  assert.match(job.message, /merge 失败/, 'fail 态 message 应携带子进程 stderr 文本');
 
   const after = env.findTask(id);
   assert.equal(after.box, 'queue');
   assert.equal(after.runtime.stage, 'AWAIT_HUMAN_MERGE', '无 task/<id> 分支，merge 应失败，任务保持原状');
 });
 
-// ---- AC-003：merge 成功路径不应额外 spawn run（与其余 6 个同步动作不同）----
+// ---- AC-003：merge 成功路径不应额外 spawn run（与其余 5 个同步动作不同）----
 
-test('AC-003: merge 成功后不 spawn conductor run；队列里其它任务不被连带触发', async (t) => {
+test('AC-003: merge 立即 202+jobId，job 终态为 ok；成功后不 spawn conductor run，队列里其它任务不被连带触发（P4-AC-014②）', async (t) => {
   const env = makeEnv(t, { config: { spawnRetries: 0 } });
 
   const mergeId = 'task-20260705-161';
@@ -466,13 +869,65 @@ test('AC-003: merge 成功后不 spawn conductor run；队列里其它任务不�
   const srv = await startDashboard(t, env, ['--port', '0']); // 默认 autoRun=true
 
   const res = await postJson(srv.baseUrl, `/api/task/${mergeId}/merge`, {});
-  assert.equal(res.status, 200);
-  assert.equal(res.body.ok, true, 'merge 应成功');
+  assert.equal(res.status, 202);
+  assert.ok(res.body.jobId);
+
+  const job = await waitForJobTerminal(srv.baseUrl, res.body.jobId);
+  assert.equal(job.state, 'ok', 'merge 应成功');
 
   await waitFor(() => env.findTask(mergeId)?.box === 'done', 4000);
   await new Promise((r) => setTimeout(r, 1000));
   assert.equal(env.calls().length, 0, 'merge 成功不应触发后台 run，probe 任务的 fake-claude 不应被调用');
   assert.equal(env.findTask(probeId).runtime.stage, 'READY', 'merge 成功不应连带推进队列里其它任务');
+});
+
+// ---- P4-AC-010/011：job SSE 推送 + 同任务同动作并发 409 ----
+
+test('P4-AC-010: job 完成经 SSE 推送 type:job 事件，字段与 GET /api/jobs 记录一致', async (t) => {
+  const env = makeEnv(t, { config: { spawnRetries: 0 } });
+  const id = 'task-20260705-163';
+  env.writeTask(id, { stage: 'READY' });
+
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+  const sse = await openSse(t, srv.baseUrl);
+  await sse.waitForFrame((f) => f.startsWith(':'));
+
+  const res = await postJson(srv.baseUrl, `/api/task/${id}/retry`, {});
+  assert.equal(res.status, 202);
+  const jobId = res.body.jobId;
+
+  const jobFrame = await sse.waitForFrame((f) => sseData(f)?.type === 'job' && sseData(f).jobId === jobId);
+  const jobEvent = sseData(jobFrame);
+  const jobsRes = await getJson(srv.baseUrl, '/api/jobs');
+  const recorded = jobsRes.body.jobs.find((j) => j.id === jobId);
+  assert.equal(jobEvent.state, recorded.state);
+  assert.equal(jobEvent.action, recorded.action);
+  assert.equal(jobEvent.taskId, recorded.taskId);
+  assert.equal(jobEvent.message, recorded.message);
+});
+
+test('P4-AC-011: 同任务同动作已有 running job 时再次 POST 返回 409，不新登记第二个 job；不同任务/不同动作不受影响', async (t) => {
+  const env = makeEnv(t);
+  const mergeId = 'task-20260705-164';
+  env.writeTask(mergeId, { stage: 'AWAIT_HUMAN_MERGE', spent: 6 }); // 无 task/<id> 分支，merge 会失败但仍占用 running 一段时间
+
+  const retryId = 'task-20260705-165';
+  env.writeTask(retryId, { stage: 'READY' });
+
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+
+  const first = await postJson(srv.baseUrl, `/api/task/${mergeId}/merge`, {});
+  assert.equal(first.status, 202);
+  const second = await postJson(srv.baseUrl, `/api/task/${mergeId}/merge`, {});
+  assert.equal(second.status, 409, '同任务同动作已有 running job 时应 409');
+
+  const otherTask = await postJson(srv.baseUrl, `/api/task/${retryId}/retry`, {});
+  assert.equal(otherTask.status, 202, '不同任务不应被同任务的 running job 挡住');
+
+  await waitForJobTerminal(srv.baseUrl, first.body.jobId);
+  const jobsRes = await getJson(srv.baseUrl, '/api/jobs');
+  const mergeJobs = jobsRes.body.jobs.filter((j) => j.taskId === mergeId && j.action === 'merge');
+  assert.equal(mergeJobs.length, 1, '409 不应新登记第二个 job');
 });
 
 // ---- AC-017：new-task 透传 CLI + brief 临时文件生命周期 + id 解析 + feasibility 显式布尔 ----
@@ -512,6 +967,54 @@ test('AC-017: POST /api/new-task 透传 CLI，brief 临时文件用后即删，i
   const featureNoFeasTask = env.findTask(featureNoFeasRes.body.id);
   assert.equal(featureNoFeasTask.task.feasibility, false);
   assert.equal(featureNoFeasTask.runtime.stage, 'NEEDS_SPEC');
+});
+
+// ==== P5：GET /api/metrics（AC-009） ============================
+
+test('AC-009: GET /api/metrics 空仓库返回良构空结构而非 500；写入 done 任务后现读反映，不产生磁盘写入', async (t) => {
+  const env = makeEnv(t);
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+
+  const emptyRes = await getJson(srv.baseUrl, '/api/metrics');
+  assert.equal(emptyRes.status, 200);
+  assert.equal(emptyRes.body.isEmpty, true);
+  assert.deepEqual(emptyRes.body.totals.taskCount, { done: 0, failed: 0 });
+  assert.deepEqual(emptyRes.body.table, []);
+  assert.equal(emptyRes.body.totals.spentPercentiles.p50, null);
+  for (const key of ['totals', 'yield', 'durations', 'table', 'isEmpty']) assert.ok(key in emptyRes.body, key);
+
+  const id = 'task-20260713-820';
+  const doneDir = path.join(env.root, 'state', 'done', id);
+  fs.mkdirSync(doneDir, { recursive: true });
+  fs.writeFileSync(path.join(doneDir, 'task.json'), JSON.stringify({
+    schema_version: 1, id, kind: 'bugfix', title: 't', repo: 'target', targetRepo: env.targetDir,
+    baseBranch: 'main', testCommand: 'node --test', created_at: '2026-07-13T00:00:00.000Z',
+  }));
+  fs.writeFileSync(path.join(doneDir, 'runtime.json'), JSON.stringify({
+    schema_version: 1, stage: 'DONE', maker_miss_count: 0, verifier_invalid_count: 0, spent_usd: 3,
+    approval: null, maker_session_id: null, current_round: 0, last_failure_type: null,
+    updated_at: '2026-07-13T00:00:00.000Z',
+  }));
+  const dossierDir = env.dossier(id);
+  fs.mkdirSync(dossierDir, { recursive: true });
+  fs.writeFileSync(path.join(dossierDir, 'maker-r1.json'), JSON.stringify({ role: 'maker', round: 1, ok: true, cost_usd: 0.5 }));
+  fs.writeFileSync(path.join(dossierDir, 'verify-r1.verdict.json'), JSON.stringify({
+    schema_version: 1, round: 1, overall: 'pass',
+    criteria_results: [{ ac_id: 'AC-001', status: 'pass', reason: 'ok', evidence: [] }], non_ac_findings: [],
+  }));
+
+  const filledRes = await getJson(srv.baseUrl, '/api/metrics');
+  assert.equal(filledRes.status, 200);
+  assert.equal(filledRes.body.isEmpty, false);
+  assert.equal(filledRes.body.totals.taskCount.done, 1);
+  assert.equal(filledRes.body.totals.totalSpentUsd, 3);
+  assert.equal(filledRes.body.table.length, 1);
+  assert.equal(filledRes.body.table[0].id, id);
+  assert.equal(filledRes.body.table[0].spentUsd, 3);
+  assert.equal(filledRes.body.yield.firstPassRate.value, 1);
+
+  const doneDirEntriesAfter = fs.readdirSync(doneDir).sort();
+  assert.deepEqual(doneDirEntriesAfter, ['runtime.json', 'task.json'], 'GET /api/metrics 不应在任务目录留下任何写入痕迹');
 });
 
 // ---- AC-018：非法 id / 未知 action / 缺字段 / 非法 JSON body 均 400，不 spawn ----
