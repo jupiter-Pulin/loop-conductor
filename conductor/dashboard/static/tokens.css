@@ -1,26 +1,27 @@
 /* dashboard/static/tokens.css — 唯一视觉事实源 docs/features/dashboard-v2/design-language.md §1/§2 的逐字落地。
-   不发明本文档之外的颜色/字号。 */
+   不发明本文档之外的颜色/字号。当前主题：Claude Dark（§1）。 */
 :root {
-  /* §1 结构层（无状态，永远墨色） */
-  --paper:      #FAF9F5;
-  --surface:    #FFFFFF;
-  --ink:        #211F1A;
-  --ink-2:      #6B675D;
-  --ink-3:      #A6A196;
-  --line:       #E5E2D9;
-  --line-heavy: #C9C5B8;
+  /* §1 结构层（无状态，永远暖灰/暖白墨色；层次见 §1.1 表面色阶） */
+  --paper:         #1F1E1B;
+  --surface:       #262521;
+  --surface-hover: #2E2D28;
+  --ink:           #F5F4EF;
+  --ink-2:         #B8B5AD;
+  --ink-3:         #8A877F;
+  --line:          rgba(255,255,255,.08);
+  --line-heavy:    rgba(255,255,255,.16);
 
-  /* §1 状态层（唯一允许出现彩色的地方） */
-  --live:       #1D4ED8;
-  --live-bg:    #EFF4FE;
-  --attn:       #B45309;
-  --attn-bg:    #FDF3E7;
-  --pass:       #15803D;
-  --pass-bg:    #ECF6EE;
-  --fail:       #B91C1C;
-  --fail-bg:    #FBEFED;
-  --unknown:    #7C6F9B;
-  --unknown-bg: #F3F0F9;
+  /* §1 状态层（唯一允许出现彩色的地方；--live 为全站唯一强调色） */
+  --live:       #D97757;
+  --live-bg:    rgba(217,119,87,.16);
+  --attn:       #E49D67;
+  --attn-bg:    rgba(228,157,103,.16);
+  --pass:       #6BC78D;
+  --pass-bg:    rgba(107,199,141,.16);
+  --fail:       #DA6262;
+  --fail-bg:    rgba(218,98,98,.16);
+  --unknown:    #AB97D8;
+  --unknown-bg: rgba(171,151,216,.16);
 
   /* §2 字体 */
   --font-ui:   -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans SC", sans-serif;

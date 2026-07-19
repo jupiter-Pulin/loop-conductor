@@ -421,14 +421,17 @@ test('index.html：不引用任何外部 URL 资源，允许同源 /static/ 引�
 
 // ---- AC-001：tokens.css 逐字落地 design-language.md §1/§2 全部 token ----
 
-test('tokens.css：逐字声明 design-language §1/§2 全部颜色与字体 token（AC-001）', () => {
+test('tokens.css：逐字声明 design-language §1/§2 全部颜色与字体 token（AC-001，Claude Dark）', () => {
   const css = fs.readFileSync(path.join(STATIC_DIR, 'tokens.css'), 'utf8').toLowerCase();
   const expectations = [
-    ['--paper', '#faf9f5'], ['--surface', '#ffffff'], ['--ink', '#211f1a'],
-    ['--ink-2', '#6b675d'], ['--ink-3', '#a6a196'], ['--line', '#e5e2d9'], ['--line-heavy', '#c9c5b8'],
-    ['--live', '#1d4ed8'], ['--live-bg', '#eff4fe'], ['--attn', '#b45309'], ['--attn-bg', '#fdf3e7'],
-    ['--pass', '#15803d'], ['--pass-bg', '#ecf6ee'], ['--fail', '#b91c1c'], ['--fail-bg', '#fbefed'],
-    ['--unknown', '#7c6f9b'], ['--unknown-bg', '#f3f0f9'],
+    ['--paper', '#1f1e1b'], ['--surface', '#262521'], ['--surface-hover', '#2e2d28'], ['--ink', '#f5f4ef'],
+    ['--ink-2', '#b8b5ad'], ['--ink-3', '#8a877f'],
+    ['--line', 'rgba\\(255,255,255,\\.08\\)'], ['--line-heavy', 'rgba\\(255,255,255,\\.16\\)'],
+    ['--live', '#d97757'], ['--live-bg', 'rgba\\(217,119,87,\\.16\\)'],
+    ['--attn', '#e49d67'], ['--attn-bg', 'rgba\\(228,157,103,\\.16\\)'],
+    ['--pass', '#6bc78d'], ['--pass-bg', 'rgba\\(107,199,141,\\.16\\)'],
+    ['--fail', '#da6262'], ['--fail-bg', 'rgba\\(218,98,98,\\.16\\)'],
+    ['--unknown', '#ab97d8'], ['--unknown-bg', 'rgba\\(171,151,216,\\.16\\)'],
   ];
   for (const [name, value] of expectations) {
     const re = new RegExp(`${name}\\s*:\\s*${value}\\s*;`);
@@ -509,13 +512,13 @@ test('app.css：.drawer 宽度为 min(1280px, 90vw)，且 768px media query 内�
   assert.match(mediaMatch[1], /width\s*:\s*100vw/, '768px media query 内 .drawer 宽度应为 100vw');
 });
 
-// ---- AC-002：抽屉遮罩背景色改为 rgba(33, 31, 26, 0.5) ----
+// ---- AC-002：抽屉遮罩背景色改为 rgba(0, 0, 0, 0.6)（Claude Dark，design-language §3） ----
 
-test('app.css：.overlay.open 背景色为 rgba(33, 31, 26, 0.5)（AC-002）', () => {
+test('app.css：.overlay.open 背景色为 rgba(0, 0, 0, 0.6)（AC-002，Claude Dark）', () => {
   const css = fs.readFileSync(path.join(STATIC_DIR, 'app.css'), 'utf8');
   const overlayOpenMatch = css.match(/\.overlay\.open\s*\{[^}]*\}/);
   assert.ok(overlayOpenMatch, 'app.css 应含 .overlay.open 规则块');
-  assert.match(overlayOpenMatch[0], /background\s*:\s*rgba\(\s*33\s*,\s*31\s*,\s*26\s*,\s*\.?5\s*\)/, '.overlay.open 背景色应为 rgba(33, 31, 26, 0.5)');
+  assert.match(overlayOpenMatch[0], /background\s*:\s*rgba\(\s*0\s*,\s*0\s*,\s*0\s*,\s*\.?6\s*\)/, '.overlay.open 背景色应为 rgba(0, 0, 0, 0.6)');
 });
 
 // ---- AC-020：static/*.mjs 仅相对导入（不要求至少一条 import） ----
