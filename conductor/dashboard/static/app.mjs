@@ -56,22 +56,44 @@ function fmtNowLocal() {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-// ---- 全局页头：五项监工上下文 ----
+// ---- 全局页头：五项监工上下文(骨架只建一次,轮询只 patch 变化的 stat-value 文本,避免每 1.5s 全量重建引发布局跳动) ----
+
+const HEADER_STAT_DEFS = [
+  ['target repo', 'targetRepo'],
+  ['base branch', 'baseBranch'],
+  ['queue/done/failed', 'queueDoneFailed'],
+  ['done 花费', 'doneSpentUsd'],
+  ['刷新于', 'refreshedAt'],
+];
+const headerStatEls = new Map(); // key -> stat-value span
+
+function ensureHeaderStatsSkeleton() {
+  if (headerStatEls.size > 0) return;
+  const wrap = document.getElementById('header-stats');
+  for (const [label, key] of HEADER_STAT_DEFS) {
+    const valueEl = el('span', { class: 'stat-value' });
+    wrap.appendChild(el('span', { class: 'stat' }, [
+      el('span', { class: 'stat-label', text: `${label} ` }),
+      valueEl,
+    ]));
+    headerStatEls.set(key, valueEl);
+  }
+}
+
+function setStatText(key, text) {
+  const valueEl = headerStatEls.get(key);
+  if (valueEl.textContent !== text) valueEl.textContent = text;
+}
 
 function renderHeaderStats(board) {
+  ensureHeaderStatsSkeleton();
   const stats = summarizeBoard(board);
   const cfg = board.config || {};
-  const wrap = document.getElementById('header-stats');
-  wrap.innerHTML = '';
-  const stat = (label, value) => el('span', { class: 'stat' }, [
-    el('span', { class: 'stat-label', text: `${label} ` }),
-    el('span', { class: 'stat-value', text: value }),
-  ]);
-  wrap.appendChild(stat('target repo', cfg.targetRepo || '(unset)'));
-  wrap.appendChild(stat('base branch', cfg.baseBranch || '(currentBranch)'));
-  wrap.appendChild(stat('queue/done/failed', `${stats.queue} / ${stats.done} / ${stats.failed}`));
-  wrap.appendChild(stat('done 花费', fmtUsd(stats.doneSpentUsd)));
-  wrap.appendChild(stat('刷新于', fmtNowLocal()));
+  setStatText('targetRepo', cfg.targetRepo || '(unset)');
+  setStatText('baseBranch', cfg.baseBranch || '(currentBranch)');
+  setStatText('queueDoneFailed', `${stats.queue} / ${stats.done} / ${stats.failed}`);
+  setStatText('doneSpentUsd', fmtUsd(stats.doneSpentUsd));
+  setStatText('refreshedAt', fmtNowLocal());
 }
 
 // ---- 屏 1：看板（keyed 增量渲染：卡片按任务 id 复用节点，签名变化才重建，避免轮询闪烁） ----
@@ -274,14 +296,38 @@ async function loadBoard() {
 
 // ---- 实时活动面（P4-G2）：页头显示「现在哪个 agent 在跑」，无活跃时静默 ----
 
+const activityCache = new Map(); // "taskId|role|round" -> node，跨轮询保留未变节点，beacon 呼吸动效不因轮询重启
+
+function activityKey(a) { return `${a.taskId}|${a.role}|${a.round}`; }
+
+function buildActivityBadgeNode(a) {
+  return el('span', { class: 'activity-badge activity-badge--live' }, [
+    el('span', { class: 'activity-dot' }),
+    el('span', { class: 'mono', text: `${a.taskId} · ${a.role} r${a.round}` }),
+  ]);
+}
+
+/** keyed 增量渲染(同 renderLanes 的卡片缓存手法):未变的活跃项复用节点,避免每次轮询重建导致
+ *  beacon 呼吸动效从头重播、也避免不必要的 DOM 抖动(轮询刷新禁布局跳动)。 */
 function renderActivity(active) {
   const wrap = document.getElementById('header-activity');
-  wrap.innerHTML = '';
+  const seen = new Set();
+  let anchor = null;
   for (const a of active) {
-    wrap.appendChild(el('span', { class: 'activity-badge activity-badge--live' }, [
-      el('span', { class: 'activity-dot' }),
-      el('span', { class: 'mono', text: `${a.taskId} · ${a.role} r${a.round}` }),
-    ]));
+    const key = activityKey(a);
+    seen.add(key);
+    let node = activityCache.get(key);
+    if (!node) {
+      node = buildActivityBadgeNode(a);
+      node.classList.add('badge-enter');
+      activityCache.set(key, node);
+    }
+    const expected = anchor ? anchor.nextSibling : wrap.firstChild;
+    if (node !== expected) wrap.insertBefore(node, expected);
+    anchor = node;
+  }
+  for (const [key, node] of activityCache) {
+    if (!seen.has(key)) { node.remove(); activityCache.delete(key); }
   }
 }
 
