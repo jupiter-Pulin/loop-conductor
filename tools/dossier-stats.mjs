@@ -222,14 +222,90 @@ export function renderMarkdown({ tasks, summary }) {
   return lines.join('\n');
 }
 
-// ---- CLI：node tools/dossier-stats.mjs [--json] [root]（root 缺省 = 本仓库根 / CONDUCTOR_ROOT） ----
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const args = process.argv.slice(2);
+/**
+ * 解析 argv 得到 `{ taskId, taskIdInvalid, asJson, root }`。
+ * `--task` 的值先于 root 位置参数被消费，避免 id 被误当作 root（见 spec「当前 root 位置参数的陷阱」）。
+ * `--task` 缺值或其后紧跟 `--` 开头 flag 时 `taskIdInvalid = true`，`taskId` 不设。
+ */
+export function parseArgs(argv) {
+  const args = [...argv];
+  const taskIdx = args.indexOf('--task');
+  let taskId;
+  let taskIdInvalid = false;
+  if (taskIdx !== -1) {
+    const val = args[taskIdx + 1];
+    if (val === undefined || val.startsWith('--')) {
+      taskIdInvalid = true;
+      args.splice(taskIdx, 1);
+    } else {
+      taskId = val;
+      args.splice(taskIdx, 2);
+    }
+  }
   const asJson = args.includes('--json');
   const rootArg = args.find((a) => !a.startsWith('--'));
   const root = rootArg
     ? path.resolve(rootArg)
     : (process.env.CONDUCTOR_ROOT ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'));
+  return { taskId, taskIdInvalid, asJson, root };
+}
+
+/** 任务 id 所在的箱（queue/done/failed），三处均无则 null。 */
+export function findTaskBox(root, id) {
+  for (const box of ['queue', 'done', 'failed']) {
+    if (fs.existsSync(path.join(root, 'state', box, id))) return box;
+  }
+  return null;
+}
+
+/** 复用 collectTask 选中单任务；未找到返回 null。不做独立于 collectStats 的重复聚合。 */
+export function selectTask(root, id) {
+  const box = findTaskBox(root, id);
+  if (!box) return null;
+  return collectTask(root, box, id);
+}
+
+/** 单任务详情：沿用逐任务表既有字段，逐行「字段: 值」呈现（见 spec AC-002）。 */
+export function renderTaskDetail(t) {
+  const cuts = t.maker_rounds.filter((r) => r.subtype === 'error_max_turns').length;
+  const ver = t.verifier_rounds.map((r) => r.overall?.[0] ?? '?').join('') || '-';
+  const com = t.committer_valid_attempt ? `a${t.committer_valid_attempt}` : (t.committer_degraded ? 'degraded' : '-');
+  return [
+    `id: ${t.id}`,
+    `box: ${t.box}`,
+    `kind: ${t.kind ?? '-'}`,
+    `maker 轮次数: ${t.maker_rounds.length}`,
+    `截断腿数: ${cuts}`,
+    `verifier: ${ver}`,
+    `committer: ${com}`,
+    `成本(spent_usd): ${t.spent_usd}`,
+    `失败类型: ${t.last_failure_type ?? '-'}`,
+  ].join('\n');
+}
+
+/** CLI 入口：纯函数，argv → `{ code, stdout, stderr }`，供单测断言退出码/流向。 */
+export function runCli(argv) {
+  const { taskId, taskIdInvalid, asJson, root } = parseArgs(argv);
+  if (taskIdInvalid) {
+    return { code: 1, stdout: '', stderr: '--task 需要一个任务 id 参数\n' };
+  }
+  if (taskId) {
+    const task = selectTask(root, taskId);
+    if (!task) {
+      return { code: 1, stdout: '', stderr: `任务 ${taskId} 在 queue/done/failed 三处均未找到\n` };
+    }
+    const out = asJson ? `${JSON.stringify(task, null, 2)}\n` : `${renderTaskDetail(task)}\n`;
+    return { code: 0, stdout: out, stderr: '' };
+  }
   const stats = collectStats(root);
-  process.stdout.write(asJson ? `${JSON.stringify(stats, null, 2)}\n` : `${renderMarkdown(stats)}\n`);
+  const out = asJson ? `${JSON.stringify(stats, null, 2)}\n` : `${renderMarkdown(stats)}\n`;
+  return { code: 0, stdout: out, stderr: '' };
+}
+
+// ---- CLI：node tools/dossier-stats.mjs [--json] [--task <id>] [root]（root 缺省 = 本仓库根 / CONDUCTOR_ROOT） ----
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const { code, stdout, stderr } = runCli(process.argv.slice(2));
+  if (stdout) process.stdout.write(stdout);
+  if (stderr) process.stderr.write(stderr);
+  process.exitCode = code;
 }

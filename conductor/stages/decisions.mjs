@@ -688,6 +688,42 @@ export function parseNumstat(text) {
  * 与自动合并的风险方向（main 假绿）相反——所以这里要求分歧数为 0（任何方向），不看 high_risk_count。
  * 边界：本谓词只决定「本地合并」；push 永远人工（git-safety hook 不变）。
  */
+/**
+ * spec 审批门机器放行谓词（纯函数唯一裁判；输入全部机械产物，禁止任何 AI 自评）。
+ * 放行 = 全部机械门的合取；任何一门数据缺失即 fail-closed（无证据 = 不放行）。
+ * 护栏方向：spec-verifier pass 是必要非充分——pass 但带 blocker/major finding
+ * （典型：规模拆分建议）意味着 verdict 里有值得人裁决的信息，一律留人审。
+ * 边界：本谓词只免「人在 AWAIT_SPEC_APPROVAL 点章」这一步；merge 闸门与 reject 通道不动。
+ */
+export function evaluateAutoApproveSpec({ kind, draftCheck, maxAcs, specVerdict }) {
+  const reasons = [];
+  if (kind !== 'feature') reasons.push(`kind=${kind ?? '?'} ≠ feature`);
+
+  // spec 草稿契约（与 cmdApprove 人审落章处同一终审：validateSpecDoc）。
+  if (!draftCheck) reasons.push('spec 草稿缺失（无契约校验结果）');
+  else {
+    if (draftCheck.ok !== true) {
+      reasons.push(`spec-doc/v1 不合格：${(draftCheck.errors ?? []).join('；') || '未知原因'}`);
+    }
+    const acCount = Array.isArray(draftCheck.acs) ? draftCheck.acs.length : 0;
+    if (acCount <= 0) reasons.push('AC 数为 0');
+    else if (Number.isFinite(maxAcs) && acCount > maxAcs) reasons.push(`AC 数 ${acCount} > 上限 ${maxAcs}`);
+  }
+
+  // spec-verifier verdict：当轮产物必须存在、pass、且无需人裁决的重 finding。
+  if (!specVerdict) reasons.push('spec-verify verdict 缺失');
+  else {
+    if (specVerdict.overall !== 'pass') reasons.push(`spec-verifier overall=${specVerdict.overall ?? '?'} ≠ pass`);
+    const findings = Array.isArray(specVerdict.findings) ? specVerdict.findings : [];
+    const heavy = findings.filter((f) => f?.severity === 'blocker' || f?.severity === 'major');
+    if (heavy.length > 0) {
+      reasons.push(`verdict 带需人裁决的 finding：${heavy.map((f) => `${f.severity}（${String(f.issue ?? '').slice(0, 60)}）`).join('、')}`);
+    }
+  }
+
+  return { eligible: reasons.length === 0, reasons };
+}
+
 export function evaluateAutoMerge({
   kind, allowedKinds,
   verdictOverall, acCount, maxAcs,

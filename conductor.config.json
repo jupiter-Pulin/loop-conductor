@@ -45,5 +45,7 @@
   "autoMergeKinds": ["bugfix"],
   "autoMergeMaxDiffLines": 400,
   "autoMergeMaxAcs": 8,
-  "autoMergeDeniedPaths": ["conductor/", "package.json", ".github/", "agents/", "conductor.config.json", ".claude/"]
+  "autoMergeDeniedPaths": ["conductor/", "package.json", ".github/", "agents/", "conductor.config.json", ".claude/"],
+  "autoApproveSpecEnabled": false,
+  "autoApproveSpecMaxAcs": 12
 }

@@ -99,6 +99,52 @@ test('extractFailingTests：test at <file>:<line> 的文件部分归一为 basen
   assert.deepEqual(sig.failingTests, ['foo.test.mjs :: some failing test']);
 });
 
+// 同一失败的 TAP 输出（node:test 非 TTY 下 node ≤22 的默认 reporter）：失败测试身份应与 spec 提取一致。
+const STDOUT_TAP = [
+  'TAP version 13',
+  '# Subtest: some failing test',
+  'not ok 1 - some failing test',
+  '  ---',
+  '  duration_ms: 12.345',
+  "  type: 'test'",
+  "  location: '/Users/alice/project/tests/integration/foo.test.mjs:10:1'",
+  "  failureType: 'testCodeFailure'",
+  "  error: 'boom'",
+  "  code: 'ERR_TEST_FAILURE'",
+  '  ...',
+  '1..1',
+  '# tests 1',
+  '# fail 1',
+  '',
+].join('\n');
+
+test('extractFailingTests：TAP 格式（not ok + location 诊断）提取的失败测试身份与 spec 一致', () => {
+  const sig = buildSignature(gateRecord({ stdout_tail: STDOUT_TAP }));
+  assert.deepEqual(sig.failingTests, ['foo.test.mjs :: some failing test']);
+  assert.deepEqual(sig.errorTokens, [], "ERR_TEST_FAILURE 不是环境 errno，不得进入错误词层");
+});
+
+test('extractFailingTests：TAP 父级 subtestsFailed 聚合项剔除，只留叶子失败', () => {
+  const nested = [
+    '# Subtest: parent',
+    '    # Subtest: leaf case',
+    '    not ok 1 - leaf case',
+    '      ---',
+    "      location: '/p/tests/bar.test.mjs:5:3'",
+    "      failureType: 'testCodeFailure'",
+    '      ...',
+    '    1..1',
+    'not ok 1 - parent',
+    '  ---',
+    "  location: '/p/tests/bar.test.mjs:4:1'",
+    "  failureType: 'subtestsFailed'",
+    '  ...',
+    '',
+  ].join('\n');
+  const sig = buildSignature(gateRecord({ stdout_tail: nested }));
+  assert.deepEqual(sig.failingTests, ['bar.test.mjs :: leaf case']);
+});
+
 test('extractErrorTokens：errno / Cannot find module / address already in use 排序去重', () => {
   const text = [
     "Error: Cannot find module '/abs/path/to/left-pad.js'",

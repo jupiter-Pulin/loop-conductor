@@ -30,14 +30,28 @@ function normalize(text) {
 const TEST_AT_RE = /^test at (\S+):\d+:\d+$/;
 const FAIL_MARK_RE = /^✖ (.+)$/;
 const FAILING_HEADER = 'failing tests:';
+// TAP 格式（node:test 非 TTY 下 node ≤22 的默认 reporter）：`not ok <n> - <测试名>`，
+// 文件来自随后 YAML 诊断块的 `location: '<file>:<line>:<col>'`。
+const TAP_NOT_OK_RE = /^not ok \d+ - (.+)$/;
+const TAP_DIRECTIVE_RE = / # (?:SKIP|TODO)\b.*$/i;
+const TAP_LOCATION_RE = /^location: '(.+?):\d+:\d+'$/;
+const TAP_SUBTESTS_FAILED = "failureType: 'subtestsFailed'";
 
 /**
- * 失败测试身份集合：node:test 输出里 `test at <file>:<line>` 紧邻其后的 `✖ <测试名>` 行，
+ * 失败测试身份集合，兼容 node:test 两种 reporter 输出：
+ * - spec：`test at <file>:<line>` 紧邻其后的 `✖ <测试名>` 行；
+ * - tap：`not ok <n> - <测试名>` + YAML 诊断块的 `location:`（父级 subtestsFailed 聚合项剔除，
+ *   与 spec 的 failing tests 分节只列叶子失败对齐）。
  * 文件部分归一为 basename。排序去重，格式 `<basename> :: <测试名>`（无法配对文件时退化为纯测试名）。
  */
 function extractFailingTests(normalizedText) {
   const seen = new Set();
-  let pendingFile = null;
+  let pendingFile = null; // spec：test at 行携带的文件，等待下一 ✖ 行配对
+  let tapPending = null; // tap：{ name, file }，等待 YAML 诊断块补全 location
+  const flushTap = () => {
+    if (tapPending) seen.add(tapPending.file ? `${tapPending.file} :: ${tapPending.name}` : tapPending.name);
+    tapPending = null;
+  };
   for (const raw of normalizedText.split('\n')) {
     const line = raw.trim();
     const testAt = line.match(TEST_AT_RE);
@@ -48,8 +62,23 @@ function extractFailingTests(normalizedText) {
       if (name === FAILING_HEADER) continue; // "✖ failing tests:" 是分节标题，非测试项
       seen.add(pendingFile ? `${pendingFile} :: ${name}` : name);
       pendingFile = null;
+      continue;
+    }
+    const notOk = line.match(TAP_NOT_OK_RE);
+    if (notOk) {
+      flushTap();
+      if (TAP_DIRECTIVE_RE.test(notOk[1])) continue; // # SKIP / # TODO 指令项不算失败
+      tapPending = { name: notOk[1].trim(), file: null };
+      continue;
+    }
+    if (tapPending) {
+      const loc = line.match(TAP_LOCATION_RE);
+      if (loc) { tapPending.file = basenameOf(loc[1]); continue; }
+      if (line === TAP_SUBTESTS_FAILED) { tapPending = null; continue; } // 父级聚合项，只留叶子
+      if (line === '...') flushTap(); // YAML 诊断块结束
     }
   }
+  flushTap();
   return [...seen].sort();
 }
 

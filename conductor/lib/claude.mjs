@@ -2,14 +2,63 @@
 // flag / JSON schema 漂移只改这里；CLAUDE_BIN 环境变量是 fake-claude 测试的挂载点。
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 const MAX_BUFFER = 64 * 1024 * 1024;
 const STREAM_PARSE_ERROR =
   'claude stream-json parse failed; ensure Claude CLI supports --output-format stream-json --verbose';
 
-export function claudeBin() {
-  return process.env.CLAUDE_BIN || 'claude';
+function isExecutableFile(p) {
+  try {
+    if (!fs.statSync(p).isFile()) return false;
+    fs.accessSync(p, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function pathHasClaude(env) {
+  const pathEnv = env.PATH ?? '';
+  return pathEnv.split(path.delimiter).filter(Boolean).some((dir) => isExecutableFile(path.join(dir, 'claude')));
+}
+
+/**
+ * 桌面 App 托管目录（`<probeRoot>/<版本号>/claude.app/Contents/MacOS/claude`）内
+ * 按修改时间探测最新版本的 claude 二进制；探测根目录可注入（单测用）。落空返回 null。
+ */
+export function probeManagedClaudeBin({ probeRoot, homeDir = os.homedir() } = {}) {
+  const root = probeRoot ?? path.join(homeDir, 'Library', 'Application Support', 'Claude', 'claude-code');
+  let entries;
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  let best = null;
+  let bestMtimeMs = -Infinity;
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const candidate = path.join(root, entry.name, 'claude.app', 'Contents', 'MacOS', 'claude');
+    if (!isExecutableFile(candidate)) continue;
+    const mtimeMs = fs.statSync(candidate).mtimeMs;
+    if (mtimeMs > bestMtimeMs) {
+      bestMtimeMs = mtimeMs;
+      best = candidate;
+    }
+  }
+  return best;
+}
+
+/**
+ * claude 二进制解析：CLAUDE_BIN 环境变量 > PATH > 桌面 App 托管目录 > 字面回退 'claude'。
+ * env/probeRoot 可注入（单测用）；生产调用（runClaudeStream）不传参，用 process.env 与真实 homedir。
+ */
+export function claudeBin({ env = process.env, probeRoot } = {}) {
+  if (env.CLAUDE_BIN) return env.CLAUDE_BIN;
+  if (pathHasClaude(env)) return 'claude';
+  return probeManagedClaudeBin({ probeRoot, homeDir: env.HOME }) ?? 'claude';
 }
 
 /**
@@ -226,6 +275,15 @@ export function setSleepFn(fn) {
 }
 
 /**
+ * spawn 层确定性系统错误（EACCES/ENOENT/EPERM/ENOTDIR，二进制层面的死错误）：进程从未
+ * 启动，零 API 消费。isTransientFailure 与 accountSpawnCost（H20 估价，避免把这类失败
+ * 按历史均价虚增成本）共用同一判定，防止两处漂移。
+ */
+export function isDeterministicSpawnFailure(res) {
+  return Boolean(res?.spawnError) && DETERMINISTIC_SPAWN_ERRNO.test(String(res?.error ?? ''));
+}
+
+/**
  * 瞬态判定：API 错误状态码命中名单、spawn 自身报错、被杀，或「不透明退出失败」
  * ——CLI 非零退出且无可解析 result 事件（raw==null，从而也读不到 api_error_status）。
  * 拿不到状态码时无法区分真是瞬态还是硬错误，按疑似瞬态给一次重试机会；
@@ -234,7 +292,7 @@ export function setSleepFn(fn) {
  * 判非瞬态——重试必然同样失败，只会白等整条退避阶梯。
  */
 export function isTransientFailure(res) {
-  if (res?.spawnError) return !DETERMINISTIC_SPAWN_ERRNO.test(String(res.error ?? ''));
+  if (res?.spawnError) return !isDeterministicSpawnFailure(res);
   if (res?.killed) return true;
   if (res?.raw == null && res?.exitCode !== 0) return true;
   return res?.raw?.is_error === true && TRANSIENT_STATUSES.has(res.raw?.api_error_status);

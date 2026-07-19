@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { runClaude, runClaudeWithRetry } from '../lib/claude.mjs';
+import { runClaude, runClaudeWithRetry, isDeterministicSpawnFailure } from '../lib/claude.mjs';
 import {
   ensureWorktree, commitAll, diffAgainstBase, diffNameStatusAgainstBase, diffStatAgainstBase,
   mergeBaseWith, addDetachedWorktree, removeWorktree, currentBranch, mergeBranch, deleteBranch,
@@ -1092,6 +1092,8 @@ export function estimateRoleCost(cfg, role) {
  * config `unknownSpawnCostEstimateEnabled=true` 且该角色有历史样本 → 按均价估计入账，
  * runtime.estimated_cost_usd 独立累计（透明可审），timeline 标 estimated——预算闸不再被
  * killed spawn 系统性放水。无样本时退回 lower-bound（绝不凭空造数）。
+ * 例外：spawn 报确定性系统错误（ENOENT/EACCES/ENOTDIR 类，与 isTransientFailure 同源判定）
+ * 时进程从未起来、零 API 消费，不落入估计分支（task-20260718-001：曾被虚增 $1.9 成本）。
  */
 export function accountSpawnCost(ts, cfg, role, round, res) {
   if (!res.costUnknown) {
@@ -1099,6 +1101,10 @@ export function accountSpawnCost(ts, cfg, role, round, res) {
     return;
   }
   addCost(ts, res.costUsd, cfg); // unknown 时 costUsd 恒 0：保持旧行为的字面等价（no-op）
+  if (isDeterministicSpawnFailure(res)) {
+    state.appendTimeline(cfg, ts.id, `${role} r${round} spawn 确定性失败（${res.error ?? 'unknown'}），不做历史均价估计入账`);
+    return;
+  }
   if (cfg.unknownSpawnCostEstimateEnabled === true) {
     const est = estimateRoleCost(cfg, role);
     if (est.samples > 0) {

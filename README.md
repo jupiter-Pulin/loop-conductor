@@ -20,6 +20,7 @@
 | 纯路由和 schema 判断 | `conductor/stages/decisions.mjs` |
 | agent 角色 prompt | `agents/*.md` |
 | commit / 分支规范（committer 提案的规范源） | `.claude/skills/git-conventions/SKILL.md` |
+| 冷 session 发起任务的入口 skill（蒸馏 brief → new → run → 监控） | `.claude/skills/loop-task/SKILL.md` |
 | 行为 case | `tests/integration/*.test.mjs` |
 | 单元级不变量 | `tests/unit/*.test.mjs` |
 | 跨任务失败分布/成本/轮次聚合 CLI | `tools/dossier-stats.mjs`（`node tools/dossier-stats.mjs [--json]`） |
@@ -36,6 +37,7 @@
 | maker | `agents/maker-agent.md` | `conductor/stages/ready.mjs`, `conductor/stages/fixing.mjs` | 修改任务 worktree，使冻结 spec 全部满足（git 破坏性操作由逐轮 settings hook 拦截）。 |
 | verifier | `agents/verifier-agent.md` | `conductor/stages/verify.mjs` | 冷读 spec + diff，逐条裁决 AC。 |
 | committer | `agents/committer-agent.md` | `conductor/conductor.mjs::cmdMerge` | 起草 merge commit 文案（提案制，`validateCommitMessage` 终审，两次不过降级机器文案）。 |
+| reviewer | `agents/reviewer-agent.md` | `conductor/stages/verify.mjs`（shadow，`reviewStage` 默认 off） | 与 verifier 同 diff 独立正确性审查，只落对照产物，不影响主链。 |
 
 ## 状态流
 
@@ -51,6 +53,8 @@ reject-feasibility -> NEEDS_FEASIBILITY 重产（notes 进下轮 prompt）
 feature:
 NEEDS_SPEC -> SPEC_VERIFY -> SPEC_FIXING -> SPEC_VERIFY -> AWAIT_SPEC_APPROVAL -> READY
 spec 契约门（spec-doc/v1）fail -> 原地重试 spec-agent，耗尽 -> FAILED_BOX
+AWAIT_SPEC_APPROVAL 机器放行（autoApproveSpec / new --auto-approve-spec，默认关）：
+  evaluateAutoApproveSpec 谓词全绿（verdict pass 无 blocker/major、AC 数 ≤ 上限）-> 代章进 READY；否则留人审
 
 bugfix:
 READY
@@ -74,7 +78,7 @@ FAILED_BOX --retry--> READY or NEEDS_SPEC
 npm test
 npm run conductor -- status
 npm run conductor -- new --kind bugfix --title "..."
-npm run conductor -- new --kind feature --title "..." [--brief <file>] [--feasibility]
+npm run conductor -- new --kind feature --title "..." [--brief <file>] [--feasibility] [--auto-approve-spec] [--repo <path>]
 npm run conductor -- run
 npm run conductor -- approve-setup <id>
 npm run conductor -- approve-feasibility <id> --option O-X [--notes "..."]
@@ -115,6 +119,7 @@ npm run conductor -- retry <id>
 | test gate 空转测试拦截 | `tests/integration/test-gate.test.mjs` |
 | test gate per-AC 定向探针（AC→测试映射） | `tests/integration/test-gate-per-ac.test.mjs` |
 | merge commit 文案提案 + 降级 | `tests/integration/commit-message.test.mjs` |
+| spec 审批门机器放行（默认关 / major finding 拦截 / 全绿代章 / AC 上限） | `tests/integration/auto-approve-spec.test.mjs` |
 | verifier fail repair context | `tests/integration/verifier-fail.test.mjs` |
 | verifier invalid 重试 | `tests/integration/verifier-invalid.test.mjs` |
 | maker retry ladder | `tests/integration/retry-ladder.test.mjs` |
