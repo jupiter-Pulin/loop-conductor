@@ -266,6 +266,47 @@ async function handleSyncAction(cfg, id, action, req, res, autoRun) {
   sendJson(res, 200, { ok, exitCode: result.exitCode, message: formatCliMessage(result) });
 }
 
+// ---- 在编辑器里打开任务 worktree（人审跳 VS Code）：只 spawn 编辑器，不落任何状态、不动任务。 ----
+
+/** detached spawn 一个编辑器进程；1.5s 内未退出视为已启动（编辑器常驻不算失败），
+ *  提前退出则以 exitCode 判定。ENOENT 等 spawn 失败返回 started:false。 */
+function spawnEditorProcess(cmd, args) {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, { detached: true, stdio: 'ignore' });
+    const timer = setTimeout(() => { child.unref(); resolve({ started: true, exitCode: null }); }, 1500);
+    timer.unref?.();
+    child.on('error', () => { clearTimeout(timer); resolve({ started: false, exitCode: null }); });
+    child.on('exit', (code) => { clearTimeout(timer); resolve({ started: true, exitCode: code ?? 1 }); });
+  });
+}
+
+function editorLaunchOk(r) { return r.started && (r.exitCode === null || r.exitCode === 0); }
+
+/** 打开 worktrees/<id>：默认 `code <dir>`，darwin 下回退 `open -a "Visual Studio Code"`；
+ *  DASHBOARD_EDITOR_CMD 可整体覆盖编辑器命令（也是测试钩子）。 */
+async function openWorktreeInEditor(cfg, id) {
+  const dir = path.join(cfg.worktreesDir, id);
+  let stat = null;
+  try { stat = fs.statSync(dir); } catch { /* 不存在走统一文案 */ }
+  if (!stat || !stat.isDirectory()) {
+    return { ok: false, message: `worktree 不存在或已清理：${dir}（任务已合并归档，或尚未进入 maker 阶段）` };
+  }
+  const override = process.env.DASHBOARD_EDITOR_CMD;
+  if (override) {
+    const r = await spawnEditorProcess(override, [dir]);
+    return editorLaunchOk(r)
+      ? { ok: true, message: `已用 ${override} 打开 ${dir}` }
+      : { ok: false, message: `${override} 启动失败（exitCode=${r.exitCode}）` };
+  }
+  if (editorLaunchOk(await spawnEditorProcess('code', [dir]))) {
+    return { ok: true, message: `已在 VS Code 打开 ${dir}` };
+  }
+  if (process.platform === 'darwin' && editorLaunchOk(await spawnEditorProcess('open', ['-a', 'Visual Studio Code', dir]))) {
+    return { ok: true, message: `已在 VS Code 打开 ${dir}` };
+  }
+  return { ok: false, message: '找不到 code 命令：在 VS Code 里执行「Shell Command: Install \'code\' command in PATH」后重试' };
+}
+
 /** `/static/<rel>` → 磁盘绝对路径；逃逸白名单目录 STATIC_DIR 一律返回 null（供 404）。 */
 function resolveStaticFile(pathname) {
   const rawRel = pathname.slice(STATIC_PREFIX.length);
@@ -381,6 +422,13 @@ export function createDashboardServer(cfg, { autoRun = true, forceScan = false }
         const id = parts[2];
         if (!isValidTaskId(id)) { sendJson(res, 400, { error: 'invalid task id' }); return; }
         sendJson(res, 200, { lines: buildStreamTail(cfg, id) });
+        return;
+      }
+
+      if (parts[0] === 'api' && parts[1] === 'task' && parts.length === 4 && parts[3] === 'open-editor' && req.method === 'POST') {
+        const id = parts[2];
+        if (!isValidTaskId(id)) { sendJson(res, 400, { error: 'invalid task id' }); return; }
+        sendJson(res, 200, await openWorktreeInEditor(cfg, id));
         return;
       }
 

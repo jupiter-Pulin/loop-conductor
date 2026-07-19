@@ -170,8 +170,9 @@ main { padding: 0 28px 8px; }
 .overlay.align-right { justify-content: flex-end; }
 .overlay.align-center { justify-content: center; align-items: center; }
 
+/* 抽屉是监控 peek：刻意收窄，让看板保持可见——深内容一律去全屏审查页（#/task/<id>）。 */
 .drawer {
-  width: min(1280px, 90vw); height: 100%; background: var(--surface); overflow-y: auto; padding: 24px;
+  width: min(480px, 92vw); height: 100%; background: var(--surface); overflow-y: auto; padding: 24px;
   transform: translateX(48px); opacity: 0;
   transition: transform .25s ease, opacity .25s ease;
 }
@@ -209,14 +210,48 @@ main { padding: 0 28px 8px; }
 .dot-label.current { color: var(--attn); font-weight: 700; }
 .dot-line { flex: 1; height: 2px; background: var(--line-heavy); margin-top: 5px; }
 
-.drawer-body { display: flex; gap: 24px; }
-.main-col { flex: 1; min-width: 0; }
-.timeline-col { width: 220px; flex-shrink: 0; border-left: 1px solid var(--line); padding-left: 16px; }
-.timeline-col h3 { font: var(--t-h2) var(--font-ui); }
+.drawer-stage { color: var(--ink-2); margin-bottom: 6px; }
+.drawer-timeline { margin-top: 20px; border-top: 1px solid var(--line); padding-top: 12px; }
+.drawer-timeline .timeline-scroll { max-height: 38vh; overflow-y: auto; }
 .timeline-item {
   font: var(--t-caption) var(--font-ui); margin-bottom: 12px; color: var(--ink-2);
   animation: fade-up .3s ease both; animation-delay: calc(var(--i, 0) * 30ms);
 }
+
+/* ---- 屏 2b：全屏审查页（#/task/<id>）——主列（报告→diff→动作条）+ 右侧 sticky timeline ---- */
+#view-task { padding: 0 28px 8px; }
+.task-page-topbar { display: flex; justify-content: space-between; align-items: center; padding: 14px 0 4px; }
+.task-topbar-right { display: flex; align-items: center; gap: 14px; }
+.task-page-header { padding: 4px 0 6px; border-bottom: 1px solid var(--line); }
+.task-page-meta { display: flex; align-items: center; gap: 10px; color: var(--ink-2); }
+.task-page-title { font: var(--t-display) var(--font-ui); margin: 8px 0 6px; }
+.task-page-stage { display: flex; align-items: center; gap: 14px; color: var(--ink-2); }
+.task-page-stage .working { margin-top: 0; }
+.task-page-body { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 0 32px; }
+.task-main { min-width: 0; padding: 16px 0 24px; }
+.task-main pre.readonly-tall { max-height: 60vh; }
+.task-aside { border-left: 1px solid var(--line); padding: 16px 0 24px 20px; }
+.task-aside-inner { position: sticky; top: 16px; max-height: calc(100vh - 32px); overflow-y: auto; }
+.task-aside h3 { margin-top: 0; }
+@media (max-width: 900px) {
+  .task-page-body { grid-template-columns: 1fr; }
+  .task-aside { border-left: none; padding-left: 0; }
+  .task-aside-inner { position: static; max-height: none; }
+}
+/* 决策条 sticky 钉在主列底部：长报告/长 diff 滚到哪里都能落锤 */
+.task-actionbar {
+  position: sticky; bottom: 0; z-index: 5; margin-top: 20px; padding: 12px 0;
+  display: flex; gap: 10px; align-items: center;
+  background: var(--surface); border-top: 1px solid var(--line);
+}
+
+/* ---- VS Code 跳转（worktree 直达编辑器） ---- */
+.editor-controls { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
+.editor-status {
+  font: var(--t-caption) var(--font-data); color: var(--ink-3);
+  max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.editor-status-fail { color: var(--fail); }
 
 @keyframes fade-up { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -287,8 +322,13 @@ summary:hover { background: var(--surface-hover); }
 .verdict-empty { color: var(--ink-3); font: var(--t-body) var(--font-ui); }
 .verdict-summary { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
 .verdict-round { color: var(--ink-2); }
+.verdict-counts { font: var(--t-caption) var(--font-data); color: var(--ink-2); font-variant-numeric: tabular-nums; }
 .criteria-list { display: flex; flex-direction: column; gap: 10px; }
-.criterion { border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; }
+/* AC 卡片左缘随裁决着色：扫一眼就能定位 fail 项（报告是审查页主角） */
+.criterion { border: 1px solid var(--line); border-left: 3px solid var(--line-heavy); border-radius: 12px; padding: 10px 12px; }
+.criterion-pass { border-left-color: var(--pass); }
+.criterion-fail { border-left-color: var(--fail); background: var(--fail-bg); }
+.criterion-unknown { border-left-color: var(--unknown); }
 .criterion-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
 .criterion-id { color: var(--ink-2); }
 .criterion-reason { font: var(--t-body) var(--font-ui); }
@@ -308,9 +348,12 @@ summary:hover { background: var(--surface-hover); }
 .finding-issue { font: var(--t-body) var(--font-ui); }
 .finding-recommendation { font: var(--t-caption) var(--font-ui); color: var(--ink-2); margin-top: 2px; }
 
-/* ---- merge 分文件 diff ---- */
+/* ---- merge 分文件 diff（定位：粗览分诊面，深审跳 VS Code） ---- */
 .diff-block { margin-top: 16px; }
-.diff-toolbar { margin-bottom: 8px; }
+.diff-head { display: flex; align-items: baseline; gap: 12px; }
+.diff-shortstat { font: var(--t-caption) var(--font-data); color: var(--ink-2); }
+.diff-note { font: var(--t-caption) var(--font-ui); color: var(--ink-3); margin: 2px 0 10px; }
+.diff-toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
 .diff-files { display: flex; flex-direction: column; gap: 6px; }
 .diff-file { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
 .diff-file-header {

@@ -1,9 +1,12 @@
-// dashboard/static/app.mjs — 看板屏浏览器入口：屏 1 看板增量渲染 / 屏 2 详情抽屉 / 屏 3 新建任务面板。
+// dashboard/static/app.mjs — 看板屏浏览器入口：屏 1 看板增量渲染 / 屏 2 详情（窄抽屉监控态 +
+// #/task/<id> 全屏审查页）/ 屏 3 新建任务面板 / 屏 4 指标视图。
 // 契约不变：/api/board、/api/task/:id、五个同步动作、/api/new-task；轮询周期恒 1500ms（I-4），
 // P4 起以 /api/events SSE 失效通知驱动增量刷新，SSE 不可用/断线时 1500ms 轮询兜底恒可用（INV-3）。
+// P6 详情双面分工：抽屉只做监控 peek（无决策按钮），一切人审决策（approve/reject/merge/retry)
+// 只存在于全屏审查页；页由 hash 路由驱动，可刷新、可回退。
 import {
   GAUGE_LANES, summarizeBoard, gaugeSegments, escapeHtml, verdictChip,
-  groupTimelineByRound, roundGaugeTicks, resolveDrawerFocusTarget,
+  groupTimelineByRound, roundGaugeTicks, resolveDrawerFocusTarget, parseRouteHash,
 } from './view.mjs';
 import {
   barWidths, sortTableRows, formatUsd, formatPercent, formatDurationSeconds, isMetricsEmpty,
@@ -12,12 +15,13 @@ import {
 const LANES = GAUGE_LANES.map((key) => ({ key, label: key, you: key === 'merge' }));
 
 let latestBoard = null;
-let drawerTaskId = null;
+let detailMode = null; // 'drawer'（监控 peek）| 'page'（全屏审查页）| null
+let detailTaskId = null;
 let lastDetail = null;
 let lastDiff = null;
 let selectedOption = null;
 let pendingActionMessage = null;
-let drawerExpandedFiles = new Set();
+let expandedDiffFiles = new Set();
 let drawerTriggerEl = null;
 let lastStreamTail = null;
 let currentView = 'board';
@@ -114,17 +118,23 @@ function buildGaugeNode(entry) {
   return el('div', { class: 'gauge' }, segs.map((state) => el('span', { class: `seg ${state}` })));
 }
 
+/** 卡片点击分流：needs-human 直达全屏审查页（少一跳），推进中任务开监控 peek 抽屉。 */
+function openTaskEntry(entry, triggerEl) {
+  if (entry.needsHuman) gotoTask(entry.id);
+  else openDrawer(entry.id, triggerEl);
+}
+
 function buildCardNode(entry) {
   const card = el('div', {
     class: 'card' + (entry.needsHuman ? ' needs-human' : ''),
     'data-id': entry.id,
     tabindex: '0',
     role: 'button',
-    onclick: (e) => openDrawer(entry.id, e.currentTarget),
+    onclick: (e) => openTaskEntry(entry, e.currentTarget),
     onkeydown: (e) => {
       if (e.key !== 'Enter') return;
       e.preventDefault();
-      openDrawer(entry.id, e.currentTarget);
+      openTaskEntry(entry, e.currentTarget);
     },
   }, [
     el('div', { class: 'top-row' }, [
@@ -250,16 +260,17 @@ function renderBoxList(containerId, tasks) {
   const container = document.getElementById(containerId);
   container.innerHTML = '';
   for (const entry of tasks) {
+    // done/failed 都是复盘场景：直达全屏审查页，不走监控抽屉。
     container.appendChild(el('div', {
       class: 'box-row',
       'data-id': entry.id,
       tabindex: '0',
       role: 'button',
-      onclick: (e) => openDrawer(entry.id, e.currentTarget),
+      onclick: () => gotoTask(entry.id),
       onkeydown: (e) => {
         if (e.key !== 'Enter') return;
         e.preventDefault();
-        openDrawer(entry.id, e.currentTarget);
+        gotoTask(entry.id);
       },
     }, [
       el('span', { class: 'task-id', text: entry.id }),
@@ -344,6 +355,32 @@ document.getElementById('toggle-failed').addEventListener('click', () => {
   document.getElementById('failed-wrap').classList.toggle('open');
 });
 
+// ---- hash 路由（P6）：'' → 看板、#/metrics → 指标、#/task/<id> → 全屏审查页。 ----
+// hash 是唯一路由事实源：导航按钮/卡片只改 hash，渲染统一走 hashchange → applyRoute。
+
+function gotoBoard() {
+  if (parseRouteHash(location.hash).view === 'board') return;
+  location.hash = ''; // 留下裸 '#' 无害，仍解析为 board
+}
+
+function gotoMetrics() {
+  if (location.hash === '#/metrics') return;
+  location.hash = '#/metrics';
+}
+
+function gotoTask(id) {
+  const target = `#/task/${id}`;
+  if (location.hash === target) return;
+  location.hash = target;
+}
+
+function applyRoute() {
+  const route = parseRouteHash(location.hash);
+  if (route.view === 'task') { openTaskPage(route.id); return; }
+  if (detailMode === 'page') closeTaskPage();
+  switchView(route.view);
+}
+
 // ---- 屏 4：指标视图（P5）：花费/良率/打回归因/阶段耗时聚合 + 零依赖手绘条形图 ----
 
 function switchView(view) {
@@ -352,10 +389,11 @@ function switchView(view) {
   document.getElementById('nav-metrics').classList.toggle('active', view === 'metrics');
   document.getElementById('view-board').hidden = view !== 'board';
   document.getElementById('view-metrics').hidden = view !== 'metrics';
+  document.getElementById('view-task').hidden = view !== 'task';
   if (view === 'metrics') loadMetrics();
 }
-document.getElementById('nav-board').addEventListener('click', () => switchView('board'));
-document.getElementById('nav-metrics').addEventListener('click', () => switchView('metrics'));
+document.getElementById('nav-board').addEventListener('click', gotoBoard);
+document.getElementById('nav-metrics').addEventListener('click', gotoMetrics);
 
 async function loadMetrics() {
   const { status, body } = await api('/api/metrics');
@@ -503,20 +541,26 @@ function hideOverlay(id) {
   overlayHideTimers.set(id, setTimeout(() => { ov.hidden = true; }, 240));
 }
 
-// ---- 屏 2：详情抽屉 ----
+// ---- 屏 2：详情（抽屉 peek + 全屏审查页共用一条数据管线） ----
 
-/** 需要「diff 入口」的 review kind：merge 门 + done/failed 复盘（AC-010）。 */
+/** 需要「diff 入口」的 review kind：merge 门 + done/failed 复盘（AC-010）。仅全屏页拉取。 */
 const DIFF_ENTRY_KINDS = ['merge', 'done', 'failed'];
 
-function closeDrawer() {
-  const id = drawerTaskId;
-  drawerTaskId = null;
+function resetDetailState() {
   lastDetail = null;
   lastDiff = null;
   lastStreamTail = null;
   selectedOption = null;
   pendingActionMessage = null;
-  drawerExpandedFiles = new Set();
+  expandedDiffFiles = new Set();
+}
+
+function closeDrawer() {
+  if (detailMode !== 'drawer') return;
+  const id = detailTaskId;
+  detailMode = null;
+  detailTaskId = null;
+  resetDetailState();
   hideOverlay('drawer-overlay');
   if (drawerTriggerEl) {
     if (document.contains(drawerTriggerEl)) {
@@ -534,39 +578,87 @@ function closeDrawer() {
 
 async function openDrawer(id, triggerEl) {
   drawerTriggerEl = triggerEl ?? null;
-  drawerTaskId = id;
-  selectedOption = null;
-  pendingActionMessage = null;
-  drawerExpandedFiles = new Set();
+  detailMode = 'drawer';
+  detailTaskId = id;
+  resetDetailState();
   showOverlay('drawer-overlay');
-  await refreshDrawer();
+  await refreshDetail();
   document.getElementById('drawer').focus();
 }
 
-async function refreshDrawer() {
-  if (!drawerTaskId) return;
-  const id = drawerTaskId;
+let boardScrollY = 0; // 进审查页前的看板滚动位，返回时还原（页面推入语义：进页置顶）
+
+function openTaskPage(id) {
+  if (detailMode === 'drawer') closeDrawer();
+  const alreadyOpen = detailMode === 'page' && detailTaskId === id;
+  detailMode = 'page';
+  detailTaskId = id;
+  if (!alreadyOpen) {
+    boardScrollY = window.scrollY;
+    resetDetailState();
+    document.getElementById('view-task').innerHTML = '';
+  }
+  switchView('task');
+  if (!alreadyOpen) window.scrollTo(0, 0);
+  refreshDetail().then(() => {
+    if (!alreadyOpen && detailMode === 'page' && detailTaskId === id) {
+      document.getElementById('view-task').focus({ preventScroll: true });
+    }
+  });
+}
+
+function closeTaskPage() {
+  if (detailMode !== 'page') return;
+  detailMode = null;
+  detailTaskId = null;
+  resetDetailState();
+  document.getElementById('view-task').innerHTML = '';
+  window.scrollTo(0, boardScrollY);
+}
+
+async function refreshDetail() {
+  if (!detailTaskId) return;
+  const id = detailTaskId;
+  const mode = detailMode;
   const { status, body } = await api(`/api/task/${encodeURIComponent(id)}`);
-  if (drawerTaskId !== id) return;
+  if (detailTaskId !== id || detailMode !== mode) return;
   lastDetail = status === 200 ? body : null;
   lastDiff = null;
   lastStreamTail = null;
-  if (lastDetail && DIFF_ENTRY_KINDS.includes(lastDetail.review.kind)) {
+  if (mode === 'page' && lastDetail && DIFF_ENTRY_KINDS.includes(lastDetail.review.kind)) {
     const diffRes = await api(`/api/task/${encodeURIComponent(id)}/diff`);
-    if (drawerTaskId === id) lastDiff = diffRes.status === 200 ? diffRes.body : null;
+    if (detailTaskId === id) lastDiff = diffRes.status === 200 ? diffRes.body : null;
   }
   if (lastDetail && lastDetail.working) {
     const tailRes = await api(`/api/task/${encodeURIComponent(id)}/stream-tail`);
-    if (drawerTaskId === id) lastStreamTail = tailRes.status === 200 ? tailRes.body.lines : null;
+    if (detailTaskId === id) lastStreamTail = tailRes.status === 200 ? tailRes.body.lines : null;
   }
-  if (drawerTaskId === id) renderDrawerFromCache();
+  if (detailTaskId === id && detailMode === mode) renderDetailFromCache();
 }
 
-function renderDrawerFromCache() {
-  const drawer = document.getElementById('drawer');
-  drawer.innerHTML = '';
-  if (!lastDetail) { drawer.appendChild(el('div', { text: '任务未找到或已归档' })); return; }
-  renderDrawer(drawer, drawerTaskId, lastDetail);
+function renderDetailFromCache() {
+  if (detailMode === 'drawer') {
+    const drawer = document.getElementById('drawer');
+    drawer.innerHTML = '';
+    if (!lastDetail) { drawer.appendChild(el('div', { text: '任务未找到或已归档' })); return; }
+    renderDrawerPeek(drawer, detailTaskId, lastDetail);
+  } else if (detailMode === 'page') {
+    const page = document.getElementById('view-task');
+    page.innerHTML = '';
+    if (!lastDetail) {
+      page.appendChild(el('div', { class: 'task-page' }, [
+        el('div', { class: 'task-page-topbar' }, [
+          el('button', { class: 'btn btn-ghost', text: '← 看板', onclick: gotoBoard }),
+        ]),
+        el('div', { class: 'empty-state' }, [
+          el('div', { class: 'empty-title', text: '任务未找到或已归档' }),
+          el('div', { class: 'empty-hint', text: `id: ${detailTaskId}` }),
+        ]),
+      ]));
+      return;
+    }
+    renderTaskPage(page, detailTaskId, lastDetail);
+  }
 }
 
 /** ISO 字符串 → 浏览器本地时间 `HH:MM`；与当日不同天时前缀 `MM-DD `。 */
@@ -594,7 +686,7 @@ function buildRoundTicksNode(ticks) {
   return row;
 }
 
-/** 抽屉放大回路刻度：maker/verify 段下叠加轮次刻度点（design-language §4）。 */
+/** 详情放大回路刻度：maker/verify 段下叠加轮次刻度点（design-language §4）。 */
 function stageDots(lane, box, rounds) {
   const wrap = el('div', { class: 'stage-dots' });
   const curIdx = lane != null ? LANES.findIndex((l) => l.key === lane) : -1;
@@ -685,7 +777,7 @@ function buildRoundsSectionNode(rounds) {
   return wrap;
 }
 
-/** 抽屉「实时输出」折叠区（P4-G3）：stream tail 增量文本，纯文本渲染（textContent，不解析 HTML）。 */
+/** 「实时输出」折叠区（P4-G3）：stream tail 增量文本，纯文本渲染（textContent，不解析 HTML）。 */
 function buildStreamTailNode(lines) {
   const wrap = el('details', { class: 'stream-tail', open: '' }, [
     el('summary', { text: `实时输出${lines && lines.length ? ` · ${lines.length}` : ''}` }),
@@ -710,6 +802,29 @@ function buildAttemptsSectionNode(attempts) {
   return wrap;
 }
 
+/** Timeline 条目列表（抽屉纵向区与页侧栏共用）；返回可直接 append 的 fragment。 */
+function buildTimelineListNode(entries) {
+  const frag = document.createDocumentFragment();
+  if (!entries || entries.length === 0) {
+    frag.appendChild(el('div', { class: 'timeline-item', text: '(无记录)' }));
+    return frag;
+  }
+  let i = 0;
+  for (const group of groupTimelineByRound(entries)) {
+    if (group.round != null) {
+      frag.appendChild(el('div', { class: 'timeline-round-header mono', text: `r${group.round}` }));
+    }
+    for (const entry of group.entries) {
+      const prefix = entry.ts == null ? '' : `${formatLocalTimestamp(entry.ts)} `;
+      const item = el('div', { class: 'timeline-item', text: `${prefix}${entry.text}` });
+      item.style.setProperty('--i', Math.min(i, 12));
+      frag.appendChild(item);
+      i++;
+    }
+  }
+  return frag;
+}
+
 async function doAction(id, action, body) {
   const { body: resBody } = await api(`/api/task/${encodeURIComponent(id)}/${action}`, {
     method: 'POST',
@@ -722,7 +837,7 @@ async function doAction(id, action, body) {
 async function submitAction(id, action, body) {
   pendingActionMessage = await doAction(id, action, body);
   loadBoard();
-  await refreshDrawer();
+  await refreshDetail();
 }
 
 /** 决定性动作（通过/打回/合并/重试）统一走浏览器原生二次确认（AC-011）。 */
@@ -738,10 +853,10 @@ async function pollJobUntilDone(id, jobId) {
     const { body } = await api('/api/jobs');
     const job = body && Array.isArray(body.jobs) ? body.jobs.find((j) => j.id === jobId) : null;
     if (job && job.state !== 'running') {
-      if (drawerTaskId === id) {
+      if (detailTaskId === id) {
         pendingActionMessage = { ok: job.state === 'ok', message: job.message || (job.state === 'ok' ? 'ok' : 'failed') };
         loadBoard();
-        await refreshDrawer();
+        await refreshDetail();
       }
       return;
     }
@@ -754,12 +869,40 @@ async function confirmAndSubmitJob(id, action, confirmMessage) {
   const resBody = await doAction(id, action, {});
   if (!resBody || typeof resBody.jobId !== 'string') {
     pendingActionMessage = { ok: false, message: (resBody && resBody.error) || '提交失败' };
-    await refreshDrawer();
+    await refreshDetail();
     return;
   }
   pendingActionMessage = { ok: null, message: `已提交，job ${resBody.jobId} 处理中…` };
-  renderDrawerFromCache();
+  renderDetailFromCache();
   pollJobUntilDone(id, resBody.jobId);
+}
+
+// ---- 在 VS Code 打开 worktree：POST /api/task/:id/open-editor，状态就地内联显示，不打断当前面 ----
+
+function buildEditorControls(id) {
+  const status = el('span', { class: 'editor-status' });
+  const btn = el('button', {
+    class: 'btn btn-ghost', text: '在 VS Code 打开 ↗',
+    onclick: async () => {
+      btn.disabled = true;
+      status.textContent = '打开中…';
+      status.classList.remove('editor-status-fail');
+      const { body } = await api(`/api/task/${encodeURIComponent(id)}/open-editor`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+      });
+      btn.disabled = false;
+      const ok = body && body.ok === true;
+      status.textContent = ok ? '已打开' : ((body && body.message) || '打开失败');
+      if (body && body.message) status.title = body.message;
+      status.classList.toggle('editor-status-fail', !ok);
+    },
+  });
+  return el('span', { class: 'editor-controls' }, [btn, status]);
+}
+
+/** worktree 大概率在场的阶段才在抽屉里给编辑器入口（maker 起建、merge 后清理）。 */
+function editorRelevant(detail) {
+  return ['maker', 'verify', 'merge'].includes(detail.lane) || detail.box === 'failed';
 }
 
 // ---- verdict / spec-verify 面板 + 分文件 diff（P2） ----
@@ -767,6 +910,17 @@ async function confirmAndSubmitJob(id, action, confirmMessage) {
 function chipNode(status) {
   const chip = verdictChip(status);
   return el('span', { class: `chip ${chip.className}` }, [`${chip.symbol} ${chip.label}`]);
+}
+
+/** criteria → { pass, fail, other } 计数，供裁决面板的 AC 汇总条。 */
+function countCriteria(criteria) {
+  const counts = { pass: 0, fail: 0, other: 0 };
+  for (const c of criteria || []) {
+    if (c.status === 'pass') counts.pass++;
+    else if (c.status === 'fail') counts.fail++;
+    else counts.other++;
+  }
+  return counts;
 }
 
 function buildVerdictPanelNode(verdict, { title = 'Verifier 裁决' } = {}) {
@@ -780,13 +934,19 @@ function buildVerdictPanelNode(verdict, { title = 'Verifier 裁决' } = {}) {
     wrap.appendChild(el('div', { class: 'verdict-empty', text: 'verifier 裁决文件已损坏，无法解析' }));
     return wrap;
   }
+  const counts = countCriteria(verdict.criteria);
   wrap.appendChild(el('div', { class: 'verdict-summary' }, [
     chipNode(verdict.overall),
     el('span', { class: 'verdict-round mono', text: `round ${verdict.round}` }),
+    el('span', {
+      class: 'verdict-counts mono',
+      text: `✓ ${counts.pass} · ✗ ${counts.fail}${counts.other ? ` · ? ${counts.other}` : ''} / ${(verdict.criteria || []).length} AC`,
+    }),
   ]));
   const list = el('div', { class: 'criteria-list' });
   for (const c of verdict.criteria) {
-    const item = el('div', { class: 'criterion' }, [
+    const statusCls = c.status === 'pass' ? 'criterion-pass' : c.status === 'fail' ? 'criterion-fail' : 'criterion-unknown';
+    const item = el('div', { class: `criterion ${statusCls}` }, [
       el('div', { class: 'criterion-head' }, [
         chipNode(c.status),
         el('span', { class: 'criterion-id mono', text: c.ac_id }),
@@ -859,7 +1019,7 @@ function renderPatchHtml(patch) {
 }
 
 function buildDiffFileNode(f) {
-  const isOpen = drawerExpandedFiles.has(f.path);
+  const isOpen = expandedDiffFiles.has(f.path);
   const header = el('div', {
     class: 'diff-file-header',
     onclick: () => { toggleDiffFile(f.path); },
@@ -888,14 +1048,20 @@ function buildDiffFileNode(f) {
 }
 
 function toggleDiffFile(path) {
-  if (drawerExpandedFiles.has(path)) drawerExpandedFiles.delete(path);
-  else drawerExpandedFiles.add(path);
-  renderDrawerFromCache();
+  if (expandedDiffFiles.has(path)) expandedDiffFiles.delete(path);
+  else expandedDiffFiles.add(path);
+  renderDetailFromCache();
 }
 
-function buildDiffSectionNode(diff) {
+/** 分文件 diff 区。定位是「粗览改动范围」的分诊面，不替代编辑器里的逐行审查——
+ *  故标题行直接挂 shortstat 汇总，工具条常备 VS Code 跳转。 */
+function buildDiffSectionNode(diff, { taskId, shortstat } = {}) {
   const wrap = el('div', { class: 'diff-block' });
-  wrap.appendChild(el('h3', { text: 'Diff' }));
+  wrap.appendChild(el('div', { class: 'diff-head' }, [
+    el('h3', { text: 'Diff' }),
+    shortstat ? el('span', { class: 'diff-shortstat mono', text: shortstat }) : null,
+  ]));
+  wrap.appendChild(el('div', { class: 'diff-note', text: '在这里粗览改动范围与文件分布；逐行深审建议跳到 VS Code 里进行。' }));
   if (!diff) {
     wrap.appendChild(el('div', { class: 'diff-empty', text: 'diff 加载中或加载失败' }));
     return wrap;
@@ -904,68 +1070,105 @@ function buildDiffSectionNode(diff) {
     wrap.appendChild(el('div', { class: 'diff-empty', text: '分支已清理，无可展示的 diff（任务已合并或从未产生改动）' }));
     return wrap;
   }
-  const allOpen = diff.files.every((f) => drawerExpandedFiles.has(f.path));
+  const allOpen = diff.files.every((f) => expandedDiffFiles.has(f.path));
   const toggleAllBtn = el('button', {
     class: 'btn btn-ghost',
     text: allOpen ? '收起全部' : '展开全部',
     onclick: () => {
-      if (allOpen) drawerExpandedFiles = new Set();
-      else drawerExpandedFiles = new Set(diff.files.map((f) => f.path));
-      renderDrawerFromCache();
+      if (allOpen) expandedDiffFiles = new Set();
+      else expandedDiffFiles = new Set(diff.files.map((f) => f.path));
+      renderDetailFromCache();
     },
   });
-  wrap.appendChild(el('div', { class: 'diff-toolbar' }, [toggleAllBtn]));
+  wrap.appendChild(el('div', { class: 'diff-toolbar' }, [toggleAllBtn, taskId ? buildEditorControls(taskId) : null]));
   const filesWrap = el('div', { class: 'diff-files' });
   for (const f of diff.files) filesWrap.appendChild(buildDiffFileNode(f));
   wrap.appendChild(filesWrap);
   return wrap;
 }
 
-function renderDrawer(drawer, id, detail) {
+// ---- 屏 2a：抽屉 peek（纯监控：无审查内容、无决策按钮；入口只有「完整详情」与编辑器跳转） ----
+
+function renderDrawerPeek(drawer, id, detail) {
   const task = detail.task;
   const runtime = detail.runtime;
-  const review = detail.review;
   const needsHuman = detail.needsHuman;
+  const roundsView = detail.rounds || { rounds: [], attempts: [] };
 
   drawer.appendChild(el('div', { class: 'drawer-header' }, [
     el('div', {}, [
       el('div', { class: 'mono', text: id }),
       task ? el('span', { class: 'badge badge-kind', text: String(task.kind).toUpperCase() }) : null,
       el('h2', { text: task ? task.title : '(损坏任务目录)' }),
-      el('div', { text: `stage: ${runtime ? runtime.stage : '(unknown)'}` }),
+      el('div', { class: 'mono drawer-stage', text: `stage: ${runtime ? runtime.stage : '(unknown)'}` }),
       needsHuman ? el('span', { class: 'needs-you', text: '⚑ needs you' }) : null,
     ]),
     el('button', { class: 'close-x', text: '×', onclick: closeDrawer }),
   ]));
-  const body = el('div', { class: 'drawer-body' });
-  const mainCol = el('div', { class: 'main-col' });
-  const roundsView = detail.rounds || { rounds: [], attempts: [] };
-  mainCol.appendChild(stageDots(detail.lane, detail.box, roundsView.rounds));
-  const resultSlot = el('div', { class: 'result-box' });
-  if (pendingActionMessage) {
-    resultSlot.appendChild(el('pre', {
-      class: 'readonly',
-      text: pendingActionMessage.message || (pendingActionMessage.ok ? 'ok' : 'failed'),
-    }));
+
+  drawer.appendChild(el('div', { class: 'action-row' }, [
+    el('button', {
+      class: 'btn btn-primary',
+      text: needsHuman ? '进入审查 →' : '完整详情 →',
+      onclick: () => gotoTask(id),
+    }),
+    editorRelevant(detail) ? buildEditorControls(id) : null,
+  ]));
+
+  if (detail.review && detail.review.kind === 'broken') {
+    drawer.appendChild(el('div', { class: 'broken-banner', text: detail.review.error }));
   }
 
+  drawer.appendChild(stageDots(detail.lane, detail.box, roundsView.rounds));
+
+  if (pendingActionMessage) {
+    drawer.appendChild(el('div', { class: 'result-box' }, [
+      el('pre', { class: 'readonly', text: pendingActionMessage.message || (pendingActionMessage.ok ? 'ok' : 'failed') }),
+    ]));
+  }
+
+  if (detail.working) {
+    drawer.appendChild(workingLabel());
+    drawer.appendChild(buildStreamTailNode(lastStreamTail));
+  }
+
+  drawer.appendChild(buildRoundsSectionNode(roundsView.rounds));
+  const attemptsNode = buildAttemptsSectionNode(roundsView.attempts);
+  if (attemptsNode) drawer.appendChild(attemptsNode);
+
+  const timelineWrap = el('div', { class: 'drawer-timeline' }, [el('h3', { text: 'Timeline' })]);
+  const scroll = el('div', { class: 'timeline-scroll' });
+  scroll.appendChild(buildTimelineListNode(detail.timelineEntries || []));
+  timelineWrap.appendChild(scroll);
+  drawer.appendChild(timelineWrap);
+}
+
+// ---- 屏 2b：全屏审查页（报告优先：verify/spec 报告是主角，diff 只做分诊，决策按钮固定在底部动作条） ----
+
+/** review kind → { content: node[], actions: node[] }。content 顺序即页面主列顺序：报告在前。 */
+function buildReviewMain(id, detail) {
+  const task = detail.task;
+  const review = detail.review;
+  const content = [];
+  const actions = [];
+
   if (review.kind === 'feasibility') {
-    mainCol.appendChild(el('h3', { text: 'Feasibility memo' }));
-    mainCol.appendChild(el('pre', { class: 'readonly', text: review.missing ? review.message : review.markdown }));
-    mainCol.appendChild(el('h3', { text: 'YOUR DECISION · PICK AN OPTION' }));
+    content.push(el('h3', { text: 'Feasibility memo' }));
+    content.push(el('pre', { class: 'readonly', text: review.missing ? review.message : review.markdown }));
+    content.push(el('h3', { text: 'YOUR DECISION · PICK AN OPTION' }));
     const optionsWrap = el('div', {});
     for (const opt of review.options || []) {
       optionsWrap.appendChild(el('div', {
         class: 'option-card' + (selectedOption === opt.option_id ? ' selected' : ''),
-        onclick: () => { selectedOption = opt.option_id; renderDrawerFromCache(); },
+        onclick: () => { selectedOption = opt.option_id; renderDetailFromCache(); },
       }, [
         el('span', { class: 'option-id', text: opt.option_id }),
         el('span', { text: opt.text }),
       ]));
     }
-    mainCol.appendChild(optionsWrap);
+    content.push(optionsWrap);
     const notes = el('textarea', { id: 'fb-notes', rows: 3 });
-    mainCol.appendChild(el('div', { class: 'field' }, [el('label', { text: '备注（可选）' }), notes]));
+    content.push(el('div', { class: 'field' }, [el('label', { text: '备注（可选）' }), notes]));
     const approveLabel = selectedOption ? `通过 · 选 ${selectedOption} 继续` : '通过 · 请先选择一个 option';
     const approveBtn = el('button', {
       class: 'btn btn-primary', text: approveLabel,
@@ -979,21 +1182,21 @@ function renderDrawer(drawer, id, detail) {
       class: 'btn btn-danger', text: '打回并留言',
       onclick: () => confirmAndSubmit(id, 'reject-feasibility', { notes: notes.value }, '确定打回 feasibility 并留言？'),
     });
-    mainCol.appendChild(el('div', { class: 'action-row' }, [approveBtn, rejectBtn]));
+    actions.push(approveBtn, rejectBtn);
   } else if (review.kind === 'setup') {
-    mainCol.appendChild(el('h3', { text: 'Setup profile 草稿' }));
-    mainCol.appendChild(el('pre', { class: 'readonly', text: review.missing ? review.message : review.markdown }));
-    const approveBtn = el('button', {
+    content.push(el('h3', { text: 'Setup profile 草稿' }));
+    content.push(el('pre', { class: 'readonly', text: review.missing ? review.message : review.markdown }));
+    actions.push(el('button', {
       class: 'btn btn-primary', text: '通过',
       onclick: () => confirmAndSubmit(id, 'approve-setup', {}, '确定通过 setup profile？'),
-    });
-    mainCol.appendChild(el('div', { class: 'action-row' }, [approveBtn]));
+    }));
   } else if (review.kind === 'spec') {
-    mainCol.appendChild(el('h3', { text: 'Spec 草稿' }));
-    mainCol.appendChild(el('pre', { class: 'readonly', text: review.missing ? review.message : review.markdown }));
-    mainCol.appendChild(buildSpecVerifyNode(review.specVerify));
+    // 报告优先：spec-verifier 机器审在草稿之前——人先看机器挑出的问题，再对着草稿核对。
+    content.push(buildSpecVerifyNode(review.specVerify));
+    content.push(el('h3', { text: 'Spec 草稿' }));
+    content.push(el('pre', { class: 'readonly readonly-tall', text: review.missing ? review.message : review.markdown }));
     const notes = el('textarea', { id: 'spec-notes', rows: 3 });
-    mainCol.appendChild(el('div', { class: 'field' }, [el('label', { text: 'Reject 备注（必填）' }), notes]));
+    content.push(el('div', { class: 'field' }, [el('label', { text: 'Reject 备注（必填）' }), notes]));
     const approveBtn = el('button', {
       class: 'btn btn-primary', text: '通过 spec',
       onclick: () => confirmAndSubmit(id, 'approve', {}, '确定通过 spec？'),
@@ -1004,75 +1207,100 @@ function renderDrawer(drawer, id, detail) {
     });
     rejectBtn.disabled = true;
     notes.addEventListener('input', () => { rejectBtn.disabled = notes.value.trim() === ''; });
-    mainCol.appendChild(el('div', { class: 'action-row' }, [approveBtn, rejectBtn]));
+    actions.push(approveBtn, rejectBtn);
   } else if (review.kind === 'merge') {
-    mainCol.appendChild(el('h3', { text: 'Diff 摘要' }));
-    mainCol.appendChild(el('pre', { class: 'readonly', text: review.error ? review.error : review.diffShortstat }));
-    mainCol.appendChild(buildVerdictPanelNode(review.verdict));
-    mainCol.appendChild(buildDiffSectionNode(lastDiff));
-    const mergeBtn = el('button', {
+    // 报告优先：verifier 裁决（AC 逐条证据）在 diff 之前。
+    content.push(buildVerdictPanelNode(review.verdict));
+    content.push(buildDiffSectionNode(lastDiff, {
+      taskId: id,
+      shortstat: review.error ? review.error : review.diffShortstat,
+    }));
+    actions.push(el('button', {
       class: 'btn btn-primary', text: `合并到 ${task ? task.baseBranch : 'base'}`,
       onclick: () => confirmAndSubmitJob(id, 'merge', `确定合并到 ${task ? task.baseBranch : 'base'}？此操作不可撤销。`),
-    });
-    mainCol.appendChild(el('div', { class: 'action-row' }, [mergeBtn]));
+    }));
   } else if (review.kind === 'failed') {
-    mainCol.appendChild(el('h3', { text: '失败信息' }));
-    mainCol.appendChild(el('div', { text: review.lastFailureType || '(未知失败类型)' }));
-    mainCol.appendChild(buildVerdictPanelNode(review.verdict, { title: '最终 verifier 裁决' }));
-    mainCol.appendChild(buildDiffSectionNode(lastDiff));
-    const retryBtn = el('button', {
+    content.push(el('h3', { text: '失败信息' }));
+    content.push(el('div', { text: review.lastFailureType || '(未知失败类型)' }));
+    content.push(buildVerdictPanelNode(review.verdict, { title: '最终 verifier 裁决' }));
+    content.push(buildDiffSectionNode(lastDiff, { taskId: id }));
+    actions.push(el('button', {
       class: 'btn btn-danger', text: '↻ 重试',
       onclick: () => confirmAndSubmitJob(id, 'retry', '确定重试该任务？'),
-    });
-    mainCol.appendChild(el('div', { class: 'action-row' }, [retryBtn]));
+    }));
   } else if (review.kind === 'done') {
-    mainCol.appendChild(el('h3', { text: '任务已完成' }));
-    mainCol.appendChild(buildVerdictPanelNode(review.verdict, { title: '最终 verifier 裁决' }));
-    mainCol.appendChild(buildDiffSectionNode(lastDiff));
+    content.push(el('h3', { text: '任务已完成' }));
+    content.push(buildVerdictPanelNode(review.verdict, { title: '最终 verifier 裁决' }));
+    content.push(buildDiffSectionNode(lastDiff, { taskId: id }));
   } else if (review.kind === 'broken') {
-    mainCol.appendChild(el('div', { class: 'broken-banner', text: review.error }));
+    content.push(el('div', { class: 'broken-banner', text: review.error }));
   } else {
-    mainCol.appendChild(el('div', { text: `当前 stage：${runtime ? runtime.stage : '?'}` }));
-    if (detail.working === true) mainCol.appendChild(workingLabel());
+    content.push(el('div', { text: `当前 stage：${detail.runtime ? detail.runtime.stage : '?'}` }));
+  }
+  return { content, actions };
+}
+
+function renderTaskPage(page, id, detail) {
+  const task = detail.task;
+  const runtime = detail.runtime;
+  const roundsView = detail.rounds || { rounds: [], attempts: [] };
+  const wrap = el('div', { class: 'task-page' });
+
+  wrap.appendChild(el('div', { class: 'task-page-topbar' }, [
+    el('button', { class: 'btn btn-ghost', text: '← 看板', onclick: gotoBoard }),
+    el('div', { class: 'task-topbar-right' }, [
+      buildEditorControls(id),
+      typeof runtime?.spent_usd === 'number' ? el('span', { class: 'spent mono', text: fmtUsd(runtime.spent_usd) }) : null,
+    ]),
+  ]));
+
+  const header = el('div', { class: 'task-page-header' }, [
+    el('div', { class: 'task-page-meta' }, [
+      el('span', { class: 'mono', text: id }),
+      task ? el('span', { class: 'badge badge-kind', text: String(task.kind).toUpperCase() }) : null,
+      detail.needsHuman ? el('span', { class: 'needs-you', text: '⚑ needs you' }) : null,
+    ]),
+    el('h2', { class: 'task-page-title', text: task ? task.title : '(损坏任务目录)' }),
+    el('div', { class: 'task-page-stage' }, [
+      el('span', { class: 'mono', text: `stage: ${runtime ? runtime.stage : '(unknown)'}` }),
+      detail.working ? workingLabel() : null,
+    ]),
+    stageDots(detail.lane, detail.box, roundsView.rounds),
+  ]);
+  wrap.appendChild(header);
+
+  const main = el('div', { class: 'task-main' });
+  if (pendingActionMessage) {
+    main.appendChild(el('div', { class: 'result-box' }, [
+      el('pre', { class: 'readonly', text: pendingActionMessage.message || (pendingActionMessage.ok ? 'ok' : 'failed') }),
+    ]));
   }
 
-  if (detail.working) mainCol.appendChild(buildStreamTailNode(lastStreamTail));
+  const { content, actions } = buildReviewMain(id, detail);
+  for (const node of content) main.appendChild(node);
 
-  mainCol.appendChild(buildRoundsSectionNode(roundsView.rounds));
+  if (detail.working) main.appendChild(buildStreamTailNode(lastStreamTail));
+  main.appendChild(buildRoundsSectionNode(roundsView.rounds));
   const attemptsNode = buildAttemptsSectionNode(roundsView.attempts);
-  if (attemptsNode) mainCol.appendChild(attemptsNode);
+  if (attemptsNode) main.appendChild(attemptsNode);
+  if (actions.length > 0) main.appendChild(el('div', { class: 'task-actionbar' }, actions));
 
-  mainCol.appendChild(resultSlot);
-  body.appendChild(mainCol);
+  const aside = el('div', { class: 'task-aside' });
+  const asideInner = el('div', { class: 'task-aside-inner' }, [el('h3', { text: 'Timeline' })]);
+  asideInner.appendChild(buildTimelineListNode(detail.timelineEntries || []));
+  aside.appendChild(asideInner);
 
-  const timelineCol = el('div', { class: 'timeline-col' }, [el('h3', { text: 'Timeline' })]);
-  const entries = detail.timelineEntries || [];
-  if (entries.length === 0) {
-    timelineCol.appendChild(el('div', { class: 'timeline-item', text: '(无记录)' }));
-  } else {
-    let i = 0;
-    for (const group of groupTimelineByRound(entries)) {
-      if (group.round != null) {
-        timelineCol.appendChild(el('div', { class: 'timeline-round-header mono', text: `r${group.round}` }));
-      }
-      for (const entry of group.entries) {
-        const prefix = entry.ts == null ? '' : `${formatLocalTimestamp(entry.ts)} `;
-        const item = el('div', { class: 'timeline-item', text: `${prefix}${entry.text}` });
-        item.style.setProperty('--i', Math.min(i, 12));
-        timelineCol.appendChild(item);
-        i++;
-      }
-    }
-  }
-  body.appendChild(timelineCol);
-  drawer.appendChild(body);
+  wrap.appendChild(el('div', { class: 'task-page-body' }, [main, aside]));
+  page.appendChild(wrap);
 }
 
 document.getElementById('drawer-overlay').addEventListener('click', (e) => {
   if (e.target.id === 'drawer-overlay') closeDrawer();
 });
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && drawerTaskId != null) closeDrawer();
+  if (e.key !== 'Escape') return;
+  if (detailMode === 'drawer') closeDrawer();
+  else if (detailMode === 'page') gotoBoard();
 });
 
 // ---- 屏 3：新建任务面板 ----
@@ -1182,12 +1410,12 @@ function handleServerEvent(evt) {
     loadBoard();
     if (currentView === 'metrics') loadMetrics();
   } else if (evt.type === 'task-dirty') {
-    if (evt.id === drawerTaskId) refreshDrawer();
+    if (evt.id === detailTaskId) refreshDetail();
   } else if (evt.type === 'job') {
     loadBoard();
-    if (evt.taskId === drawerTaskId) {
+    if (evt.taskId === detailTaskId) {
       pendingActionMessage = { ok: evt.state === 'ok', message: evt.message };
-      refreshDrawer();
+      refreshDetail();
     }
   }
 }
@@ -1207,3 +1435,5 @@ function startRealtime() {
 
 loadBoard();
 startRealtime();
+window.addEventListener('hashchange', applyRoute);
+applyRoute();
