@@ -500,13 +500,13 @@ test('app.css：.lane.idle 分支隐藏 .lane-header 与 .lane-row，避免与 .
   assert.match(decl, /display\s*:\s*none/, '隐藏规则应声明 display: none');
 });
 
-// ---- AC-001：抽屉宽度自适应 min(1280px, 90vw)，窄屏 ≤768px 全宽 ----
+// ---- AC-001（P6 改版）：抽屉是监控 peek，收窄为 min(480px, 92vw)；窄屏 ≤768px 仍全宽 ----
 
-test('app.css：.drawer 宽度为 min(1280px, 90vw)，且 768px media query 内声明全宽（AC-001）', () => {
+test('app.css：.drawer 宽度为 min(480px, 92vw)（peek 形态，深内容归全屏审查页），且 768px media query 内声明全宽（AC-001/P6）', () => {
   const css = fs.readFileSync(path.join(STATIC_DIR, 'app.css'), 'utf8');
   const drawerRuleMatch = css.match(/\.drawer\s*\{[^}]*\}/);
   assert.ok(drawerRuleMatch, 'app.css 应含 .drawer 规则块');
-  assert.match(drawerRuleMatch[0], /width\s*:\s*min\(1280px,\s*90vw\)/, '.drawer 宽度应为 min(1280px, 90vw)');
+  assert.match(drawerRuleMatch[0], /width\s*:\s*min\(480px,\s*92vw\)/, '.drawer 宽度应为 min(480px, 92vw)');
   const mediaMatch = css.match(/@media\s*\(max-width:\s*768px\)\s*\{([^}]*\.drawer[^}]*\{[^}]*\})/);
   assert.ok(mediaMatch, 'app.css 应含 768px media query 内针对 .drawer 的规则');
   assert.match(mediaMatch[1], /width\s*:\s*100vw/, '768px media query 内 .drawer 宽度应为 100vw');
@@ -782,22 +782,28 @@ test('buildTaskDetail：done/failed 任务 review.verdict 携带最新轮 verify
   assert.deepEqual(probeDetail.review.verdict, { missing: true });
 });
 
-// ---- P3-AC-001：看板卡片/箱行键盘可达 + openDrawer 用 currentTarget（而非 document.activeElement）记焦点 ----
+// ---- P3-AC-001（P6 改版）：看板卡片/箱行键盘可达；卡片经 openTaskEntry 分流（needs-human 直达审查页，
+// 其余开 peek 抽屉），箱行直达审查页；openDrawer 仍用 currentTarget（而非 document.activeElement）记焦点 ----
 
-test('app.mjs：卡片与箱行可键盘聚焦并用 Enter 打开抽屉，openDrawer 用 currentTarget 记触发元素（AC-001）', () => {
+test('app.mjs：卡片/箱行可键盘聚焦并 Enter 打开；卡片走 openTaskEntry 分流、箱行走 gotoTask；openDrawer 用 currentTarget 记触发元素（AC-001/P6）', () => {
   const src = fs.readFileSync(path.join(STATIC_DIR, 'app.mjs'), 'utf8');
 
   const cardFn = src.match(/function buildCardNode\s*\([^)]*\)\s*\{[\s\S]*?\n\}/);
   assert.ok(cardFn, 'app.mjs 应含 buildCardNode 函数');
   assert.match(cardFn[0], /tabindex:\s*['"]0['"]/, 'card 应带 tabindex，可获得键盘焦点');
-  assert.match(cardFn[0], /onkeydown:[\s\S]*?e\.key\s*(===|!==)\s*['"]Enter['"][\s\S]*?openDrawer\(/, 'card 应在 keydown Enter 时打开抽屉');
-  assert.match(cardFn[0], /onclick:\s*\(e\)\s*=>\s*openDrawer\(entry\.id,\s*e\.currentTarget\)/, 'card 点击应把 e.currentTarget 传给 openDrawer');
+  assert.match(cardFn[0], /onkeydown:[\s\S]*?e\.key\s*(===|!==)\s*['"]Enter['"][\s\S]*?openTaskEntry\(/, 'card 应在 keydown Enter 时经 openTaskEntry 打开');
+  assert.match(cardFn[0], /onclick:\s*\(e\)\s*=>\s*openTaskEntry\(entry,\s*e\.currentTarget\)/, 'card 点击应把 e.currentTarget 传给 openTaskEntry');
+
+  const entryFn = src.match(/function openTaskEntry\s*\([^)]*\)\s*\{[\s\S]*?\n\}/);
+  assert.ok(entryFn, 'app.mjs 应含 openTaskEntry 分流函数');
+  assert.match(entryFn[0], /needsHuman[\s\S]*?gotoTask\(entry\.id\)/, 'needs-human 卡片应直达全屏审查页');
+  assert.match(entryFn[0], /openDrawer\(entry\.id,\s*triggerEl\)/, '非 needs-human 卡片应开 peek 抽屉并透传触发元素');
 
   const boxRowFn = src.match(/function renderBoxList\s*\([^)]*\)\s*\{[\s\S]*?\n\}/);
   assert.ok(boxRowFn, 'app.mjs 应含 renderBoxList 函数');
   assert.match(boxRowFn[0], /tabindex:\s*['"]0['"]/, 'box-row 应带 tabindex，可获得键盘焦点');
-  assert.match(boxRowFn[0], /onkeydown:[\s\S]*?e\.key\s*(===|!==)\s*['"]Enter['"][\s\S]*?openDrawer\(/, 'box-row 应在 keydown Enter 时打开抽屉');
-  assert.match(boxRowFn[0], /onclick:\s*\(e\)\s*=>\s*openDrawer\(entry\.id,\s*e\.currentTarget\)/, 'box-row 点击应把 e.currentTarget 传给 openDrawer');
+  assert.match(boxRowFn[0], /onkeydown:[\s\S]*?e\.key\s*(===|!==)\s*['"]Enter['"][\s\S]*?gotoTask\(/, 'box-row 应在 keydown Enter 时直达审查页');
+  assert.match(boxRowFn[0], /onclick:\s*\(\)\s*=>\s*gotoTask\(entry\.id\)/, 'box-row 点击应直达审查页（done/failed 是复盘场景）');
 
   assert.doesNotMatch(src, /document\.activeElement/, 'openDrawer 不应再依据 document.activeElement 记录触发元素');
   const openDrawerFn = src.match(/async function openDrawer\s*\([^)]*\)\s*\{[\s\S]*?\n\}/);
@@ -808,19 +814,18 @@ test('app.mjs：卡片与箱行可键盘聚焦并用 Enter 打开抽屉，openDr
   assert.match(src, /drawerTriggerEl\.focus\(\)/, '关闭抽屉时应把焦点还原到 drawerTriggerEl');
 });
 
-// ---- P3-AC-003：refreshDrawer 里 lastDetail 的写入带 drawerTaskId===id 一致性守卫 ----
+// ---- P3-AC-003（P6 改版）：refreshDetail 里 lastDetail 的写入带 detailTaskId/detailMode 一致性守卫 ----
 
-test('app.mjs：refreshDrawer 中 lastDetail 写入受 drawerTaskId===id 守卫，与 lastDiff/渲染同口径（AC-003）', () => {
+test('app.mjs：refreshDetail 中 lastDetail 写入受 detailTaskId===id（含 detailMode）守卫，与 lastDiff/渲染同口径（AC-003/P6）', () => {
   const src = fs.readFileSync(path.join(STATIC_DIR, 'app.mjs'), 'utf8');
-  const fnMatch = src.match(/async function refreshDrawer\s*\([^)]*\)\s*\{[\s\S]*?\n\}/);
-  assert.ok(fnMatch, 'app.mjs 应含 refreshDrawer 函数');
+  const fnMatch = src.match(/async function refreshDetail\s*\([^)]*\)\s*\{[\s\S]*?\n\}/);
+  assert.ok(fnMatch, 'app.mjs 应含 refreshDetail 函数');
   const body = fnMatch[0];
 
-  const guardedAssign = /if\s*\(\s*drawerTaskId\s*!==\s*id\s*\)\s*return;\s*\n\s*lastDetail\s*=/.test(body)
-    || /if\s*\(\s*drawerTaskId\s*===\s*id\s*\)\s*\{\s*\n?\s*lastDetail\s*=/.test(body);
-  assert.ok(guardedAssign, 'lastDetail 的写入应处于 drawerTaskId===id 一致性守卫之下（旧任务的迟到响应不应覆盖新任务详情）');
-  assert.match(body, /if\s*\(\s*drawerTaskId\s*===\s*id\s*\)\s*lastDiff\s*=/, 'lastDiff 写入应保留既有 drawerTaskId===id 守卫');
-  assert.match(body, /if\s*\(\s*drawerTaskId\s*===\s*id\s*\)\s*renderDrawerFromCache\(\)/, '渲染调用应保留既有 drawerTaskId===id 守卫');
+  const guardedAssign = /if\s*\(\s*detailTaskId\s*!==\s*id\s*\|\|\s*detailMode\s*!==\s*mode\s*\)\s*return;\s*\n\s*lastDetail\s*=/.test(body);
+  assert.ok(guardedAssign, 'lastDetail 的写入应处于 detailTaskId===id 且 detailMode===mode 一致性守卫之下（旧任务/旧面的迟到响应不应覆盖新详情）');
+  assert.match(body, /if\s*\(\s*detailTaskId\s*===\s*id\s*\)\s*lastDiff\s*=/, 'lastDiff 写入应保留 detailTaskId===id 守卫');
+  assert.match(body, /if\s*\(\s*detailTaskId\s*===\s*id\s*&&\s*detailMode\s*===\s*mode\s*\)\s*renderDetailFromCache\(\)/, '渲染调用应带 detailTaskId/detailMode 双守卫');
 });
 
 // ==== P3：轮次证据链——view.mjs 纯计算 helper ================================
@@ -1086,4 +1091,15 @@ test('readStreamTail：原子 rename 替换后按路径重开读到新文件内�
   const lines = readStreamTail(filePath);
   assert.ok(lines.includes('新文件内容'), 'rename 后应读到新文件内容');
   assert.ok(!lines.includes('旧文件内容'), 'rename 后不应因持有旧 inode/句柄读到过期内容');
+});
+
+// ==== P6：hash 路由（全屏审查页） ============================================
+
+test('parseRouteHash：#/task/<id> → task 视图并透传 id；#/metrics → metrics；其余一切（含畸形 id）回落 board（P6）', async () => {
+  const { parseRouteHash } = await import('../../conductor/dashboard/static/view.mjs');
+  assert.deepEqual(parseRouteHash('#/task/task-20260719-003'), { view: 'task', id: 'task-20260719-003' });
+  assert.deepEqual(parseRouteHash('#/metrics'), { view: 'metrics' });
+  for (const h of ['', '#', '#/', null, undefined, '#/task/', '#/task/../etc', '#/task/a b', '#/unknown']) {
+    assert.deepEqual(parseRouteHash(h), { view: 'board' }, `hash ${String(h)} 应回落 board`);
+  }
 });

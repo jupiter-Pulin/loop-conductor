@@ -1052,3 +1052,40 @@ test('AC-018: 非法 id / 未知 action / 缺字段 / 非法 JSON body 均 400�
   const after = env.findTask(validId).runtime;
   assert.deepEqual(after, before, '全部非法请求均在 spawn 前拒绝，任务状态不应变化');
 });
+
+// ---- P6：POST /api/task/:id/open-editor —— 人审从 dashboard 直达编辑器里的 worktree ----
+
+test('P6: open-editor 非法 id 400；worktree 缺失 200 ok:false 且文案指明清理；存在时经 DASHBOARD_EDITOR_CMD 启动并 ok:true', async (t) => {
+  const env = makeEnv(t);
+  const id = 'task-20260719-901';
+  env.writeTask(id, { stage: 'AWAIT_HUMAN_MERGE' });
+  fs.mkdirSync(env.worktree(id), { recursive: true });
+
+  const missingId = 'task-20260719-902';
+  env.writeTask(missingId, { stage: 'AWAIT_HUMAN_MERGE' });
+
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run'], { DASHBOARD_EDITOR_CMD: '/usr/bin/true' });
+
+  const badId = await postJson(srv.baseUrl, '/api/task/not-a-task-id/open-editor', {});
+  assert.equal(badId.status, 400);
+
+  const missing = await postJson(srv.baseUrl, `/api/task/${missingId}/open-editor`, {});
+  assert.equal(missing.status, 200);
+  assert.equal(missing.body.ok, false);
+  assert.match(missing.body.message, /worktree 不存在或已清理/);
+
+  const ok = await postJson(srv.baseUrl, `/api/task/${id}/open-editor`, {});
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.ok, true, `应经 DASHBOARD_EDITOR_CMD 启动成功：${ok.body.message}`);
+});
+
+test('P6: DASHBOARD_EDITOR_CMD 指向不存在的命令时 200 ok:false（spawn ENOENT 不 500）', async (t) => {
+  const env = makeEnv(t);
+  const id = 'task-20260719-903';
+  env.writeTask(id, { stage: 'AWAIT_HUMAN_MERGE' });
+  fs.mkdirSync(env.worktree(id), { recursive: true });
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run'], { DASHBOARD_EDITOR_CMD: '/nonexistent-editor-cmd-p6' });
+  const res = await postJson(srv.baseUrl, `/api/task/${id}/open-editor`, {});
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, false);
+});

@@ -104,3 +104,15 @@ export function resolveDrawerFocusTarget(triggerInDocument, triggerEl, cardEl, c
   if (cardEl) return cardEl;
   return container;
 }
+
+/**
+ * hash 路由解析（P6 全屏审查页）：`#/task/<id>` → { view:'task', id }、`#/metrics` →
+ * { view:'metrics' }、其余一切（含 ''、'#'、'#/'、畸形 id）→ { view:'board' }。
+ * id 字符集与 model.mjs::isValidTaskId 同宽（字母数字/-/_），最终合法性仍由 server 端裁决。
+ */
+export function parseRouteHash(hash) {
+  const m = /^#\/task\/([A-Za-z0-9_-]+)$/.exec(hash ?? '');
+  if (m) return { view: 'task', id: m[1] };
+  if (hash === '#/metrics') return { view: 'metrics' };
+  return { view: 'board' };
+}
