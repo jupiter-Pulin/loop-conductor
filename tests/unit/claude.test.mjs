@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  buildClaudeArgs, parseClaudeJson, claudeBin, runClaudeStream,
+  buildClaudeArgs, parseClaudeJson, claudeBin, probeManagedClaudeBin, runClaudeStream,
   isTransientFailure, runClaudeWithRetry, setSleepFn,
 } from '../../conductor/lib/claude.mjs';
 import { FAKE_CLAUDE } from '../helpers/env.mjs';
@@ -113,14 +113,69 @@ test('runClaudeStream：超长 prompt（≥300KB）经 stdin 传递，argv 不�
 });
 
 test('claudeBin：CLAUDE_BIN 环境变量覆盖（fake-claude 挂载点）', () => {
-  const prev = process.env.CLAUDE_BIN;
+  // env/probeRoot 显式传入，不依赖真实机器的 PATH 或桌面 App 托管目录状态（AC-001/AC-002 的探测根目录可注入）。
+  assert.equal(claudeBin({ env: { PATH: '' }, probeRoot: '/nonexistent-probe-root' }), 'claude');
+  assert.equal(claudeBin({ env: { CLAUDE_BIN: '/tmp/fake-claude.mjs', PATH: '' } }), '/tmp/fake-claude.mjs');
+});
+
+/** 在临时目录下建一个可执行的 `<root>/<version>/claude.app/Contents/MacOS/claude`，返回其路径。 */
+function makeManagedClaudeBin(root, version, { mtimeMs } = {}) {
+  const binPath = path.join(root, version, 'claude.app', 'Contents', 'MacOS', 'claude');
+  fs.mkdirSync(path.dirname(binPath), { recursive: true });
+  fs.writeFileSync(binPath, '#!/bin/sh\necho fake\n', { mode: 0o755 });
+  if (mtimeMs != null) {
+    const t = mtimeMs / 1000;
+    fs.utimesSync(binPath, t, t);
+  }
+  return binPath;
+}
+
+test('AC-001: probeManagedClaudeBin — 多版本按修改时间取最新可执行文件', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-managed-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  makeManagedClaudeBin(root, '1.0.0', { mtimeMs: 1000 });
+  const newer = makeManagedClaudeBin(root, '2.1.209', { mtimeMs: 2000 });
+  assert.equal(probeManagedClaudeBin({ probeRoot: root }), newer);
+});
+
+test('AC-001: probeManagedClaudeBin — 探测根目录不存在或无可执行文件时返回 null', (t) => {
+  assert.equal(probeManagedClaudeBin({ probeRoot: '/nonexistent-probe-root' }), null);
+  const emptyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-managed-empty-'));
+  t.after(() => fs.rmSync(emptyRoot, { recursive: true, force: true }));
+  assert.equal(probeManagedClaudeBin({ probeRoot: emptyRoot }), null);
+});
+
+test('AC-001: claudeBin — 未设 CLAUDE_BIN 且 PATH 无 claude 时探测托管目录，命中返回绝对路径；全部落空回退字面 claude', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-managed-bin-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const newest = makeManagedClaudeBin(root, '2.0.0', { mtimeMs: 5000 });
+  assert.equal(claudeBin({ env: { PATH: '' }, probeRoot: root }), newest);
+  // 全部落空（无 CLAUDE_BIN、PATH 无 claude、托管目录不存在）→ 字面回退
+  assert.equal(claudeBin({ env: { PATH: '' }, probeRoot: '/nonexistent-probe-root' }), 'claude');
+});
+
+test('AC-001: claudeBin — PATH 命中 claude 时优先于托管目录探测，直接回退字面 claude 交给 PATH 解析', (t) => {
+  const pathDir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-pathbin-'));
+  const probeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-managed-unused-'));
+  t.after(() => {
+    fs.rmSync(pathDir, { recursive: true, force: true });
+    fs.rmSync(probeRoot, { recursive: true, force: true });
+  });
+  fs.writeFileSync(path.join(pathDir, 'claude'), '#!/bin/sh\necho fake\n', { mode: 0o755 });
+  makeManagedClaudeBin(probeRoot, '9.9.9', { mtimeMs: 9000 }); // 即便托管目录也有更“新”的候选，也不应被探测到
+  assert.equal(claudeBin({ env: { PATH: pathDir }, probeRoot }), 'claude');
+});
+
+test('AC-002: claudeBin — 显式 CLAUDE_BIN 优先级最高，不做任何探测（回归守卫）', () => {
+  const probeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-managed-shadowed-'));
   try {
-    delete process.env.CLAUDE_BIN;
-    assert.equal(claudeBin(), 'claude');
-    process.env.CLAUDE_BIN = '/tmp/fake-claude.mjs';
-    assert.equal(claudeBin(), '/tmp/fake-claude.mjs');
+    makeManagedClaudeBin(probeRoot, '3.3.3', { mtimeMs: 3000 });
+    assert.equal(
+      claudeBin({ env: { CLAUDE_BIN: '/opt/fake/claude', PATH: '/some/dir' }, probeRoot }),
+      '/opt/fake/claude',
+    );
   } finally {
-    if (prev === undefined) delete process.env.CLAUDE_BIN; else process.env.CLAUDE_BIN = prev;
+    fs.rmSync(probeRoot, { recursive: true, force: true });
   }
 });
 

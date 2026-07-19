@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { collectStats, collectTask, renderMarkdown } from '../../tools/dossier-stats.mjs';
+import { collectStats, collectTask, renderMarkdown, parseArgs, selectTask, runCli } from '../../tools/dossier-stats.mjs';
 
 function makeRoot(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dossier-stats-'));
@@ -150,4 +150,109 @@ test('collectTask（H17）：committer_degraded 事件 + 半行截断容错', (t
   const rec = collectTask(root, 'done', 'task-20260701-012');
   assert.equal(rec.committer_valid_attempt, null);
   assert.equal(rec.committer_degraded, true, 'degraded 以事件为准');
+});
+
+// ---- --task 单任务钻取 ----
+
+function makeTaskDetailRoot(t) {
+  const root = makeRoot(t);
+  writeTaskFixture(root, 'done', 'task-20260702-001', {
+    kind: 'bugfix',
+    runtime: { stage: 'DONE', spent_usd: 4.25 },
+    dossier: {
+      'maker-r1.json': { round: 1, mode: 'cold', ok: false, cost_usd: 2, raw: { subtype: 'error_max_turns' } },
+      'maker-r2.json': { round: 2, mode: 'resume', ok: true, cost_usd: 1, raw: { subtype: 'success' } },
+      'verify-r2.verdict.json': { overall: 'pass' },
+      'committer-r1.json': { cost_usd: 0.02, raw: { subtype: 'success' } },
+    },
+    timeline: '- committer 提案 a1 有效：fix(x): y\n- merged\n',
+  });
+  writeTaskFixture(root, 'failed', 'task-20260702-002', {
+    kind: 'feature',
+    runtime: { stage: 'FAILED_BOX', last_failure_type: 'spawn_failed', spent_usd: 0.75 },
+  });
+  return root;
+}
+
+test('AC-001/AC-002：--task 输出单任务详情块，含关键字段且不含其他任务 id', (t) => {
+  const root = makeTaskDetailRoot(t);
+  const res = runCli(['--task', 'task-20260702-001', root]);
+  assert.equal(res.code, 0);
+  assert.ok(res.stdout.includes('id: task-20260702-001'));
+  assert.ok(res.stdout.includes('box: done'));
+  assert.ok(res.stdout.includes('kind: bugfix'));
+  assert.ok(res.stdout.includes('成本(spent_usd): 4.25'));
+  assert.ok(!res.stdout.includes('task-20260702-002'), '不应包含其他任务 id');
+
+  for (const field of ['id', 'box', 'kind', 'maker 轮次数', '截断腿数', 'verifier', 'committer', '成本(spent_usd)', '失败类型']) {
+    assert.ok(res.stdout.includes(`${field}: `), `详情块缺字段 ${field}`);
+  }
+  assert.ok(res.stdout.includes('失败类型: -'), 'last_failure_type 为空回退 -');
+});
+
+test('AC-003：--task 未知 id 非零退出，stderr 说明三箱均未找到，stdout 不含全量输出', (t) => {
+  const root = makeTaskDetailRoot(t);
+  const res = runCli(['--task', 'task-20260702-999', root]);
+  assert.notEqual(res.code, 0);
+  assert.ok(res.stderr.includes('queue/done/failed'));
+  assert.equal(res.stdout, '');
+});
+
+test('AC-004/AC-010：--task --json 输出单个对象，与 collectStats 中同 id 条目字段/键集合一致', (t) => {
+  const root = makeTaskDetailRoot(t);
+  const res = runCli(['--task', 'task-20260702-001', '--json', root]);
+  assert.equal(res.code, 0);
+  const parsed = JSON.parse(res.stdout);
+  assert.ok(!Array.isArray(parsed));
+
+  const { tasks } = collectStats(root);
+  const fromStats = tasks.find((tk) => tk.id === 'task-20260702-001');
+  assert.deepEqual(parsed, fromStats);
+
+  const direct = collectTask(root, 'done', 'task-20260702-001');
+  assert.deepEqual(Object.keys(parsed).sort(), Object.keys(direct).sort());
+});
+
+test('AC-005：--task 未知 id --json 非零退出，stdout 不输出任何 JSON', (t) => {
+  const root = makeTaskDetailRoot(t);
+  const res = runCli(['--task', 'task-20260702-999', '--json', root]);
+  assert.notEqual(res.code, 0);
+  assert.ok(res.stderr.length > 0);
+  assert.equal(res.stdout, '');
+});
+
+test('AC-008：--task 缺失 id 值（末位参数 / 紧跟 -- flag）非零退出', () => {
+  const res1 = runCli(['--task']);
+  assert.notEqual(res1.code, 0);
+  assert.ok(res1.stderr.length > 0);
+  assert.equal(res1.stdout, '');
+
+  const res2 = runCli(['--task', '--json']);
+  assert.notEqual(res2.code, 0);
+  assert.ok(res2.stderr.length > 0);
+  assert.equal(res2.stdout, '');
+});
+
+test('AC-009：--task <id> 不传 root 时用 CONDUCTOR_ROOT 默认 root 命中，id 不被误当 root', (t) => {
+  const root = makeTaskDetailRoot(t);
+  const prevRoot = process.env.CONDUCTOR_ROOT;
+  process.env.CONDUCTOR_ROOT = root;
+  t.after(() => {
+    if (prevRoot === undefined) delete process.env.CONDUCTOR_ROOT;
+    else process.env.CONDUCTOR_ROOT = prevRoot;
+  });
+
+  const parsedNoRoot = parseArgs(['--task', 'task-20260702-001']);
+  assert.equal(parsedNoRoot.taskId, 'task-20260702-001');
+  assert.equal(parsedNoRoot.root, path.resolve(root));
+
+  const res = runCli(['--task', 'task-20260702-001']);
+  assert.equal(res.code, 0);
+  assert.ok(res.stdout.includes('id: task-20260702-001'));
+
+  const otherRoot = makeRoot(t);
+  writeTaskFixture(otherRoot, 'done', 'task-20260702-001', { runtime: { spent_usd: 9 } });
+  const parsedWithRoot = parseArgs(['--task', 'task-20260702-001', otherRoot]);
+  assert.equal(parsedWithRoot.root, path.resolve(otherRoot));
+  assert.equal(selectTask(parsedWithRoot.root, 'task-20260702-001').spent_usd, 9);
 });

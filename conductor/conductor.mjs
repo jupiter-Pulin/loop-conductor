@@ -84,6 +84,8 @@ export function loadCfg(root = resolveRoot()) {
     autoMergeMaxDiffLines: 400, // H33 机械低风险判定：numstat 总改动行数上限
     autoMergeMaxAcs: 8, // H33 机械低风险判定：AC 数上限
     autoMergeDeniedPaths: [], // H33 危险路径清单（命中即不放行）：'dir/' 前缀匹配，其余子串匹配；空=不限（开启提案时应配真实清单）
+    autoApproveSpecEnabled: false, // spec 审批门机器放行：默认关；开=AWAIT_SPEC_APPROVAL 且 evaluateAutoApproveSpec 谓词全绿即冻结进 READY（merge 闸门不动）。new --auto-approve-spec 可逐任务覆盖
+    autoApproveSpecMaxAcs: 8, // 机器放行的 AC 数上限：超上限（或 verdict 带 blocker/major finding）一律留人审
     spawnRetries: 6, // Claude 瞬态重试次数（H7：长尾覆盖限流窗口）
     spawnBackoffMs: [15000, 30000, 60000, 120000, 300000, 600000], // 瞬态重试退避（H7：尾部 5min/10min 穿越 429 窗口）
     verifierShadowEnabled: false, // verifier shadow 观测实验（R4-E11）：默认关；开启也绝不影响状态机
@@ -266,6 +268,10 @@ function cmdNew(cfg, opts) {
   const feasibility = kind === 'feature' && (
     opts.feasibility != null ? opts.feasibility !== 'false' : cfg.feasibilityEnabled === true
   );
+  // --auto-approve-spec：spec 审批门机器放行（仅 feature 有意义；task.json 显式值 > config.autoApproveSpecEnabled）。
+  const autoApproveSpec = kind === 'feature' && opts['auto-approve-spec'] != null
+    ? opts['auto-approve-spec'] !== 'false'
+    : undefined;
   const naturalStage = kind === 'feature'
     ? (feasibility ? 'NEEDS_FEASIBILITY' : 'NEEDS_SPEC')
     : kind === 'probe' ? 'NEEDS_FEASIBILITY' // probe 链（H26）：只读调查，复用 feasibility agent
@@ -284,6 +290,7 @@ function cmdNew(cfg, opts) {
     kind,
     title,
     ...(kind === 'feature' ? { feasibility } : {}),
+    ...(autoApproveSpec !== undefined ? { autoApproveSpec } : {}),
     repo: path.basename(targetRepo),
     targetRepo,
     baseBranch,
@@ -332,6 +339,9 @@ function cmdNew(cfg, opts) {
     console.log('feature 档（feasibility gate）：conductor run 会先让 feasibility-agent 产出决策 memo，等你 approve-feasibility --option 点名后再进 spec 链');
   } else {
     console.log('feature 档：conductor run 会先让 spec-agent 产出草稿，经 spec-verifier 后等你 approve/reject');
+  }
+  if (autoApproveSpec === true) {
+    console.log('auto-approve-spec 已开：spec-verifier pass 且谓词全绿（无 blocker/major finding、AC 数达标）时机器代章进 READY；merge 闸门不动');
   }
   if (stage === 'NEEDS_TARGET_SETUP') {
     console.log('当前 target repo 没有 approved setup profile：conductor run 会先进入 setup-agent + approve-setup 闸门');
@@ -805,7 +815,18 @@ const USAGE = `用法：conductor <command>
   close <id>                           probe 终点闸门：调查报告固化进 dossier 后归档（无 merge）
   retry <id>                           FAILED_BOX → READY（重置 miss，保留案卷）/ 清理崩溃标记`;
 
+const REQUIRED_NODE_MAJOR = 24;
+
+/** node 主版本 < 24 时输出一行 stderr 警告（不阻断，退出码/后续行为不变）。 */
+export function warnIfNodeVersionUnsupported(version = process.version) {
+  const major = Number.parseInt(String(version).replace(/^v/, ''), 10);
+  if (Number.isFinite(major) && major < REQUIRED_NODE_MAJOR) {
+    console.error(`[conductor] 警告：当前 Node ${version}，本仓测试需 v24（部分测试在低版本上可能失败）。`);
+  }
+}
+
 export async function main(argv = process.argv.slice(2)) {
+  warnIfNodeVersionUnsupported();
   const { cmd, opts } = parseArgs(argv);
   const cfg = loadCfg();
   ensureDirs(cfg);
