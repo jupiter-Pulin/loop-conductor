@@ -76,7 +76,7 @@ export const SPEC_VERIFIER_CONTRACT = Object.freeze({
   id: 'spec-verifier-verdict/v1',
   schemaVersion: 1,
   overallValues: Object.freeze(['pass', 'fail']),
-  severities: Object.freeze(['blocker', 'major', 'minor']),
+  severities: Object.freeze(['blocker', 'major', 'minor', 'advisory']),
   audiences: Object.freeze(['human', 'spec-agent', 'both']),
 });
 
@@ -661,6 +661,24 @@ export function validateSpecVerifierVerdict(parsed) {
   };
 }
 
+/**
+ * H18 规模闸 ⇔ advisory 的机械双向核验（纯函数）。协议要求「规模闸触发 ⇔ verdict 携
+ * severity=advisory 拆分建议」只是 prompt 文字，verifier 不守约时必须机械执法：
+ * - 闸已触发但零 advisory：拆分建议缺失，人审拿不到该拿的信息；
+ * - 闸未触发却带 advisory：advisory 只许在 conductor 明文要求时出现（防洗白通道）。
+ * 违约返回错误文本（走 spec-verifier invalid 阶梯），守约返回 null。
+ */
+export function specScaleGateViolation(scaleGate, verdict) {
+  const advisories = (verdict?.findings ?? []).filter((f) => f?.severity === 'advisory');
+  if (scaleGate && advisories.length === 0) {
+    return `规模闸已触发（AC×${scaleGate.acCount} > ${scaleGate.max}）但 verdict 缺 severity=advisory 拆分建议`;
+  }
+  if (!scaleGate && advisories.length > 0) {
+    return `规模闸未触发但 verdict 携 ${advisories.length} 条 severity=advisory finding（advisory 仅限 conductor 明文要求时使用）`;
+  }
+  return null;
+}
+
 /** 解析 git diff --numstat 输出（H33）：{ total_lines, files, binary }。二进制行（-\t-）计入 binary。 */
 export function parseNumstat(text) {
   let totalLines = 0;
@@ -691,8 +709,8 @@ export function parseNumstat(text) {
 /**
  * spec 审批门机器放行谓词（纯函数唯一裁判；输入全部机械产物，禁止任何 AI 自评）。
  * 放行 = 全部机械门的合取；任何一门数据缺失即 fail-closed（无证据 = 不放行）。
- * 护栏方向：spec-verifier pass 是必要非充分——pass 但带 blocker/major finding
- * （典型：规模拆分建议）意味着 verdict 里有值得人裁决的信息，一律留人审。
+ * 护栏方向：spec-verifier pass 是必要非充分——pass 但带 blocker/major/advisory finding
+ * （advisory 典型：规模拆分建议，不翻转 overall 但拆分与否必须人裁）意味着 verdict 里有值得人裁决的信息，一律留人审。
  * 边界：本谓词只免「人在 AWAIT_SPEC_APPROVAL 点章」这一步；merge 闸门与 reject 通道不动。
  */
 export function evaluateAutoApproveSpec({ kind, draftCheck, maxAcs, specVerdict }) {
@@ -715,7 +733,7 @@ export function evaluateAutoApproveSpec({ kind, draftCheck, maxAcs, specVerdict 
   else {
     if (specVerdict.overall !== 'pass') reasons.push(`spec-verifier overall=${specVerdict.overall ?? '?'} ≠ pass`);
     const findings = Array.isArray(specVerdict.findings) ? specVerdict.findings : [];
-    const heavy = findings.filter((f) => f?.severity === 'blocker' || f?.severity === 'major');
+    const heavy = findings.filter((f) => f?.severity === 'blocker' || f?.severity === 'major' || f?.severity === 'advisory');
     if (heavy.length > 0) {
       reasons.push(`verdict 带需人裁决的 finding：${heavy.map((f) => `${f.severity}（${String(f.issue ?? '').slice(0, 60)}）`).join('、')}`);
     }

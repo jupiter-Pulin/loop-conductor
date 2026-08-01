@@ -64,6 +64,27 @@ test('契约1：默认关——feature 停人审闸门，零 autoapprove 产物'
   assert.ok(!env.exists(env.dossier(id, 'spec-verify-r1.autoapprove-decision.json')), '默认关零 autoapprove 产物');
 });
 
+test('契约2b：开但 verdict pass 带 advisory finding（规模拆分建议）——不放行留人审', (t) => {
+  // advisory 不翻转 overall（否则重演 task-20260801-001 死锁），但拆分与否必须人裁——机器不得代章。
+  // specMaxAcs=1 使规模闸对 2AC 草稿触发——advisory 只许在闸触发时出现（双向执法）。
+  const env = makeEnv(t, { config: { specMaxAcs: 1 } });
+  env.writeApprovedSetupProfile();
+  const id = newFeature(env, '--auto-approve-spec');
+  env.setScenario([
+    specAgentStep(env, id, SPEC_DRAFT),
+    specVerifierStep(1, 'pass', { over: {
+      findings: [{ severity: 'advisory', audience: 'both', issue: 'AC 数超规模阈值，附拆分建议', recommendation: '拆 Milestone A/B' }],
+    } }),
+  ]);
+  assert.equal(env.run('run').status, 0);
+  const after = env.findTask(id);
+  assert.equal(after.runtime.stage, 'AWAIT_SPEC_APPROVAL', 'advisory 在场时机器不代章');
+  assert.equal(after.runtime.approval, null);
+  const decision = env.readJson(env.dossier(id, 'spec-verify-r1.autoapprove-decision.json'));
+  assert.equal(decision.eligible, false);
+  assert.ok(decision.reasons.some((r) => r.includes('需人裁决的 finding')), JSON.stringify(decision.reasons));
+});
+
 test('契约2：开但 verdict 带 major finding——不放行留人审，同轮幂等', (t) => {
   const env = makeEnv(t, { config: { eventsLogEnabled: true } });
   env.writeApprovedSetupProfile();

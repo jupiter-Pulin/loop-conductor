@@ -5,7 +5,7 @@ import path from 'node:path';
 import { runClaudeWithRetry } from '../lib/claude.mjs';
 import * as state from '../lib/state.mjs';
 import {
-  parseStrictJson, specMissNext, specVerifierInvalidNext, validateSpecVerifierVerdict,
+  parseStrictJson, specMissNext, specScaleGateViolation, specVerifierInvalidNext, validateSpecVerifierVerdict,
 } from './decisions.mjs';
 import {
   accountSpawnCost, archiveSpecDraft, budgetExceeded, buildSpecVerifierPrompt, failToBox,
@@ -88,7 +88,12 @@ export default async function specVerifyHandler(ts, cfg) {
   }
 
   const parsed = parseStrictJson(res.result);
-  const check = validateSpecVerifierVerdict(parsed);
+  let check = validateSpecVerifierVerdict(parsed);
+  if (check.ok) {
+    // H18 双向核验（机械执法，幂等重入的历史 verdict 不追溯）：闸触发 ⇔ advisory 在场。
+    const violation = specScaleGateViolation(scaleGate, check.verdict);
+    if (violation) check = { ok: false, errors: [violation] };
+  }
   if (!check.ok) {
     const m = (ts.runtime.spec_verifier_invalid_count ?? 0) + 1;
     state.writeJson(state.dossierPath(cfg, id, `spec-verify-r${round}.invalid-a${m}.json`), {
