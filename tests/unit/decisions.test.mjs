@@ -6,7 +6,7 @@ import {
   needsSpecAction, makerMissNext, makerRound, verdictNext, verifierInvalidNext,
   fixingMode, parseStrictJson, specMissNext, specVerifierInvalidNext,
   needsFeasibilityAction, feasibilityApprovalNext, feasibilityContractInvalidNext,
-  validateSpecVerifierVerdict, validateVerifierVerdict, MAX_MISS, STAGES,
+  specScaleGateViolation, validateSpecVerifierVerdict, validateVerifierVerdict, MAX_MISS, STAGES,
   sameSignatureStreak, normalizeGateCommands, resolveGateCommands, checkEvidenceAnchors, validateReviewReport,
 } from '../../conductor/stages/decisions.mjs';
 
@@ -372,6 +372,22 @@ test('validateSpecVerifierVerdict：finding 字段枚举与文本校验', () => 
   assert.ok(r.errors.some((e) => /audience/.test(e)));
   assert.ok(r.errors.some((e) => /issue/.test(e)));
   assert.ok(r.errors.some((e) => /recommendation/.test(e)));
+});
+
+test('validateSpecVerifierVerdict：advisory finding 合法，可随 pass 出现（H18 规模闸拆分建议）', () => {
+  const r = validateSpecVerifierVerdict(goodSpecVerdict({
+    findings: [{ severity: 'advisory', audience: 'both', issue: 'AC×24 超过阈值 12', recommendation: '拆 Milestone A/B 两任务' }],
+  }));
+  assert.equal(r.ok, true, r.errors?.join('; '));
+});
+
+test('specScaleGateViolation：闸触发 ⇔ advisory 在场，双向核验', () => {
+  const advisory = { severity: 'advisory', audience: 'both', issue: '超阈值', recommendation: '拆分' };
+  const gate = { acCount: 24, max: 12 };
+  assert.equal(specScaleGateViolation(gate, goodSpecVerdict({ findings: [advisory] })), null, '闸开+advisory=守约');
+  assert.equal(specScaleGateViolation(null, goodSpecVerdict()), null, '闸关+无 advisory=守约');
+  assert.match(specScaleGateViolation(gate, goodSpecVerdict()) ?? '', /规模闸已触发.*advisory/, '闸开缺 advisory=违约');
+  assert.match(specScaleGateViolation(null, goodSpecVerdict({ findings: [advisory] })) ?? '', /规模闸未触发/, '闸关带 advisory=违约');
 });
 
 test('sameSignatureStreak：尾部连续相等 run 长度', () => {

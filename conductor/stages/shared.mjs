@@ -942,14 +942,16 @@ export function buildSpecVerifierPrompt(ts, cfg, round, scaleGate = null) {
     scaleGate
       ? `# 规模闸（H18 软档，conductor 机械计数）\n本 spec 含 ${scaleGate.acCount} 条 AC，超过阈值 ${scaleGate.max}` +
         '（单任务链轮次预算按 one-thing-per-loop 设计，超规模 spec 已有真实截断先例）。' +
-        '无论 overall 裁决如何，findings 必须包含一条 severity=major、audience=both 的**拆分建议**：' +
+        '无论 overall 裁决如何，findings 必须包含一条 severity=advisory、audience=both 的**拆分建议**：' +
         '给出把本 spec 拆成多任务或 AC 分批 milestone 的具体方案（哪些 AC 一组、组间依赖顺序）。' +
-        '不因规模本身判 fail——拆分决定权在人审闸门。'
+        'advisory 档不参与 overall 判定——若 spec 除规模外没有 blocker/major 问题，overall 应为 pass。' +
+        '不因规模本身判 fail——拆分决定权在人审闸门（AWAIT_SPEC_APPROVAL）。'
       : null,
     `# Verdict contract\n${SPEC_VERIFIER_CONTRACT.id} ` +
     `(schema_version=${SPEC_VERIFIER_CONTRACT.schemaVersion})。`,
     '# JSON 字段\n必须包含 schema_version、round、overall、summary、human_report、spec_agent_feedback、findings。' +
-    ' findings 每项含 severity(blocker|major|minor)、audience(human|spec-agent|both)、issue、recommendation。',
+    ' findings 每项含 severity(blocker|major|minor|advisory)、audience(human|spec-agent|both)、issue、recommendation。' +
+    ' advisory 仅用于 conductor 明文要求的执行建议（如规模拆分建议），不参与 overall 判定。',
     '# 输出纪律（协议要求，机械校验，不可违反）\n' +
     '最终回复的第一个字符必须是 `{`，最后一个字符必须是 `}`；`{` 之前与 `}` 之后不得有任何字符——' +
     '不要输出解释文字、总结、Markdown 代码围栏（包括 ```json）、空行或提示语。' +
@@ -959,6 +961,8 @@ export function buildSpecVerifierPrompt(ts, cfg, round, scaleGate = null) {
 }
 
 export function writeSpecRepairContext(cfg, id, round, verdict) {
+  // advisory（规模拆分建议）面向人审闸门，不进 repair 上下文——历史上规模反馈会诱导
+  // spec-agent 私自折叠 AC 规避规模闸（task-20260801-002 r5 实例），修复范围必须锁在 blocker/major。
   const ctx = {
     schema_version: 1,
     round,
@@ -966,8 +970,9 @@ export function writeSpecRepairContext(cfg, id, round, verdict) {
     overall: 'fail',
     human_report: verdict.human_report,
     spec_agent_feedback: verdict.spec_agent_feedback,
-    findings: verdict.findings,
-    instruction: 'Repair the spec draft only. Preserve useful accepted content and address every blocker/major finding.',
+    findings: (verdict.findings ?? []).filter((f) => f?.severity !== 'advisory'),
+    instruction: 'Repair the spec draft only. Preserve useful accepted content and address every blocker/major finding. ' +
+      'Do NOT split the task or drop/merge acceptance criteria to dodge the scale gate — split decisions belong to the human approval gate.',
   };
   state.writeJson(state.dossierPath(cfg, id, `spec-repair-context-r${round}.json`), ctx);
   return ctx;

@@ -54,7 +54,7 @@ feature:
 NEEDS_SPEC -> SPEC_VERIFY -> SPEC_FIXING -> SPEC_VERIFY -> AWAIT_SPEC_APPROVAL -> READY
 spec 契约门（spec-doc/v1）fail -> 原地重试 spec-agent，耗尽 -> FAILED_BOX
 AWAIT_SPEC_APPROVAL 机器放行（autoApproveSpec / new --auto-approve-spec，默认关）：
-  evaluateAutoApproveSpec 谓词全绿（verdict pass 无 blocker/major、AC 数 ≤ 上限）-> 代章进 READY；否则留人审
+  evaluateAutoApproveSpec 谓词全绿（verdict pass 无 blocker/major/advisory、AC 数 ≤ 上限）-> 代章进 READY；否则留人审（advisory=规模拆分建议，拆分与否必须人裁）
 
 bugfix:
 READY

@@ -77,7 +77,7 @@ export function loadCfg(root = resolveRoot()) {
     eventsLogEnabled: false, // H17 结构化事件流：dossier/<id>/events.jsonl（NDJSON）供机器消费，timeline 回归纯人读；best-effort 绝不打断主链
     specChainIsolationEnabled: false, // H19 spec/feasibility 链物理隔离：探索 cwd 换 baseBranch 一次性 detached worktree（交付走编排侧绝对路径不受影响；只见已提交状态）
     unknownSpawnCostEstimateEnabled: false, // H20 killed/无 result spawn 按角色 dossier 历史均价估计入账（标 estimated，独立累计 runtime.estimated_cost_usd；无样本退回 lower-bound）
-    specMaxAcs: null, // H18 spec 规模闸（软档）：AC 数超此阈值时要求 spec-verifier 附拆分建议 finding，不改路由；null=关
+    specMaxAcs: null, // H18 spec 规模闸（软档）：AC 数超此阈值时要求 spec-verifier 附 severity=advisory 拆分建议 finding（不参与 overall、不改路由，拆分权在人审）；null=关
     reviewStage: 'off', // H21 独立 Reviewer：off=关；shadow=verifier pass 后对照跑（只落盘+分歧对照，绝不影响 stage）；gate 档属 H22（未实现，等 shadow 数据）
     autoMergeEnabled: false, // H33 机械全绿自动本地合并：默认关；开=verdict pass 后 evaluateAutoMerge 谓词全绿即本地 merge（绝不 push）。拨开须人签字（红区），且先有 shadow 期无假绿数据
     autoMergeKinds: ['bugfix'], // H33 允许自动合并的任务 kind（feature 一律人审）
@@ -85,7 +85,7 @@ export function loadCfg(root = resolveRoot()) {
     autoMergeMaxAcs: 8, // H33 机械低风险判定：AC 数上限
     autoMergeDeniedPaths: [], // H33 危险路径清单（命中即不放行）：'dir/' 前缀匹配，其余子串匹配；空=不限（开启提案时应配真实清单）
     autoApproveSpecEnabled: false, // spec 审批门机器放行：默认关；开=AWAIT_SPEC_APPROVAL 且 evaluateAutoApproveSpec 谓词全绿即冻结进 READY（merge 闸门不动）。new --auto-approve-spec 可逐任务覆盖
-    autoApproveSpecMaxAcs: 8, // 机器放行的 AC 数上限：超上限（或 verdict 带 blocker/major finding）一律留人审
+    autoApproveSpecMaxAcs: 8, // 机器放行的 AC 数上限：超上限（或 verdict 带 blocker/major/advisory finding）一律留人审
     spawnRetries: 6, // Claude 瞬态重试次数（H7：长尾覆盖限流窗口）
     spawnBackoffMs: [15000, 30000, 60000, 120000, 300000, 600000], // 瞬态重试退避（H7：尾部 5min/10min 穿越 429 窗口）
     verifierShadowEnabled: false, // verifier shadow 观测实验（R4-E11）：默认关；开启也绝不影响状态机
@@ -341,7 +341,7 @@ function cmdNew(cfg, opts) {
     console.log('feature 档：conductor run 会先让 spec-agent 产出草稿，经 spec-verifier 后等你 approve/reject');
   }
   if (autoApproveSpec === true) {
-    console.log('auto-approve-spec 已开：spec-verifier pass 且谓词全绿（无 blocker/major finding、AC 数达标）时机器代章进 READY；merge 闸门不动');
+    console.log('auto-approve-spec 已开：spec-verifier pass 且谓词全绿（无 blocker/major/advisory finding、AC 数达标）时机器代章进 READY；merge 闸门不动');
   }
   if (stage === 'NEEDS_TARGET_SETUP') {
     console.log('当前 target repo 没有 approved setup profile：conductor run 会先进入 setup-agent + approve-setup 闸门');

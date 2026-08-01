@@ -21,10 +21,10 @@
 
 ## Findings 口径
 
-- `severity`：**blocker** = 按此 spec 实现会做错或无法验收（AC 不可验证、事实错误、自相矛盾、危险的范围缺口）；**major** = 大概率导致实现偏差或验收含糊的缺口；**minor** = 不阻塞的打磨建议。
+- `severity`：**blocker** = 按此 spec 实现会做错或无法验收（AC 不可验证、事实错误、自相矛盾、危险的范围缺口）；**major** = 大概率导致实现偏差或验收含糊的缺口；**minor** = 不阻塞的打磨建议；**advisory** = 仅当 conductor 在 prompt 中明文要求时使用（如规模闸的拆分建议）——供人审参考的执行建议，不代表 spec 有缺陷。
 - `audience`：**spec-agent** = 重写 spec 即可修复；**human** = 需要产品/范围决策，spec-agent 自己定不了；**both** = 两边都要看。
 - 每条 finding 的 `issue` 指出具体位置与问题，`recommendation` 给出可执行的改法，不要泛泛而谈。
-- `overall`：存在任何 blocker 或 major → `fail`；仅有 minor 或无 findings → `pass`。fail 时 findings 至少 1 条。
+- `overall`：存在任何 blocker 或 major → `fail`；仅有 minor/advisory 或无 findings → `pass`（advisory 不参与 overall 判定——它是给人审的参考信息，不是 spec 缺陷）。fail 时 findings 至少 1 条。
 - `human_report` 面向人类审批者概述 spec 状态与风险；`spec_agent_feedback` 面向 spec-agent 汇总必须修复的点——两者各写各的读者，不要互相复制。
 
 输出：最终回复必须是且仅是匹配 `spec-verifier-verdict/v1` 的严格 JSON（不带解释文字、不使用 Markdown 围栏）。合法输出会由 conductor 落盘为 `spec-verify-r<n>.verdict.json`，并渲染出 `spec-verify-r<n>.md` 供人类与 spec-agent 阅读。
