@@ -58,6 +58,10 @@ test('r1 截断 → 同会话续跑完成 → 绿门过 → VERIFY，miss 不增
   // 成本：两腿都入账，不重复计费（0.1 + 0.2 + verifier 0.02）
   const spent = ts.runtime.spent_usd;
   assert.ok(Math.abs(spent - 0.32) < 1e-9, `两腿成本各计一次：expected 0.32, got ${spent}`);
+  // spawn 记录 cost_usd = 全部腿总成本（真实事故 task-20260801-003：只记末腿导致
+  // dossier-stats 把 maker 续跑轮成本低估近半）；断腿部分同时以 prior_legs_cost_usd 透明留痕
+  assert.ok(Math.abs(marker.cost_usd - 0.3) < 1e-9, `记录 cost_usd 应为两腿之和：got ${marker.cost_usd}`);
+  assert.ok(Math.abs(marker.prior_legs_cost_usd - 0.1) < 1e-9, '断腿成本单独留痕');
 });
 
 test('续跑额度耗尽仍截断 → 旧行为：进 green gate，红了计 miss 转 FIXING 修复', (t) => {

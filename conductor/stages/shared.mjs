@@ -106,7 +106,11 @@ export function finishSpawnRecord(rec, res) {
   rec.record.done = new Date().toISOString();
   rec.record.ok = res.ok;
   rec.record.session_id = res.sessionId;
-  rec.record.cost_usd = res.costUsd;
+  // cost_usd = 本轮全部腿的总成本：max-turns 续跑的断腿成本在 prior_legs_cost_usd 里累计
+  // （runtime 侧已逐腿入账并把 res.costUsd 清零，这里相加不会双重计费）。
+  rec.record.cost_usd = rec.record.prior_legs_cost_usd
+    ? Math.round(((res.costUsd ?? 0) + rec.record.prior_legs_cost_usd) * 1e6) / 1e6
+    : res.costUsd;
   rec.record.raw = res.raw ?? null; // 原始 CLI JSON 留档，不经转述
   if (res.killed !== undefined) rec.record.killed = res.killed ?? null;
   if (res.costUnknown) rec.record.cost_unknown = true;
@@ -1605,6 +1609,11 @@ export async function runMakerRound(ts, cfg, round, { mode, prompt, coldPrompt, 
       const sessionId = res.raw?.session_id ?? res.sessionId;
       addCost(ts, res.costUsd, cfg);
       state.saveRuntime(ts);
+      // 断腿成本同步累计进 spawn 记录：runtime 在上面已入账，但 finishSpawnRecord 只写末腿
+      // res.costUsd，不累计会让 dossier-stats / 角色均价估计把续跑轮成本系统性低估
+      // （真实事故：task-20260801-003 maker r1 账面 $4.269，漏了主腿 $4.115，近半成本消失）。
+      rec.record.prior_legs_cost_usd =
+        Math.round(((rec.record.prior_legs_cost_usd ?? 0) + (res.costUsd ?? 0)) * 1e6) / 1e6;
       res = { ...res, costUsd: 0 }; // 本腿成本已入账；防止收尾 addCost 重复计费
       if (budgetExceeded(ts, cfg) || !canStartSpawn(ts, cfg, 'maker')) break;
       legs++;
