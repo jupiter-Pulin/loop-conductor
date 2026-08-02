@@ -164,6 +164,9 @@ test('git-guard：拦截 push 与不可逆操作（exit 2 + 指引）', () => {
     const r = runHook(GIT_GUARD, [], bashCall(command));
     assert.equal(r.status, 2, `应拦截：${command}`);
     assert.match(r.stderr, /maker-git-guard 拦截/, command);
+    // 拦截提示必须给出认可的替代路径（真实事故：3 个任务 4 次 denial 全是想恢复误改文件，
+    // 旧提示只说「改用非破坏性方式」没给做法，每次白烧一轮）
+    assert.match(r.stderr, /git show HEAD:/, `拦截提示应含单文件恢复替代做法：${command}`);
   }
 });
 
