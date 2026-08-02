@@ -2,6 +2,7 @@
 
 面向 agent 的项目索引。本文件只做路由，不做长说明；当前事实源是代码和测试。没有被这里链接的文档视为历史材料，不作为实现依据。
 
+English readers: see [`README.en.md`](README.en.md) for a human-facing overview of this project.
 ## 入口
 
 | 你要找 | 打开 |
