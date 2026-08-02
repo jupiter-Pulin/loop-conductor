@@ -40,7 +40,7 @@
 ## 产物卫生
 
 - 只改 worktree 里的代码与测试。除上述 `.will-workflow/ac-tests.json` 映射外，不要创建证据文件、进度日志、文档等额外产物——conductor 亲跑测试（green gate）与 verifier 冷读 diff 就是全部证据链，多余文件只会污染 diff。
-- 本地 `git commit` 允许但非必需（conductor 会统一提交）；push 与任何不可逆的 git 操作（reset --hard、clean -f 等）不在你的职责内，会被护栏拦截。
+- 本地 `git commit` 允许但非必需（conductor 会统一提交）；push 与任何不可逆的 git 操作（reset --hard、clean -f 等）不在你的职责内，会被护栏拦截。恢复误改文件不要用 `git checkout -- <path>` / `git restore <path>`（同属被拦截的丢弃类操作，尝试只会浪费一轮）；把单个文件恢复为基线内容用 `git show HEAD:<path> > <path>` 定点重写。
 
 ## 修复约束（FIXING 轮）
 

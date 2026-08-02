@@ -169,7 +169,8 @@ function main() {
     `maker-git-guard 拦截：${danger}\n` +
     '你的职责是修改当前 worktree 的代码与测试并让测试命令全绿；' +
     '本地 git commit 允许，push 与任何不可逆的历史/worktree 操作不在你的职责内' +
-    '（commit、merge 与 worktree 清理由 conductor 负责）。请改用非破坏性方式完成当前步骤。',
+    '（commit、merge 与 worktree 清理由 conductor 负责）。请改用非破坏性方式完成当前步骤：' +
+    '如需把误改的单个文件恢复为基线内容，用 `git show HEAD:<path> > <path>` 定点重写该文件（无波及面）。',
   );
   process.exit(2);
 }
