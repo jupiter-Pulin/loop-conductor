@@ -1476,6 +1476,13 @@ export function buildCommitterPrompt(ts, cfg, acList, diffStat) {
     `subject 逐字匹配 \`type(scope)?: 描述\`（type ∈ {${types.join('|')}}，描述 ≤${subjectMaxLen} 字符，禁 WIP）；` +
     `body 非空、每行 ≤${bodyLineMaxLen} 字符。唯一程序级校验在 ` +
     '`conductor/stages/decisions.mjs::validateCommitMessage`，不合格会被要求重出，两次不合格降级机器文案。',
+    // 与 buildVerifierPrompt / buildSpecVerifierPrompt 同款纪律块（该措辞钉死后 verifier 侧 0 invalid）。
+    // 真实事故：task-20260801-002 committer a1 在 JSON 前多了一句导语，整份合法提案被机械拒收。
+    '# 输出纪律（协议要求，机械校验，不可违反）\n' +
+    '最终回复的第一个字符必须是 `{`，最后一个字符必须是 `}`；`{` 之前与 `}` 之后不得有任何字符——' +
+    '不要输出解释文字、总结、Markdown 代码围栏（包括 ```json）、空行或提示语。' +
+    '探索与推理过程留在工具调用轮次里，不要出现在最终回复中。' +
+    '不合规输出会被机械拒收，并烧掉一次重试预算。',
   ].filter(Boolean).join('\n\n');
 }
 
@@ -1529,7 +1536,10 @@ export async function runCommitterProposal(ts, cfg) {
     } else {
       state.appendTimeline(cfg, id, `committer 提案 a${attempt} invalid：${check.errors.join('; ')}`);
       state.appendEvent(cfg, id, 'committer_attempt', { attempt, outcome: 'invalid', invalid_kind: 'malformed' });
-      prompt += `\n\n# 上一轮提案校验失败（必须全部修复后重出）\n${check.errors.map((e) => `- ${e}`).join('\n')}`;
+      // 零工具指令不只给 turns_exhausted：真实事故（task-20260801-002）a1 malformed 后，a2 收到错误
+      // 反馈却又把 4 轮全花在重读源码上撞 max-turns 降级——重试轮材料已齐，禁工具直出。
+      prompt += `\n\n# 上一轮提案校验失败（必须全部修复后重出）\n${check.errors.map((e) => `- ${e}`).join('\n')}\n` +
+        '本轮**禁止调用任何工具**：起草材料已全部在上文，直接重新输出严格 JSON 提案（第一个字符 `{`，最后一个字符 `}`）。';
     }
   }
   state.appendTimeline(cfg, id, 'committer 提案两次 invalid，merge 降级机器文案');

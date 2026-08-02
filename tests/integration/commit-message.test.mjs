@@ -95,10 +95,13 @@ test('提案两次 invalid → fail-open 降级机器文案，merge 不被 block
   assert.equal(subject, `merge task/${id} (conductor)`);
   assert.equal(env.findTask(id).box, 'done');
 
-  // 重试恰一次：committer 两次 spawn 留档；第二次 prompt 附上一轮校验错误
+  // 重试恰一次：committer 两次 spawn 留档；第二次 prompt 附上一轮校验错误 + 禁工具直出指令
+  // （真实事故：task-20260801-002 a1 malformed 后 a2 又把轮次全花在重读源码上撞 max-turns 降级）
   const calls = env.calls();
   assert.equal(calls.length, 4, 'maker + verifier + committer×2');
   assert.ok(promptOf(calls[3]).includes('上一轮提案校验失败'), '重试 prompt 附错误反馈');
+  assert.ok(promptOf(calls[3]).includes('禁止调用任何工具'), 'malformed 重试 prompt 同样附禁工具直出指令');
+  assert.ok(!promptOf(calls[2]).includes('禁止调用任何工具'), '首轮 prompt 不带重试指令（正常允许有限工具核对）');
   assert.ok(env.exists(env.dossier(id, 'committer-r1.json')));
   assert.ok(env.exists(env.dossier(id, 'committer-r2.json')));
   const timeline = env.readFile(env.dossier(id, 'timeline.md'));

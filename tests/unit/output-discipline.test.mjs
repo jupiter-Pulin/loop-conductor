@@ -8,7 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { buildVerifierPrompt, buildSpecVerifierPrompt } from '../../conductor/stages/shared.mjs';
+import { buildVerifierPrompt, buildSpecVerifierPrompt, buildCommitterPrompt } from '../../conductor/stages/shared.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..', '..');
@@ -37,12 +37,14 @@ function makeFixture(t) {
   fs.mkdirSync(agentsDir, { recursive: true });
   fs.writeFileSync(path.join(agentsDir, 'verifier-agent.md'), '# verifier stub\n');
   fs.writeFileSync(path.join(agentsDir, 'spec-verifier-agent.md'), '# spec verifier stub\n');
+  fs.writeFileSync(path.join(agentsDir, 'committer-agent.md'), '# committer stub\n');
 
   const worktreesDir = path.join(root, 'worktrees');
   const id = 'task-20260704-999';
   makeMinimalWorktree(path.join(worktreesDir, id));
 
   const cfg = {
+    root,
     agentsDir,
     worktreesDir,
     dossierDir: path.join(root, 'dossier'),
@@ -88,6 +90,25 @@ test('buildSpecVerifierPrompt：输出纪律明确首字符 { / 尾字符 }，�
   assert.match(prompt, /不得有任何字符/, '必须禁止 { 之前与 } 之后出现任何字符');
   assert.match(prompt, /围栏/, '必须点名禁止 Markdown 围栏');
   assert.match(prompt, /机械拒收/, '必须说明违规输出会被机械拒收');
+});
+
+test('buildCommitterPrompt：输出纪律明确首字符 { / 尾字符 }，禁止前后缀与围栏', (t) => {
+  const { cfg, ts } = makeFixture(t);
+  const prompt = buildCommitterPrompt(ts, cfg, [{ ac_id: 'AC-001', text: 'stub ac' }], ' 1 file changed\n');
+  assert.match(prompt, /第一个字符必须是\s*`?\{/, '必须明确首字符是 {');
+  assert.match(prompt, /最后一个字符必须是\s*`?\}/, '必须明确尾字符是 }');
+  assert.match(prompt, /不得有任何字符/, '必须禁止 { 之前与 } 之后出现任何字符');
+  assert.match(prompt, /围栏/, '必须点名禁止 Markdown 围栏');
+  assert.match(prompt, /机械拒收/, '必须说明违规输出会被机械拒收');
+});
+
+test('agents/committer-agent.md：含输出纪律段，语义覆盖首尾字符/禁止前置叙事/机械拒收', () => {
+  const md = fs.readFileSync(path.join(REPO_ROOT, 'agents', 'committer-agent.md'), 'utf8');
+  assert.match(md, /输出纪律/, '必须有输出纪律段');
+  assert.match(md, /第一个字符必须是\s*`?\{/);
+  assert.match(md, /最后一个字符必须是\s*`?\}/);
+  assert.match(md, /围栏/);
+  assert.match(md, /机械拒收/);
 });
 
 test('agents/verifier-agent.md：含输出纪律段，语义覆盖首尾字符/禁止前置叙事/机械拒收', () => {
