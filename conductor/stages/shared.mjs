@@ -927,6 +927,7 @@ export function buildSpecVerifierPrompt(ts, cfg, round, scaleGate = null) {
   const feasibility = readFeasibilityContext(ts, cfg) || '(no feasibility-study context yet; placeholder for future feasibility-study agent)';
   const brief = readBrief(ts);
   const decision = readFeasibilityDecision(ts, cfg);
+  const rejectNotes = readRejectNotes(ts);
   const spec = readSpecDraft(ts, cfg);
   const history = readSpecReviewHistory(ts, cfg);
   return [
@@ -937,6 +938,13 @@ export function buildSpecVerifierPrompt(ts, cfg, round, scaleGate = null) {
     `# Approved setup profile\n\n${setup}`,
     `# Feasibility context\n\n${feasibility}`,
     decision ? `# 已选 option（人审裁决，spec 偏离即 blocker）\n\n${renderFeasibilityDecisionSection(decision)}` : '',
+    // 人审打回意见必须与 spec-agent 同源同送：缺了它，spec 按 notes 换向会被误判「未经授权偏离 brief」
+    // （真实事故：task-20260801-002 r2 因审查输入缺人审裁决上下文被打 blocker，白烧一轮修复）。
+    rejectNotes.trim()
+      ? `# Human reject notes（AWAIT_SPEC_APPROVAL 人审打回意见，最高裁决权威）\n\n${rejectNotes}\n\n` +
+        '（spec 为响应上述打回意见所做的改动——包括与 brief / feasibility 原文的偏离——视为已获人审授权，不构成缺陷；' +
+        '但 spec 与打回意见冲突、或 spec 宣称的人审授权在上述意见中找不到出处时，仍按 blocker 报告。）'
+      : '',
     history.trim() ? `# Prior spec-verifier reports\n\n${history}` : '',
     `# Spec draft under review\n\n${spec}`,
     scaleGate
