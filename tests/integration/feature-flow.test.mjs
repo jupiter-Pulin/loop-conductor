@@ -132,6 +132,11 @@ test('reject + notes 回炉：spec-agent 第二稿必须看到 reject_notes', (t
   const calls = env.calls();
   assert.equal(calls.length, 4);
   assert.ok(promptOf(calls[2]).includes('验收标准太含糊'), '第二稿 prompt 必须带 reject_notes');
+  // spec-verifier 与 spec-agent 同源同送：审查方看不到人审裁决会把「按 notes 换向」误判为
+  // 未经授权偏离 brief（真实事故：task-20260801-002 r2 blocker，白烧一轮修复）
+  assert.ok(promptOf(calls[3]).includes('验收标准太含糊'), '第二稿 spec-verifier prompt 必须带 reject_notes');
+  assert.ok(promptOf(calls[3]).includes('人审打回意见'), 'spec-verifier prompt 标明 notes 的人审权威属性');
+  assert.ok(!promptOf(calls[1]).includes('验收标准太含糊'), '打回前的 r1 spec-verifier prompt 无 notes 段');
   // 两次 spec-agent spawn 各自留档
   assert.equal(env.readJson(env.dossier(id, 'spec-agent-r1.json')).raw.session_id, 'sess-spec-1');
   assert.equal(env.readJson(env.dossier(id, 'spec-agent-r2.json')).raw.session_id, 'sess-spec-2');
