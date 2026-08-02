@@ -422,6 +422,27 @@ summary:hover { background: var(--surface-hover); }
 .round-tick-pending { color: var(--live); border-color: var(--live); background: var(--live-bg); }
 .round-tick-unknown { color: var(--unknown); border-color: var(--unknown); background: var(--unknown-bg); }
 
+/* ---- 滚动条隐藏：看板内部滚动容器不常驻滚动条，overflow 取值不变（滚动能力保留）。
+   只点名容器，不写 * / html / body——页面级滚动条照旧可见。 ---- */
+.drawer,
+.panel,
+.drawer-timeline .timeline-scroll,
+.task-aside-inner,
+pre.readonly,
+.stream-tail-pre,
+.diff-patch {
+  scrollbar-width: none;
+}
+.drawer::-webkit-scrollbar,
+.panel::-webkit-scrollbar,
+.drawer-timeline .timeline-scroll::-webkit-scrollbar,
+.task-aside-inner::-webkit-scrollbar,
+pre.readonly::-webkit-scrollbar,
+.stream-tail-pre::-webkit-scrollbar,
+.diff-patch::-webkit-scrollbar {
+  display: none;
+}
+
 .timeline-round-header {
   color: var(--ink-3); font: var(--t-caption) var(--font-data); font-weight: 700;
   margin: 10px 0 4px; letter-spacing: .04em;
