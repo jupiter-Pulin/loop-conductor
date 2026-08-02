@@ -107,5 +107,10 @@ test('spec-verifier fail 两次修复，第三次 fail 冷启动新 spec-agent �
   assert.ok(coldRestartPrompt.includes('Prior spec-verifier reports'), '新 spec-agent 收到历史报告区块');
   assert.ok(coldRestartPrompt.includes('Spec Verify Report r3'), '新 spec-agent 收到第三次失败报告');
   assert.ok(coldRestartPrompt.includes('feasibility-study context'), '预留 feasibility-study 上下文');
+  // 修复轮 Read+Edit 指引：交付文件已存在时盲 Write 会撞 harness Read-before-Write 校验
+  // （真实事故：task-20260801-001 r5 首次 Write 11.8KB 被拒，整份 payload 白烧）
+  assert.ok(promptOf(calls[2]).includes('修复轮注意'), '修复轮 prompt 附 Read+Edit 指引');
+  assert.ok(!promptOf(calls[0]).includes('修复轮注意'), '首稿 draft prompt 不带修复轮指引');
+  assert.ok(!coldRestartPrompt.includes('修复轮注意'), '冷启动重写 prompt 不带修复轮指引');
   assert.ok(fs.readdirSync(path.join(env.root, 'specs', 'archive')).some((n) => n.includes('spec-fail-r3')));
 });
