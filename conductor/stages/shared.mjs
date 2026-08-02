@@ -916,7 +916,13 @@ export function buildSpecAgentPrompt(ts, cfg, round, { mode = 'draft' } = {}) {
     `spec 必须包含标题逐字为「## ${SPEC_DOC_CONTRACT.acSectionTitle}」的段落（不接受同义标题），` +
     '每条验收标准写成 `- AC-xxx: 可验证描述` 列表项，编号不得重复。' +
     ' Stop hook 会用与 conductor 终审同一份脚本校验该文件，不合格会被要求当场修复；' +
-    'conductor 收货时会再次终审，不采信口头汇报。最终回复只需一句话确认，不要粘贴 spec 全文。',
+    'conductor 收货时会再次终审，不采信口头汇报。最终回复只需一句话确认，不要粘贴 spec 全文。' +
+    // 修复轮整文件盲写会撞 harness 的 Read-before-Write 校验，白烧一次全文 payload
+    // （真实事故：task-20260801-001 r5 首次 Write 11.8KB 被拒）；Edit 最小修改也显著省 output。
+    (mode === 'repair'
+      ? '\n修复轮注意：交付文件已存在——先用 Read 工具读入再动它（未读文件的整文件覆写会被 harness 拒绝），' +
+        '优先用 Edit 做最小修改，仅结构性重写时才整文件 Write。'
+      : ''),
   );
   parts.push(
     '# 指令\n把完整 spec 写入上面的交付文件。' +
