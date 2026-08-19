@@ -1208,6 +1208,28 @@ function buildReviewMain(id, detail) {
     rejectBtn.disabled = true;
     notes.addEventListener('input', () => { rejectBtn.disabled = notes.value.trim() === ''; });
     actions.push(approveBtn, rejectBtn);
+  } else if (review.kind === 'scope') {
+    // 规模升闸：人裁的是「要不要拆」，不是 spec 内容对错——规模对照排在机器审与草稿之前。
+    content.push(el('h3', { text: '规模升闸 · 要不要拆' }));
+    content.push(el('div', {
+      text: review.scope.acCount == null
+        ? 'spec 草稿缺失，无法机械计数'
+        : `本 spec 含 ${review.scope.acCount} 条 AC，阈值 ${review.scope.max == null ? '?' : review.scope.max}；`
+          + 'spec-verifier 本轮 fail 已挂起（miss 未计），等你裁决。',
+    }));
+    content.push(buildSpecVerifyNode(review.specVerify));
+    content.push(el('h3', { text: 'Spec 草稿' }));
+    content.push(el('pre', { class: 'readonly readonly-tall', text: review.missing ? review.message : review.markdown }));
+    const notes = el('textarea', { id: 'scope-notes', rows: 3 });
+    content.push(el('div', { class: 'field' }, [el('label', { text: '拆分意图备注（可选）' }), notes]));
+    actions.push(el('button', {
+      class: 'btn btn-primary', text: '接受规模 · 继续修复',
+      onclick: () => confirmAndSubmit(id, 'approve-scope', {}, '确定接受当前规模、让挂起的 fail 入账继续修复循环？'),
+    }));
+    actions.push(el('button', {
+      class: 'btn btn-danger', text: '选择拆分 · 收箱',
+      onclick: () => confirmAndSubmit(id, 'reject-scope', { notes: notes.value }, '确定选择拆分？任务会进 failed 箱等你手工拆成多个任务。'),
+    }));
   } else if (review.kind === 'merge') {
     // 报告优先：verifier 裁决（AC 逐条证据）在 diff 之前。
     content.push(buildVerdictPanelNode(review.verdict));

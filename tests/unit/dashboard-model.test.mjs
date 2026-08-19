@@ -87,6 +87,7 @@ test('laneForStage：与 wireframes.md 映射表逐项一致（AC-006）', () =>
     NEEDS_SPEC: 'spec',
     SPEC_VERIFY: 'spec',
     SPEC_FIXING: 'spec',
+    AWAIT_SCOPE_DECISION: 'spec',
     AWAIT_SPEC_APPROVAL: 'spec',
     READY: 'maker',
     FIXING: 'maker',
@@ -256,6 +257,24 @@ test('buildTaskDetail：feasibility-study.md 缺失时 review 给出缺失提示
   assert.deepEqual(detail.review.options, []);
 });
 
+test('buildTaskDetail：AWAIT_SCOPE_DECISION 的 review 是 scope 档——同料 spec 面板 + 机械规模对照', (t) => {
+  const root = mkroot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cfg = { ...baseCfg(root), specMaxAcs: 2 };
+  ensureDirs(cfg);
+  const id = 'task-20260705-032';
+  writeNewTask(cfg.queueDir, baseTask(id, { kind: 'feature' }), baseRuntime('AWAIT_SCOPE_DECISION'));
+  const draft = '# spec\n\n## 验收标准\n\n- AC-001 甲\n- AC-002 乙\n- AC-003 丙\n';
+  fs.writeFileSync(path.join(cfg.specsDir, `${id}.md`), draft);
+
+  const detail = buildTaskDetail(cfg, id);
+  assert.equal(detail.review.kind, 'scope');
+  assert.equal(detail.review.markdown, draft, 'spec 草稿与 AWAIT_SPEC_APPROVAL 同料');
+  assert.deepEqual(detail.review.scope, { acCount: 3, max: 2 });
+  assert.equal(detail.needsHuman, true, '规模升闸是人审 stage');
+  assert.equal(detail.working, false);
+});
+
 test('buildTaskDetail：id 不存在返回 null（供 server 404）', (t) => {
   const root = mkroot();
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -332,8 +351,10 @@ test('isValidTaskId：仅接受 task-YYYYMMDD-NNN，拒绝路径穿越等非法�
 
 // ---- CLI 结果 → 用户提示转换（AC-013/AC-017 纯函数支撑） ----
 
-test('SYNC_ACTIONS：五个同步动作与 CLI 子命令名逐字一致，retry 已 job 化不再属同步动作集合（P4-AC-014④）', () => {
-  assert.deepEqual(SYNC_ACTIONS, ['approve', 'approve-setup', 'approve-feasibility', 'reject', 'reject-feasibility']);
+test('SYNC_ACTIONS：同步动作与 CLI 子命令名逐字一致，retry 已 job 化不再属同步动作集合（P4-AC-014④）', () => {
+  assert.deepEqual(SYNC_ACTIONS, [
+    'approve', 'approve-setup', 'approve-feasibility', 'reject', 'reject-feasibility', 'approve-scope', 'reject-scope',
+  ]);
   assert.equal(SYNC_ACTIONS.includes('retry'), false);
 });
 
@@ -344,6 +365,12 @@ test('buildSyncActionArgv：body.option/notes → argv 数组，缺省不带多�
     ['approve-feasibility', 'task-20260705-001', '--option', 'O-B', '--notes', '备注'],
   );
   assert.deepEqual(buildSyncActionArgv('reject', 'task-20260705-001', { notes: '' }), ['reject', 'task-20260705-001']);
+  // 规模人闸：approve-scope 无参，reject-scope 携拆分意图 notes（镜像 reject）。
+  assert.deepEqual(buildSyncActionArgv('approve-scope', 'task-20260705-001', {}), ['approve-scope', 'task-20260705-001']);
+  assert.deepEqual(
+    buildSyncActionArgv('reject-scope', 'task-20260705-001', { notes: '拆成 A/B 两批' }),
+    ['reject-scope', 'task-20260705-001', '--notes', '拆成 A/B 两批'],
+  );
 });
 
 test('formatCliMessage：成功取 stdout、失败取 stderr，双缺兜底 (no output)', () => {

@@ -9,6 +9,7 @@ export const STAGES = [
   'NEEDS_SPEC',
   'SPEC_VERIFY',
   'SPEC_FIXING',
+  'AWAIT_SCOPE_DECISION',
   'AWAIT_SPEC_APPROVAL',
   'READY',
   'VERIFY',
@@ -308,6 +309,17 @@ export function specMissNext(missCount, maxMisses = 3) {
   const m = (missCount ?? 0) + 1;
   if (m >= maxMisses) return { stage: 'NEEDS_SPEC', missCount: m, coldRestart: true };
   return { stage: 'SPEC_FIXING', missCount: m, coldRestart: false };
+}
+
+/**
+ * spec-verifier fail 的路由分叉：规模闸触发且人未豁免 → 'escalate'（升闸 AWAIT_SCOPE_DECISION，
+ * 本次 fail 挂起不入 miss 阶梯），否则 'miss-ladder'（specMissNext 原阶梯）。
+ * 事故 task-20260802-002：AC 数 2.5 倍于阈值的 spec 每轮都在真实 blocker/major 上 fail，
+ * 修复循环 2 epoch × 3 轮打满收箱烧 $30.9，而人闸只有 pass 才到得了——「要不要拆」从没被问过。
+ * scopeDecision='waived'（人已裁「接受规模」）是任务作用域的持久豁免：规模闸退回 H18 软档，永不再升闸。
+ */
+export function specFailRoute(scaleGate, scopeDecision) {
+  return scaleGate && scopeDecision !== 'waived' ? 'escalate' : 'miss-ladder';
 }
 
 /**
