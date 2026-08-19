@@ -1,11 +1,13 @@
 // SPEC_VERIFY：spawn spec-verifier 审查 specs/<id>.md。
-// pass → AWAIT_SPEC_APPROVAL；fail → SPEC_FIXING，第三次 fail 冷启动新 spec-agent。
+// pass → AWAIT_SPEC_APPROVAL；fail → SPEC_FIXING，第三次 fail 冷启动新 spec-agent；
+// fail + 规模闸触发且人未豁免 → AWAIT_SCOPE_DECISION（升闸交人裁拆分，本次 fail 挂起）。
 import fs from 'node:fs';
 import path from 'node:path';
 import { runClaudeWithRetry } from '../lib/claude.mjs';
 import * as state from '../lib/state.mjs';
 import {
-  parseStrictJson, specMissNext, specScaleGateViolation, specVerifierInvalidNext, validateSpecVerifierVerdict,
+  parseStrictJson, specFailRoute, specMissNext, specScaleGateViolation, specVerifierInvalidNext,
+  validateSpecVerifierVerdict,
 } from './decisions.mjs';
 import {
   accountSpawnCost, archiveSpecDraft, budgetExceeded, buildSpecVerifierPrompt, failToBox,
@@ -24,11 +26,15 @@ export default async function specVerifyHandler(ts, cfg) {
     return failToBox(ts, cfg, `SPEC_VERIFY 缺 spec 草稿：specs/${id}.md`, 'spec_missing');
   }
 
+  // 规模闸的计算上提到幂等分支之前：消费 fail verdict 的路由（specFailRoute）也要用它，
+  // 重入时同样得拿到规模信息。SPEC_VERIFY 期间没有任何角色写 spec 文件，计算是确定性的。
+  const scaleGate = computeScaleGate(cfg, specPath);
+
   const verdictPath = state.dossierPath(cfg, id, `spec-verify-r${round}.verdict.json`);
   const existing = state.readJsonIf(verdictPath);
   if (existing) {
     state.appendTimeline(cfg, id, `spec-verifier r${round} verdict 已存在，直接消费（幂等重入）`);
-    return consumeSpecVerdict(ts, cfg, round, existing);
+    return consumeSpecVerdict(ts, cfg, round, existing, scaleGate);
   }
 
   if (budgetExceeded(ts, cfg)) {
@@ -36,18 +42,10 @@ export default async function specVerifyHandler(ts, cfg) {
   }
   if (!canStartSpawn(ts, cfg, 'spec-verifier')) return { changed: false };
 
-  // H18 规模闸（软档，config specMaxAcs，null=关）：机械数 AC，超限只注入 prompt 段 +
-  // 留痕，绝不改路由——拆分决定权在人审闸门。
-  let scaleGate = null;
-  if (Number.isFinite(cfg.specMaxAcs)) {
-    let draftMd = '';
-    try { draftMd = fs.readFileSync(specPath, 'utf8'); } catch { /* 上方已验存在性 */ }
-    const acCount = state.extractAcceptanceCriteria(draftMd).length;
-    if (acCount > cfg.specMaxAcs) {
-      scaleGate = { acCount, max: cfg.specMaxAcs };
-      state.appendTimeline(cfg, id, `spec 规模闸（软档）：AC×${acCount} > 阈值 ${cfg.specMaxAcs}，已要求 spec-verifier 附拆分建议（不 block）`);
-      state.appendEvent(cfg, id, 'spec_scale_gate', { round, ac_count: acCount, max: cfg.specMaxAcs });
-    }
+  // 「已要求拆分建议」只在 spawn 分支记账：幂等重入不重复写 timeline/事件。
+  if (scaleGate) {
+    state.appendTimeline(cfg, id, `spec 规模闸（软档）：AC×${scaleGate.acCount} > 阈值 ${scaleGate.max}，已要求 spec-verifier 附拆分建议（不 block）`);
+    state.appendEvent(cfg, id, 'spec_scale_gate', { round, ac_count: scaleGate.acCount, max: scaleGate.max });
   }
 
   const streamFile = state.dossierPath(cfg, id, `spec-verifier-r${round}.stream.jsonl`);
@@ -123,10 +121,23 @@ export default async function specVerifyHandler(ts, cfg) {
   ts.runtime.spec_verifier_invalid_count = 0;
   state.saveRuntime(ts);
   state.appendTimeline(cfg, id, `spec-verifier r${round} verdict: ${check.verdict.overall} (cost=$${res.costUsd})`);
-  return consumeSpecVerdict(ts, cfg, round, check.verdict);
+  return consumeSpecVerdict(ts, cfg, round, check.verdict, scaleGate);
 }
 
-function consumeSpecVerdict(ts, cfg, round, verdict) {
+/**
+ * H18 规模闸（config specMaxAcs，null=关）：机械数 AC，超限返回 { acCount, max }，否则 null。
+ * 触发的两个后果：注入 spec-verifier prompt 的拆分建议要求（软档，不改 pass 路由），
+ * 以及 fail 时把路由升格为人闸（specFailRoute）。
+ */
+function computeScaleGate(cfg, specPath) {
+  if (!Number.isFinite(cfg.specMaxAcs)) return null;
+  let draftMd = '';
+  try { draftMd = fs.readFileSync(specPath, 'utf8'); } catch { /* 调用方已验存在性 */ }
+  const acCount = state.extractAcceptanceCriteria(draftMd).length;
+  return acCount > cfg.specMaxAcs ? { acCount, max: cfg.specMaxAcs } : null;
+}
+
+function consumeSpecVerdict(ts, cfg, round, verdict, scaleGate) {
   const id = ts.id;
   if (verdict.overall === 'pass') {
     state.transitionState(ts, cfg, 'AWAIT_SPEC_APPROVAL', `spec-verifier pass r${round}`, { current_spec_round: round });
@@ -134,7 +145,35 @@ function consumeSpecVerdict(ts, cfg, round, verdict) {
     return { changed: true };
   }
 
+  // 修复上下文照常落盘：人裁「接受规模」后 SPEC_FIXING 直接拿它开工，无需重跑 spec-verifier。
   writeSpecRepairContext(cfg, id, round, verdict);
+  if (specFailRoute(scaleGate, ts.runtime.scope_decision) === 'escalate') {
+    state.appendTimeline(
+      cfg, id,
+      `spec 规模升闸：AC×${scaleGate.acCount} > 阈值 ${scaleGate.max} 且 spec-verifier r${round} fail，` +
+      '本次 fail 挂起（miss 不计），等人裁决：' +
+      `approve-scope ${id}（接受规模，继续修复循环）| reject-scope ${id} --notes "…"（选择拆分，任务收箱）`,
+    );
+    state.appendEvent(cfg, id, 'scope_escalation', { round, ac_count: scaleGate.acCount, max: scaleGate.max });
+    state.transitionState(ts, cfg, 'AWAIT_SCOPE_DECISION', `spec-verifier fail r${round} + 规模闸触发`, {
+      current_spec_round: round,
+    });
+    console.log(
+      `[${id}] spec 规模升闸 → AWAIT_SCOPE_DECISION（AC×${scaleGate.acCount} > ${scaleGate.max}）。` +
+      `conductor approve-scope ${id} 接受规模继续修复；conductor reject-scope ${id} --notes "…" 选择拆分`,
+    );
+    return { changed: true };
+  }
+  return applySpecFail(ts, cfg, round);
+}
+
+/**
+ * spec-verifier fail 的 miss 阶梯入账（挂起的 fail 经 approve-scope 人裁后也走这里）：
+ * 前两次回 SPEC_FIXING，第三次冷启动新 spec-agent（epoch+1），epoch 耗尽收箱。
+ * 调用方负责 repair 上下文——本函数只管计数与去向。
+ */
+export function applySpecFail(ts, cfg, round) {
+  const id = ts.id;
   const next = specMissNext(ts.runtime.spec_miss_count ?? 0, cfg.maxSpecMisses);
   if (next.stage === 'NEEDS_SPEC') {
     const nextEpoch = (ts.runtime.spec_epoch ?? 1) + 1;

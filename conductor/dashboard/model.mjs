@@ -21,6 +21,7 @@ const STAGE_LANE = {
   NEEDS_SPEC: 'spec',
   SPEC_VERIFY: 'spec',
   SPEC_FIXING: 'spec',
+  AWAIT_SCOPE_DECISION: 'spec',
   AWAIT_SPEC_APPROVAL: 'spec',
   READY: 'maker',
   FIXING: 'maker',
@@ -35,7 +36,7 @@ export function laneForStage(stage) {
 
 /** 人审闸门 stage（needsHuman 判据）。 */
 export const HUMAN_STAGES = [
-  'AWAIT_SETUP_APPROVAL', 'AWAIT_FEASIBILITY_APPROVAL', 'AWAIT_SPEC_APPROVAL', 'AWAIT_HUMAN_MERGE',
+  'AWAIT_SETUP_APPROVAL', 'AWAIT_FEASIBILITY_APPROVAL', 'AWAIT_SCOPE_DECISION', 'AWAIT_SPEC_APPROVAL', 'AWAIT_HUMAN_MERGE',
 ];
 
 // ---- 任务 id 校验（一切含 <id> 的路由的第一道闸门） ----
@@ -253,6 +254,20 @@ function buildSpecReview(cfg, id) {
   }
 }
 
+/** 规模人闸（AWAIT_SCOPE_DECISION）：与 spec 审查同料（机器审 + 草稿），外加机械规模对照。
+ *  AC 数现算（与规模闸同一口径 extractAcceptanceCriteria），runtime 只存裁决结果不存计数。 */
+function buildScopeReview(cfg, id) {
+  const review = buildSpecReview(cfg, id);
+  return {
+    ...review,
+    kind: 'scope',
+    scope: {
+      acCount: review.missing ? null : state.extractAcceptanceCriteria(review.markdown).length,
+      max: Number.isFinite(cfg.specMaxAcs) ? cfg.specMaxAcs : null,
+    },
+  };
+}
+
 function buildMergeReview(cfg, ts) {
   const branch = `task/${ts.id}`;
   const r = git(['diff', '--shortstat', `${ts.task.baseBranch}...${branch}`], ts.task.targetRepo);
@@ -267,6 +282,7 @@ function buildReview(cfg, ts, stage) {
   if (stage === 'AWAIT_SETUP_APPROVAL') return buildSetupReview(cfg);
   if (stage === 'AWAIT_FEASIBILITY_APPROVAL') return buildFeasibilityReview(ts);
   if (stage === 'AWAIT_SPEC_APPROVAL') return buildSpecReview(cfg, ts.id);
+  if (stage === 'AWAIT_SCOPE_DECISION') return buildScopeReview(cfg, ts.id);
   if (stage === 'AWAIT_HUMAN_MERGE') return buildMergeReview(cfg, ts);
   if (ts.box === 'failed') {
     return { kind: 'failed', lastFailureType: ts.runtime.last_failure_type ?? null, verdict: buildVerdictPanel(cfg, ts.id) };
@@ -534,8 +550,10 @@ export function buildStreamTail(cfg, id) {
 
 // ---- 写路径：CLI 透传支撑（纯函数，AC-013/014/016/017/018） ----
 
-/** 五个同步动作端点对应的 CLI 子命令名与路由 action 一致，直接透传（merge/retry 已 job 化，见 P4）。 */
-export const SYNC_ACTIONS = ['approve', 'approve-setup', 'approve-feasibility', 'reject', 'reject-feasibility'];
+/** 同步动作端点对应的 CLI 子命令名与路由 action 一致，直接透传（merge/retry 已 job 化，见 P4）。 */
+export const SYNC_ACTIONS = [
+  'approve', 'approve-setup', 'approve-feasibility', 'reject', 'reject-feasibility', 'approve-scope', 'reject-scope',
+];
 
 /** body.option / body.notes → argv 数组（不经 shell）。未知子命令自身会忽略多余 flag。 */
 export function buildSyncActionArgv(action, id, body = {}) {

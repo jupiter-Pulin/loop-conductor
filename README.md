@@ -54,6 +54,9 @@ reject-feasibility -> NEEDS_FEASIBILITY 重产（notes 进下轮 prompt）
 feature:
 NEEDS_SPEC -> SPEC_VERIFY -> SPEC_FIXING -> SPEC_VERIFY -> AWAIT_SPEC_APPROVAL -> READY
 spec 契约门（spec-doc/v1）fail -> 原地重试 spec-agent，耗尽 -> FAILED_BOX
+SPEC_VERIFY fail + 规模闸触发（AC 数 > specMaxAcs）且人未豁免 -> AWAIT_SCOPE_DECISION（本次 fail 挂起，不计 miss）
+  --approve-scope--> 接受规模，挂起的 fail 按原 miss 阶梯入账（SPEC_FIXING / 冷启动 / 耗尽收箱），该任务此后不再升闸
+  --reject-scope--> FAILED_BOX（last_failure_type=scope_split），人手工拆成多个任务重开
 AWAIT_SPEC_APPROVAL 机器放行（autoApproveSpec / new --auto-approve-spec，默认关）：
   evaluateAutoApproveSpec 谓词全绿（verdict pass 无 blocker/major/advisory、AC 数 ≤ 上限）-> 代章进 READY；否则留人审（advisory=规模拆分建议，拆分与否必须人裁）
 
@@ -67,6 +70,7 @@ READY/FIXING 可选 gateCommands（task.json 显式值 > target-profile 默认�
 READY/FIXING test-gate vacuous（测试在基线上仍全绿）-> FIXING
 VERIFY verdict fail -> FIXING
 verifier invalid -> VERIFY
+
 budget/retry/crash exhausted -> FAILED_BOX
 FAILED_BOX --retry--> READY or NEEDS_SPEC
 ```
@@ -86,6 +90,8 @@ npm run conductor -- approve-feasibility <id> --option O-X [--notes "..."]
 npm run conductor -- reject-feasibility <id> --notes "..."
 npm run conductor -- approve <id>
 npm run conductor -- reject <id> --notes "..."
+npm run conductor -- approve-scope <id>
+npm run conductor -- reject-scope <id> --notes "..."
 npm run conductor -- merge <id>
 npm run conductor -- retry <id>
 ```
@@ -121,6 +127,7 @@ npm run conductor -- retry <id>
 | test gate per-AC 定向探针（AC→测试映射） | `tests/integration/test-gate-per-ac.test.mjs` |
 | merge commit 文案提案 + 降级 | `tests/integration/commit-message.test.mjs` |
 | spec 审批门机器放行（默认关 / major finding 拦截 / 全绿代章 / AC 上限） | `tests/integration/auto-approve-spec.test.mjs` |
+| spec 规模升闸（fail+超规模 → 人裁接受规模 / 拆分收箱，豁免持久） | `tests/integration/spec-scope-escalation.test.mjs` |
 | verifier fail repair context | `tests/integration/verifier-fail.test.mjs` |
 | verifier invalid 重试 | `tests/integration/verifier-invalid.test.mjs` |
 | maker retry ladder | `tests/integration/retry-ladder.test.mjs` |

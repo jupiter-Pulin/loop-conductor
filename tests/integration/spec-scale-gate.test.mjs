@@ -153,7 +153,9 @@ test('契约7：fail 混携 major+advisory——advisory 不进 repair 上下文
     specVerifierStep(1, 'fail', { over: { findings: [major, ADVISORY_FINDING] } }),
   ]);
   assert.equal(env.run('run').status, 0);
-  assert.equal(env.findTask(id).runtime.stage, 'SPEC_FIXING', 'major 在场仍走修复路径');
+  // fail + 规模闸触发的路由已升格为人闸（tests/integration/spec-scope-escalation.test.mjs），
+  // 但 repair 上下文照落——本契约钉的是它的内容口径，与去向无关。
+  assert.equal(env.findTask(id).runtime.stage, 'AWAIT_SCOPE_DECISION', '规模超限的 fail 交人裁拆分');
   const ctx = JSON.parse(fs.readFileSync(env.dossier(id, 'spec-repair-context-r1.json'), 'utf8'));
   assert.equal(ctx.findings.length, 1, 'advisory 必须被过滤');
   assert.equal(ctx.findings[0].severity, 'major');

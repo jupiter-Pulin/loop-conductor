@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // conductor.mjs — CLI 入口 + drain 循环。确定性、可重入、幂等：conductor 是脚本，不是 agent。
-// 子命令：run / new / approve-setup / approve / reject / status / merge / retry。
+// 子命令：run / new / approve-setup / approve / reject / approve-scope / reject-scope / status / merge / retry。
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,7 +20,7 @@ import awaitSetupApprovalHandler from './stages/await_setup_approval.mjs';
 import needsFeasibilityHandler from './stages/needs_feasibility.mjs';
 import awaitFeasibilityApprovalHandler from './stages/await_feasibility_approval.mjs';
 import needsSpecHandler from './stages/needs_spec.mjs';
-import specVerifyHandler from './stages/spec_verify.mjs';
+import specVerifyHandler, { applySpecFail } from './stages/spec_verify.mjs';
 import specFixingHandler from './stages/spec_fixing.mjs';
 import awaitSpecApprovalHandler from './stages/await_spec_approval.mjs';
 import readyHandler from './stages/ready.mjs';
@@ -39,6 +39,8 @@ const STAGE_HANDLERS = {
   READY: readyHandler,
   VERIFY: verifyHandler,
   FIXING: fixingHandler,
+  // 规模人闸：只响应 approve-scope / reject-scope（任务留在 queue box，与其它 AWAIT_* 一致）
+  AWAIT_SCOPE_DECISION: async () => ({ changed: false }),
   // 终态：只响应人工 merge / close / retry 命令
   AWAIT_HUMAN_MERGE: async () => ({ changed: false }),
   AWAIT_PROBE_CLOSE: async () => ({ changed: false }),
@@ -306,6 +308,7 @@ function cmdNew(cfg, opts) {
     spec_verifier_invalid_count: 0,
     spec_contract_invalid_count: 0,
     spec_epoch: 1,
+    scope_decision: null, // null=未裁 / 'waived'=人已接受规模（任务作用域持久豁免）/ 'split'=人选择拆分（收箱）
     feasibility_approval: null,
     feasibility_contract_invalid_count: 0,
     current_feasibility_round: 0,
@@ -432,6 +435,80 @@ async function cmdReject(cfg, id, notes) {
   state.saveRuntime(ts);
   state.appendTimeline(cfg, id, `human reject${notes ? `: ${notes}` : ''}`);
   console.log(`${id} approval=rejected。下次 conductor run 时退回 spec-agent 重写 spec`);
+  });
+}
+
+/** 裁决时的机械 AC 计数（与规模闸同一口径）；草稿缺失返回 null。 */
+function specAcCount(cfg, id) {
+  try {
+    return state.extractAcceptanceCriteria(fs.readFileSync(path.join(cfg.specsDir, `${id}.md`), 'utf8')).length;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 规模人闸「接受规模」（AWAIT_SCOPE_DECISION）：豁免是任务作用域且持久（跨轮、跨 epoch），
+ * 之后规模闸退回 H18 软档（只往 spec-verifier prompt 注入 advisory 要求），永不再升闸。
+ * 升闸时挂起的那次 fail 此刻才入账——去向由既有 miss 阶梯决定（SPEC_FIXING / 冷启动 / 耗尽收箱）。
+ */
+async function cmdApproveScope(cfg, id) {
+  return withCliTaskMutation(cfg, id, async () => {
+  const ts = findTask(cfg, id);
+  if (!ts) { console.error(`找不到任务 ${id}`); process.exitCode = 1; return; }
+  if (ts.error) { console.error(`${id} 任务目录损坏：${ts.error}`); process.exitCode = 1; return; }
+  if (ts.runtime.stage !== 'AWAIT_SCOPE_DECISION') {
+    console.error(`警告：${id} 当前 stage=${ts.runtime.stage}（非 AWAIT_SCOPE_DECISION），仍写入 scope_decision=waived`);
+  }
+  const round = ts.runtime.current_spec_round ?? 0;
+  const acCount = specAcCount(cfg, id);
+  // 先产物后状态：裁决固化进 dossier（不随任务目录搬箱，永久可查），再落 runtime、再放 fail 入账。
+  state.writeJson(state.dossierPath(cfg, id, 'scope-decision.json'), {
+    schema_version: 1,
+    decision: 'waived',
+    round,
+    ac_count: acCount,
+    max: Number.isFinite(cfg.specMaxAcs) ? cfg.specMaxAcs : null,
+    decided_at: new Date().toISOString(),
+  });
+  ts.runtime.scope_decision = 'waived';
+  state.saveRuntime(ts);
+  state.appendTimeline(cfg, id, `human approve scope：接受当前规模（AC×${acCount ?? '?'}），挂起的 spec-verifier fail r${round} 入账`);
+  applySpecFail(ts, cfg, round);
+  console.log(`${id} scope_decision=waived → stage=${ts.runtime.stage}（规模闸此后只作软档提示，不再升闸）`);
+  });
+}
+
+/**
+ * 规模人闸「选择拆分」（AWAIT_SCOPE_DECISION）：任务收箱等人手工拆成多个任务重开；
+ * notes 是给人自己的拆分意图留档。不用 failToBox——那是机器判负的 stderr 口径，
+ * 这里是人主动裁决，走 stdout（收箱与搬箱仍由 transitionState 统一负责）。
+ */
+async function cmdRejectScope(cfg, id, notes) {
+  return withCliTaskMutation(cfg, id, async () => {
+  const ts = findTask(cfg, id);
+  if (!ts) { console.error(`找不到任务 ${id}`); process.exitCode = 1; return; }
+  if (ts.error) { console.error(`${id} 任务目录损坏：${ts.error}`); process.exitCode = 1; return; }
+  if (ts.runtime.stage !== 'AWAIT_SCOPE_DECISION') {
+    console.error(`警告：${id} 当前 stage=${ts.runtime.stage}（非 AWAIT_SCOPE_DECISION），仍写入 scope_decision=split`);
+  }
+  const round = ts.runtime.current_spec_round ?? 0;
+  const acCount = specAcCount(cfg, id);
+  state.writeJson(state.dossierPath(cfg, id, 'scope-decision.json'), {
+    schema_version: 1,
+    decision: 'split',
+    round,
+    ac_count: acCount,
+    max: Number.isFinite(cfg.specMaxAcs) ? cfg.specMaxAcs : null,
+    notes: typeof notes === 'string' && notes.trim() !== '' ? notes : null,
+    decided_at: new Date().toISOString(),
+  });
+  state.appendTimeline(cfg, id, `human reject scope：选择拆分（AC×${acCount ?? '?'}）${notes ? `：${notes}` : ''}`);
+  state.transitionState(ts, cfg, 'FAILED_BOX', `human 选择拆分（spec 规模升闸 r${round}）`, {
+    scope_decision: 'split',
+    last_failure_type: 'scope_split',
+  });
+  console.log(`${id} scope_decision=split → FAILED_BOX（state/failed/）。请按拆分方案新建多个任务；retry 会复位 scope_decision`);
   });
 }
 
@@ -755,6 +832,7 @@ async function cmdRetry(cfg, id) {
       spec_verifier_invalid_count: 0,
       spec_contract_invalid_count: 0,
       feasibility_contract_invalid_count: 0,
+      scope_decision: null, // scope_split 收箱后 retry 应回到「可再升闸」的状态，豁免不随任务复活
       maker_session_id: null,
       last_failure_type: null,
     });
@@ -809,6 +887,10 @@ const USAGE = `用法：conductor <command>
   approve <id>                         批准 spec（AWAIT_SPEC_APPROVAL 闸门）
   approve-setup <id>                   批准 target repo setup profile（AWAIT_SETUP_APPROVAL 闸门）
   reject <id> [--notes "…"]            打回 spec，notes 追加进任务目录 reject_notes.md
+  approve-scope <id>                   规模人闸（AWAIT_SCOPE_DECISION）：接受当前 spec 规模，
+                                       挂起的 spec-verifier fail 入账继续修复循环，此后不再升闸
+  reject-scope <id> [--notes "…"]      规模人闸：选择拆分 → 任务收箱（last_failure_type=scope_split），
+                                       notes 随裁决落 dossier/scope-decision.json
   status                               打印任务表（queue / failed / done）
   spy                                  只读查看 queue 任务的运行中角色与最近活动
   merge <id>                           人工终点闸门：合入分支、归档、清 worktree
@@ -838,6 +920,8 @@ export async function main(argv = process.argv.slice(2)) {
     case 'approve-feasibility': await cmdApproveFeasibility(cfg, opts._[0], opts.option, opts.notes); break;
     case 'reject-feasibility': await cmdRejectFeasibility(cfg, opts._[0], opts.notes); break;
     case 'reject': await cmdReject(cfg, opts._[0], opts.notes); break;
+    case 'approve-scope': await cmdApproveScope(cfg, opts._[0]); break;
+    case 'reject-scope': await cmdRejectScope(cfg, opts._[0], opts.notes); break;
     case 'status': cmdStatus(cfg); break;
     case 'spy': cmdSpy(cfg); break;
     case 'merge': await cmdMerge(cfg, opts._[0]); break;

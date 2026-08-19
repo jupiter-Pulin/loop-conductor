@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import {
   markerStatus, overBudget, greenGatePassed, approvalNext, setupApprovalNext,
   needsSpecAction, makerMissNext, makerRound, verdictNext, verifierInvalidNext,
-  fixingMode, parseStrictJson, specMissNext, specVerifierInvalidNext,
+  fixingMode, parseStrictJson, specMissNext, specFailRoute, specVerifierInvalidNext,
   needsFeasibilityAction, feasibilityApprovalNext, feasibilityContractInvalidNext,
   specScaleGateViolation, validateSpecVerifierVerdict, validateVerifierVerdict, MAX_MISS, STAGES,
   sameSignatureStreak, normalizeGateCommands, resolveGateCommands, checkEvidenceAnchors, validateReviewReport,
@@ -81,6 +81,22 @@ test('specMissNext：两次修复，第三次 fail 冷启动新 spec-agent', () 
   assert.deepEqual(specMissNext(0, 3), { stage: 'SPEC_FIXING', missCount: 1, coldRestart: false });
   assert.deepEqual(specMissNext(1, 3), { stage: 'SPEC_FIXING', missCount: 2, coldRestart: false });
   assert.deepEqual(specMissNext(2, 3), { stage: 'NEEDS_SPEC', missCount: 3, coldRestart: true });
+});
+
+test('specFailRoute：规模闸触发且未豁免才升闸，其余一律走 miss 阶梯', () => {
+  const gate = { acCount: 30, max: 12 };
+  assert.equal(specFailRoute(gate, null), 'escalate');
+  assert.equal(specFailRoute(gate, undefined), 'escalate');
+  assert.equal(specFailRoute(gate, 'split'), 'escalate'); // split 会立刻收箱，理论上到不了；不是豁免值就不放行
+  assert.equal(specFailRoute(gate, 'waived'), 'miss-ladder'); // 人已接受规模：持久豁免，永不再升闸
+  assert.equal(specFailRoute(null, null), 'miss-ladder');
+  assert.equal(specFailRoute(null, 'waived'), 'miss-ladder');
+});
+
+test('STAGES：规模人闸排在 spec 修复循环与 spec 审批门之间', () => {
+  const i = STAGES.indexOf('AWAIT_SCOPE_DECISION');
+  assert.ok(i > STAGES.indexOf('SPEC_VERIFY'));
+  assert.ok(i < STAGES.indexOf('AWAIT_SPEC_APPROVAL'));
 });
 
 test('specVerifierInvalidNext：留 SPEC_VERIFY 重试 / 超额收箱', () => {
