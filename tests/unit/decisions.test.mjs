@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import {
   markerStatus, overBudget, greenGatePassed, approvalNext, setupApprovalNext,
   needsSpecAction, makerMissNext, makerRound, verdictNext, verifierInvalidNext,
-  fixingMode, parseStrictJson, specMissNext, specFailRoute, specVerifierInvalidNext,
+  fixingMode, parseStrictJson, specMissNext, specFailRoute, specVerifierInvalidNext, crashRecoveryNext,
   needsFeasibilityAction, feasibilityApprovalNext, feasibilityContractInvalidNext,
   specScaleGateViolation, validateSpecVerifierVerdict, validateVerifierVerdict, MAX_MISS, STAGES,
   sameSignatureStreak, normalizeGateCommands, resolveGateCommands, checkEvidenceAnchors, validateReviewReport,
@@ -43,6 +43,27 @@ test('makerMissNext：miss++ 走 1/2/3 阶梯', () => {
   assert.deepEqual(makerMissNext(0, 1), { stage: 'FAILED_BOX', missCount: 1 });
   assert.deepEqual(makerMissNext(3, 5), { stage: 'FIXING', missCount: 4 });
   assert.equal(MAX_MISS, 3);
+});
+
+test('crashRecoveryNext：孤儿腿有界自动恢复（默认额度 1）', () => {
+  assert.deepEqual(crashRecoveryNext(0, 1), { action: 'auto-recover', count: 1 });
+  assert.deepEqual(crashRecoveryNext(1, 1), { action: 'box', count: 1 }); // 额度用尽 → 旧行为
+  assert.deepEqual(crashRecoveryNext(null, 1), { action: 'auto-recover', count: 1 });
+  assert.deepEqual(crashRecoveryNext(undefined, 1), { action: 'auto-recover', count: 1 });
+  // limit=0 = 关闭：count=0 时也直接收箱，且 count 保持 0（收箱文案不追加「已用尽」）
+  assert.deepEqual(crashRecoveryNext(0, 0), { action: 'box', count: 0 });
+  assert.deepEqual(crashRecoveryNext(null, 0), { action: 'box', count: 0 });
+  // 多次额度：达界前逐次自增，达界即收箱
+  assert.deepEqual(crashRecoveryNext(1, 3), { action: 'auto-recover', count: 2 });
+  assert.deepEqual(crashRecoveryNext(2, 3), { action: 'auto-recover', count: 3 });
+  assert.deepEqual(crashRecoveryNext(3, 3), { action: 'box', count: 3 });
+  // 越界（历史 runtime 计数高于当前 limit）：一律收箱，不倒扣、不重开额度
+  assert.deepEqual(crashRecoveryNext(5, 1), { action: 'box', count: 5 });
+  // limit 非法（负数/非整数/缺失）按 0 处理：worktree 可能半改，拿不准时退回收箱侧
+  assert.deepEqual(crashRecoveryNext(0, -1), { action: 'box', count: 0 });
+  assert.deepEqual(crashRecoveryNext(0, 1.5), { action: 'box', count: 0 });
+  assert.deepEqual(crashRecoveryNext(0, null), { action: 'box', count: 0 });
+  assert.deepEqual(crashRecoveryNext(0, 'many'), { action: 'box', count: 0 });
 });
 
 test('makerRound：maker 轮次恒等于 miss+1（唯一推导点）', () => {

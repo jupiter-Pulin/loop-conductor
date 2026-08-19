@@ -70,7 +70,8 @@ READY/FIXING 可选 gateCommands（task.json 显式值 > target-profile 默认�
 READY/FIXING test-gate vacuous（测试在基线上仍全绿）-> FIXING
 VERIFY verdict fail -> FIXING
 verifier invalid -> VERIFY
-
+READY/FIXING maker 孤儿腿（maker-r<n> 有 started 无 done）-> 有界自动恢复（crashAutoRecoveryLimit，默认 1，0=关）：
+  孤儿产物移入 attempts/ + 原地重 spawn，stage 不动；额度用尽 -> FAILED_BOX（crashed，人工 retry 后额度复位）
 budget/retry/crash exhausted -> FAILED_BOX
 FAILED_BOX --retry--> READY or NEEDS_SPEC
 ```
@@ -137,6 +138,7 @@ npm run conductor -- retry <id>
 | verifier shadow（默认关 / 不动 stage / 不污染主计数） | `tests/integration/verifier-shadow.test.mjs` |
 | test gate per-AC 探针有界并发（opt-in） | `tests/integration/test-gate-probe-concurrency.test.mjs` |
 | crash re-entry | `tests/integration/crash-reentry.test.mjs` |
+| crashed 孤儿腿有界自动恢复（默认额度 / 用尽收箱 / 关闭退回旧行为 / retry 复位） | `tests/integration/crash-auto-recovery.test.mjs` |
 | box/stage 崩溃巡检 | `tests/integration/crash-patrol.test.mjs` |
 | budget gate | `tests/integration/budget.test.mjs` |
 | liveness kill / slow alive | `tests/integration/liveness-kill.test.mjs` |
