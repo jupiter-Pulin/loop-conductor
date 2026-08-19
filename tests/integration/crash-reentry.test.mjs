@@ -1,5 +1,7 @@
 // 集成：崩溃重入——maker 标记有 started 无 done → 判定上次崩溃，转 FAILED_BOX（crashed），
 // 不留滞留任务；conductor retry 后可恢复正常推进（契约 §11 READY/FIXING 行）。
+// 本文件的用例意图是「重入判定 + 人工 retry 恢复」这条语义，不是恢复策略，所以一律显式关掉
+// 自动恢复（crashAutoRecoveryLimit: 0）；有界自动恢复的行为见 crash-auto-recovery.test.mjs。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -16,7 +18,7 @@ function writeOrphanMarker(env, id, round) {
 }
 
 test('READY 崩溃残留（started 无 done）→ FAILED_BOX，retry 后恢复推进', (t) => {
-  const env = makeEnv(t);
+  const env = makeEnv(t, { config: { crashAutoRecoveryLimit: 0 } });
   const id = 'task-20260611-201';
   env.writeTask(id); // stage READY
   const markerPath = writeOrphanMarker(env, id, 1);
@@ -55,7 +57,7 @@ test('READY 崩溃残留（started 无 done）→ FAILED_BOX，retry 后恢复�
 });
 
 test('FIXING 阶段的崩溃残留同样转 FAILED_BOX', (t) => {
-  const env = makeEnv(t);
+  const env = makeEnv(t, { config: { crashAutoRecoveryLimit: 0 } });
   const id = 'task-20260611-202';
   env.writeTask(id, { stage: 'FIXING', miss: 1, sessionId: 'sess-old' });
   writeOrphanMarker(env, id, 2); // round = miss+1 = 2

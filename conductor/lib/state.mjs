@@ -217,6 +217,24 @@ export function appendTimeline(cfg, id, msg) {
 }
 
 /**
+ * 把 dossier 内匹配 pattern 的产物移入 attempts/<ts>/；无匹配则不建目录，返回 0。
+ * 两个调用面共用：cmdRetry 的人工复位、READY/FIXING 的崩溃孤儿腿自动恢复——同一套
+ * 「腾出轮次命名空间但保留案卷」语义，绝不能各写一份而漂移。
+ */
+export function archiveArtifactsMatching(cfg, id, pattern) {
+  const dir = dossierPath(cfg, id);
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch { return 0; }
+  const targets = names.filter((n) => pattern.test(n));
+  if (targets.length === 0) return 0;
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const dest = path.join(dir, 'attempts', stamp);
+  fs.mkdirSync(dest, { recursive: true });
+  for (const n of targets) fs.renameSync(path.join(dir, n), path.join(dest, n));
+  return targets.length;
+}
+
+/**
  * H17 结构化事件流（config `eventsLogEnabled`，默认关）：dossier/<id>/events.jsonl 逐行追加
  * `{ ts, type, ...fields }`。机器消费面（dossier-stats 等）读这里，timeline.md 回归纯人读。
  * best-effort：事件是观测面，写失败绝不打断状态机（全吞）；状态决策绝不解析它。

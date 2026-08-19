@@ -143,7 +143,8 @@ export function validateCommitMessage(parsed, commitLanguage = 'en') {
 /**
  * spawn 双标记判定：none | in-progress（上次崩溃）| done。
  * 崩溃收箱语义只对 maker 生效：maker 是唯一改 worktree 的角色，孤儿标记（有 started 无 done）
- * 意味着 worktree 可能停在半改状态，必须 FAILED_BOX(crashed) 等人工 retry（见 ready/fixing）。
+ * 意味着 worktree 可能停在半改状态，只能有界自动恢复（crashRecoveryNext），额度用尽即
+ * FAILED_BOX(crashed) 等人工 retry（见 ready/fixing）。
  * 只读角色（setup/spec/spec-verifier/verifier）的崩溃残留有两种自然结局：同轮重 spawn 被覆盖
  * （经 startSpawnRecord 的 superseded 数组留档）、或跳号留下孤儿记录（spec-agent 走 nextRoleRound）；
  * 它们不改 worktree，重跑无害，所以不收箱。
@@ -154,6 +155,21 @@ export function markerStatus(marker) {
   if (marker.done) return 'done';
   if (marker.started) return 'in-progress';
   return 'none';
+}
+
+/**
+ * 崩溃孤儿腿（maker-r<n> 有 started 无 done）的有界自动恢复裁决。
+ * count < limit → 'auto-recover'（count 为自增后的值，供 runtime 落盘与文案）；否则 'box'
+ * （count 为已用尽的次数，0 表示从未自动恢复过 = 旧行为）。
+ * 恢复动作本身只是 cmdRetry 对 queue 崩溃残留的机械复位（归档孤儿产物后重 spawn），
+ * 不含任何人类判断——所以界限的意义是防「崩溃→恢复→再崩溃」的无限循环，不是质量判断。
+ * limit 非法（非整数/负数）按 0 处理：孤儿意味着 worktree 可能半改，拿不准时退回收箱侧。
+ */
+export function crashRecoveryNext(recoveryCount, limit) {
+  const count = recoveryCount ?? 0;
+  const max = Number.isInteger(limit) && limit > 0 ? limit : 0;
+  if (count < max) return { action: 'auto-recover', count: count + 1 };
+  return { action: 'box', count };
 }
 
 /** 预算闸：达到上限即拒绝 spawn。 */

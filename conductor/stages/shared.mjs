@@ -1158,6 +1158,28 @@ export function failToBox(ts, cfg, reason, failureType = null, extra = {}) {
 }
 
 /**
+ * 崩溃孤儿腿的机械复位（READY/FIXING 共用）：本轮 maker 产物移进 attempts/，
+ * runtime.crash_recovery_count 记为自增后的 count 落盘。
+ * stage 一律不动：drain 重入同一 handler 时 markerStatus 已回到 'none'，走既有 spawn 路径
+ * 重起 maker（预算闸/runBudget 闸都在那条路径上，此处不重复判）。
+ * 边界：worktree 可能停在崩溃 maker 的半改状态且未提交（maker 的 commitAll 在 spawn 收尾才跑），
+ * 新 maker 从那里继续——人工 `conductor retry` 也不清 worktree，此处只是把没人去点的那一下自动化。
+ */
+export function recoverCrashedMakerRound(ts, cfg, round, count) {
+  const id = ts.id;
+  // cont-<leg> 腿流同属该轮孤儿产物：不一并腾走，重 spawn 的续跑腿会覆盖它们（案卷丢失）。
+  const n = state.archiveArtifactsMatching(
+    cfg, id,
+    new RegExp(`^maker-r${round}\\.(json|settings\\.json|(cont-\\d+\\.)?stream\\.jsonl)$`),
+  );
+  ts.runtime.crash_recovery_count = count;
+  state.saveRuntime(ts);
+  state.appendTimeline(cfg, id, `crashed 自动恢复 #${count}：maker-r${round} 孤儿腿归档（${n} 个产物 → attempts/），重新 spawn`);
+  state.appendEvent(cfg, id, 'crash_auto_recovery', { round, attempt: count });
+  return { changed: true };
+}
+
+/**
  * 任务的 dossier spec.md（verifier 与 maker 的契约面）。缺失时冻结生成（幂等）。
  * bugfix 从 ts.dir/spec.md 取（无则兜底）；feature 从已冻结 dossier 或 specs/<id>.md。
  */

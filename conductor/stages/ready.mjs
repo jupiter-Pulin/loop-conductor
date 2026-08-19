@@ -5,18 +5,20 @@
 // fail → 先判失败签名连续性：同签名连败 2 轮且环境类 → 短路收箱（env_failure_repeated，不
 //        spawn 下一轮 maker）；否则 writeRepairContext(green_gate)（同签名非环境类附
 //        same_signature_streak 提示）+ makerMissNext → FIXING / FAILED_BOX。
-// 幂等：maker-r1.json 有 started 无 done → 上次崩溃，转 FAILED_BOX（crashed），retry 可恢复；
+// 幂等：maker-r1.json 有 started 无 done → 上次崩溃，有界自动恢复（crashAutoRecoveryLimit）：
+//       孤儿产物归档 + 原地重 spawn；额度用尽转 FAILED_BOX（crashed），retry 可恢复；
 //       有 done → 跳过 spawn，仅复跑 green gate 完成转移（env_failure_repeated 窄恢复复用此路径）。
 import * as state from '../lib/state.mjs';
 import { ensureWorktree, checkTrackedHarness } from '../lib/git.mjs';
 import { taskCfg } from '../lib/task-cfg.mjs';
-import { markerStatus, greenGatePassed, makerMissNext, makerRound, sameSignatureStreak } from './decisions.mjs';
+import { markerStatus, greenGatePassed, makerMissNext, makerRound, sameSignatureStreak, crashRecoveryNext } from './decisions.mjs';
 import { isEnvFailureSignature } from '../lib/failure-signature.mjs';
 import {
   worktreePath, runGreenGate, writeGreenGateResult, runTestGateProbe,
   buildRepairContext, writeRepairContext, readGreenGateSignatures,
   runMakerRound, buildMakerColdPrompt, ensureDossierSpec, budgetExceeded, failToBox,
   HARNESS_ARTIFACTS, canStartSpawn, resolveGateCommandsForTask, runGateCommands,
+  recoverCrashedMakerRound,
 } from './shared.mjs';
 
 export default async function readyHandler(ts, cfg) {
@@ -27,10 +29,14 @@ export default async function readyHandler(ts, cfg) {
   const status = markerStatus(marker);
 
   if (status === 'in-progress') {
-    // 有 started 无 done = 上次 run 在 spawn 中途崩溃。不滞留：收箱待人工 retry 恢复。
+    // 有 started 无 done = 上次 run 在 spawn 中途崩溃。先走有界自动恢复（额度内做与人工 retry
+    // 同款的机械复位，不含任何人类判断），额度用尽才收箱——不滞留，也不再赌「有人去点 retry」。
+    const rec = crashRecoveryNext(ts.runtime.crash_recovery_count, cfg.crashAutoRecoveryLimit);
+    if (rec.action === 'auto-recover') return recoverCrashedMakerRound(ts, cfg, round, rec.count);
     return failToBox(
       ts, cfg,
-      `crashed: maker-r${round} 有 started 无 done（上次 conductor 中断）。\`conductor retry ${id}\` 可恢复`,
+      `crashed: maker-r${round} 有 started 无 done（上次 conductor 中断）。\`conductor retry ${id}\` 可恢复`
+      + (rec.count > 0 ? `（自动恢复已用尽：${rec.count} 次）` : ''),
       'crashed',
     );
   }

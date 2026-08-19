@@ -62,6 +62,7 @@ export function loadCfg(root = resolveRoot()) {
     targetRepo: './target',
     baseBranch: null, // null = new 时读 currentBranch(targetRepo) 兜底 'main'
     maxMakerMisses: 3, // maker 可行动失败阶梯上限（契约 §3）
+    crashAutoRecoveryLimit: 1, // maker 孤儿腿（maker-r<n> 有 started 无 done）自动恢复次数上限；0=关，退回「直接 FAILED_BOX(crashed)」旧行为。恢复动作就是 cmdRetry 对 queue 崩溃残留的既有机械复位（孤儿产物归档 + 重 spawn，无任何人类判断输入），设界只为防「崩溃→恢复→再崩溃」的无限循环
     maxVerifierInvalidRetries: 2, // verifier 协议失败重试上限（契约 §3）
     maxSpecMisses: 3, // spec-verifier fail：两次修复，第三次冷启动新 spec-agent
     maxSpecVerifierInvalidRetries: 2,
@@ -303,6 +304,7 @@ function cmdNew(cfg, opts) {
     schema_version: 1,
     stage,
     maker_miss_count: 0,
+    crash_recovery_count: 0, // 已用掉的 maker 孤儿腿自动恢复次数（对 crashAutoRecoveryLimit 计数）
     verifier_invalid_count: 0,
     spec_miss_count: 0,
     spec_verifier_invalid_count: 0,
@@ -724,23 +726,9 @@ async function cmdClose(cfg, id) {
 
 // ---- retry ----
 
-/** 把 dossier 内匹配 pattern 的产物移入 attempts/<ts>/；无匹配则不建目录，返回 0。 */
-function archiveArtifactsMatching(cfg, id, pattern) {
-  const dir = state.dossierPath(cfg, id);
-  let names = [];
-  try { names = fs.readdirSync(dir); } catch { return 0; }
-  const targets = names.filter((n) => pattern.test(n));
-  if (targets.length === 0) return 0;
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const dest = path.join(dir, 'attempts', stamp);
-  fs.mkdirSync(dest, { recursive: true });
-  for (const n of targets) fs.renameSync(path.join(dir, n), path.join(dest, n));
-  return targets.length;
-}
-
 /** 把上一攻坚周期的轮次产物移入 attempts/<ts>/（保留案卷，腾出轮次命名空间）。 */
 function archiveRoundArtifacts(cfg, id) {
-  const n = archiveArtifactsMatching(cfg, id, /^((setup|feasibility-agent|spec-agent|spec-verifier|maker|verifier)-r\d+\.stream\.jsonl|maker-r\d+\.json|maker-r\d+\.settings\.json|verifier-r\d+\.json|setup-r\d+\.json|feasibility-agent-r\d+\.json|feasibility-agent-r\d+\.settings\.json|feasibility-check-r\d+(\.hook)?\.json|spec-agent-r\d+\.json|spec-agent-r\d+\.settings\.json|spec-verifier-r\d+\.json|verify-r\d+\.(md|verdict\.json)|verify-r\d+\.invalid-a\d+\.json|spec-verify-r\d+\.(md|verdict\.json)|spec-verify-r\d+\.invalid-a\d+\.json|spec-check-r\d+(\.hook)?\.json|green-gate-r\d+\.json|test-gate-r\d+\.json|repair-context-r\d+\.json|spec-repair-context-r\d+\.json|review-findings\.md)$/);
+  const n = state.archiveArtifactsMatching(cfg, id, /^((setup|feasibility-agent|spec-agent|spec-verifier|maker|verifier)-r\d+\.stream\.jsonl|maker-r\d+\.json|maker-r\d+\.settings\.json|verifier-r\d+\.json|setup-r\d+\.json|feasibility-agent-r\d+\.json|feasibility-agent-r\d+\.settings\.json|feasibility-check-r\d+(\.hook)?\.json|spec-agent-r\d+\.json|spec-agent-r\d+\.settings\.json|spec-verifier-r\d+\.json|verify-r\d+\.(md|verdict\.json)|verify-r\d+\.invalid-a\d+\.json|spec-verify-r\d+\.(md|verdict\.json)|spec-verify-r\d+\.invalid-a\d+\.json|spec-check-r\d+(\.hook)?\.json|green-gate-r\d+\.json|test-gate-r\d+\.json|repair-context-r\d+\.json|spec-repair-context-r\d+\.json|review-findings\.md)$/);
   if (n > 0) state.appendTimeline(cfg, id, `retry：${n} 个轮次产物移入 attempts/（案卷保留）`);
   return n;
 }
@@ -783,7 +771,7 @@ function applyNarrowRetry(cfg, ts, kind) {
     return;
   }
   const isVerifier = kind === 'verifier';
-  const n = archiveArtifactsMatching(
+  const n = state.archiveArtifactsMatching(
     cfg, id,
     isVerifier ? /^verify-r\d+\.invalid-a\d+\.json$/ : /^spec-verify-r\d+\.invalid-a\d+\.json$/,
   );
@@ -827,6 +815,7 @@ async function cmdRetry(cfg, id) {
     Object.assign(ts.runtime, {
       stage: retryStage,
       maker_miss_count: 0,
+      crash_recovery_count: 0, // 人工 retry 后重新享有完整自动恢复额度（人已看过一眼，界重新计）
       verifier_invalid_count: 0,
       spec_miss_count: 0,
       spec_verifier_invalid_count: 0,
@@ -851,7 +840,10 @@ async function cmdRetry(cfg, id) {
       );
     }
   } else {
-    // queue 中崩溃残留（started 无 done）的人工清理路径
+    // queue 中崩溃残留（started 无 done）的人工清理路径。自动恢复额度同样复位：与 FAILED_BOX
+    // 全量重置一个语义——人工介入过一次，界就重新计。
+    ts.runtime.crash_recovery_count = 0;
+    state.saveRuntime(ts);
     state.appendTimeline(cfg, id, 'human retry：清理崩溃残留标记');
     console.log(`${id} 在 queue 中（stage=${ts.runtime.stage}），已清理轮次标记，下次 run 重新 spawn`);
   }
