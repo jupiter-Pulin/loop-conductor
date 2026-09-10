@@ -3,7 +3,8 @@
 // （agents/<role>-agent.md、agents/fewshot/<role>.md）；本模块只负责选段、填占位、
 // 拼注入内容。判断力靠 few-shot 传，固定上下文越短越好。
 //
-// 硬约束（AC-026）：`agents/` 下只有这九个文件；任何 builder 的产物都不得残留 `{{`；
+// 硬约束（AC-026）：`agents/` 下只有这八个文件（4 份 prompt + fewshot/ 下 4 份）；
+// 任何 builder 的产物都不得残留 `{{`；
 // 每份 prompt 都含自己 log 的绝对路径与「用 Write 工具」一句（防 Read-before-Write 撞墙）。
 
 import fs from 'node:fs';
