@@ -118,7 +118,10 @@ function workingLabel() {
 }
 
 function cardSig(entry) {
-  return [entry.stage, entry.awaitingKind, entry.needsHuman, entry.working, entry.spentUsd, entry.kind, entry.title].join('|');
+  return [
+    entry.stage, entry.awaitingKind, entry.needsHuman, entry.working, entry.spentUsd, entry.kind, entry.title,
+    entry.lastFailureType, entry.rateLimit?.resets_at ?? '',
+  ].join('|');
 }
 
 function buildGaugeNode(entry) {
@@ -142,6 +145,8 @@ function buildColumnCardNode(entry) {
   if (entry.stage === 'FAILED_BOX' && entry.lastFailureType) {
     badges.push(el('span', { class: 'badge badge-kind', text: entry.lastFailureType }));
   }
+  // 限额收箱的卡片直接写出重置时刻：能不能恢复是看板上就该看见的事，不该藏在详情页里。
+  const rateLimit = entry.stage === 'FAILED_BOX' ? rateLimitPanel(entry.rateLimit) : null;
   const card = el('div', {
     class: 'card' + (entry.needsHuman ? ' needs-human' : ''),
     'data-id': entry.id,
@@ -160,6 +165,7 @@ function buildColumnCardNode(entry) {
     ]),
     badges.length > 0 ? el('div', {}, badges) : null,
     el('div', { class: 'title', text: entry.title || '(无标题)' }),
+    rateLimit ? el('div', { class: 'rate-limit', text: rateLimit.label }) : null,
   ]);
   if (entry.needsHuman) {
     card.appendChild(el('div', { class: 'needs-you', text: '⚑ needs you' }));

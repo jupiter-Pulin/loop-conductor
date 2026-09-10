@@ -293,7 +293,7 @@ test('AC-005: GET /api/board 泳道固定顺序、契约字段齐全，每次请
   assert.ok(entry, '新写入的任务应在下一次请求中现读到（无跨请求缓存）');
   assert.deepEqual(
     Object.keys(entry).sort(),
-    ['awaitingKind', 'box', 'column', 'id', 'kind', 'lane', 'lastFailureType', 'legacy', 'needsHuman', 'spentUsd', 'stage', 'title', 'working'].sort(),
+    ['awaitingKind', 'box', 'column', 'id', 'kind', 'lane', 'lastFailureType', 'legacy', 'needsHuman', 'rateLimit', 'spentUsd', 'stage', 'title', 'working'].sort(),
   );
   // 遗留 stage 名的任务不占任何新列，归 legacy 分组（AC-029）
   assert.equal(second.body.columns.every((c) => c.tasks.length === 0), true);
