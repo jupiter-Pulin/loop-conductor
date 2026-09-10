@@ -15,6 +15,18 @@ import { taskCfg } from './lib/task-cfg.mjs';
 import { runCommitterProposal, computeTestChangeGuard, performMerge } from './stages/shared.mjs';
 import { validateFeasibilityDoc } from './lib/feasibility-contract.mjs';
 import { validateSpecDoc } from './lib/spec-contract.mjs';
+import { composeRecords } from './lib/records.mjs';
+import { needPrecommit, needReview } from './lib/version-gate.mjs';
+import { collectModelIds, probeModels } from './lib/model-probe.mjs';
+import { PRECOMMIT_PROFILE_SAMPLE, setupProfilePaths, validatePrecommitProfile } from './lib/profile.mjs';
+import { DEFAULT_MAX_TURNS } from './lib/agent-settings.mjs';
+import routingHandler from './stages/routing.mjs';
+import awaitHumanHandler from './stages/await_human.mjs';
+import {
+  cleanupTaskArtifacts, humanRecordPath, readRouterState, revParseOrNull, specDraftPath,
+  taskBranchName, writeRouterState,
+} from './stages/router-kernel.mjs';
+import { archiveSpecDraft } from './stages/shared.mjs';
 import needsTargetSetupHandler from './stages/needs_target_setup.mjs';
 import awaitSetupApprovalHandler from './stages/await_setup_approval.mjs';
 import needsFeasibilityHandler from './stages/needs_feasibility.mjs';
@@ -28,6 +40,10 @@ import verifyHandler from './stages/verify.mjs';
 import fixingHandler from './stages/fixing.mjs';
 
 const STAGE_HANDLERS = {
+  // ---- 新状态机（router conductor）：new 创建的任务只走这两个 stage ----
+  ROUTING: routingHandler,
+  AWAIT_HUMAN: awaitHumanHandler,
+  // ---- 以下为遗留 stage：P3 删。仍注册着，让 P2 之前建的 queue 任务跑完自己的链 ----
   NEEDS_TARGET_SETUP: needsTargetSetupHandler,
   AWAIT_SETUP_APPROVAL: awaitSetupApprovalHandler,
   NEEDS_FEASIBILITY: needsFeasibilityHandler,
@@ -52,6 +68,64 @@ const STAGE_HANDLERS = {
 export function resolveRoot() {
   if (process.env.CONDUCTOR_ROOT) return path.resolve(process.env.CONDUCTOR_ROOT);
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+}
+
+/** 四角色的默认模型（spec §角色、工具、hook、模型：默认沿用现配置，四角色均 claude-opus-5）。 */
+export const DEFAULT_ROLE_MODEL = 'claude-opus-5';
+
+/** 新状态机认识的模型键；其余（setup / feasibility / specVerifier / verifier / committer）是遗留键。 */
+export const ROLE_MODEL_KEYS = Object.freeze(['router', 'spec', 'maker', 'reviewer']);
+
+/**
+ * spec §config 的删除清单（AC-027）：仍读得到（旧 stage 还靠它们跑完自己的链），
+ * 但新状态机一概不看，因此每个**人在配置文件里显式给了的**遗留键各打印一次警告。
+ * 没给的键不警告——默认值不是「人的配置」，对它们喊话只是噪音。
+ */
+export const LEGACY_CONFIG_KEYS = Object.freeze([
+  'specMaxAcs',
+  'autoApproveSpecEnabled', 'autoApproveSpecMaxAcs',
+  'autoMergeEnabled', 'autoMergeKinds', 'autoMergeMaxDiffLines', 'autoMergeMaxAcs', 'autoMergeDeniedPaths',
+  'testGateEnabled', 'testGateTestGlobs', 'testGateProbeConcurrency',
+  'testChangeGuardEnabled',
+  'verifierShadowEnabled', 'verifierShadowBackend', 'verifierShadowModel', 'verifierShadowTimeoutMs',
+  'verifierEvidenceAnchorsMode',
+  'reviewStage',
+  'crashAutoRecoveryLimit',
+  'feasibilityEnabled',
+  'specChainIsolationEnabled',
+]);
+
+/** models 里的遗留角色键（旧 stage 仍读，新状态机不看）。 */
+export const LEGACY_MODEL_KEYS = Object.freeze(['setup', 'feasibility', 'specVerifier', 'verifier', 'committer']);
+
+function warnLegacyKey(key) {
+  console.error(`[conductor] legacy config key ignored: ${key}`);
+}
+
+/**
+ * `maxTurns` 归一（AC-027）：新形态是 `{router, spec, plan, maker, reviewer}`。
+ * 配置给的是数字 → 视为 legacy 标量：赋给 `maker`，同时留给旧 stage 用（legacyMaxTurns）。
+ * 返回 { maxTurns, legacyMaxTurns }。
+ */
+export function normalizeMaxTurns(configured) {
+  if (Number.isFinite(configured)) {
+    warnLegacyKey(`maxTurns（标量 ${configured} 视为 maker 上限；新形态是 { router, spec, plan, maker, reviewer }）`);
+    return { maxTurns: { ...DEFAULT_MAX_TURNS, maker: configured }, legacyMaxTurns: configured };
+  }
+  const obj = configured != null && typeof configured === 'object' && !Array.isArray(configured) ? configured : {};
+  return { maxTurns: { ...DEFAULT_MAX_TURNS, ...obj }, legacyMaxTurns: 30 };
+}
+
+/** `models` 归一（AC-027）：四角色键缺省回落 claude-opus-5；遗留角色键保留可读但各警告一次。 */
+export function normalizeModels(defaults, userModels) {
+  const models = { ...defaults, ...(userModels ?? {}) };
+  for (const key of ROLE_MODEL_KEYS) {
+    if (typeof models[key] !== 'string' || models[key].trim() === '') models[key] = DEFAULT_ROLE_MODEL;
+  }
+  for (const key of LEGACY_MODEL_KEYS) {
+    if (Object.hasOwn(userModels ?? {}, key)) warnLegacyKey(`models.${key}`);
+  }
+  return models;
 }
 
 export function loadCfg(root = resolveRoot()) {
@@ -106,6 +180,9 @@ export function loadCfg(root = resolveRoot()) {
     lockHeartbeatMs: 60000,
     maxStepsPerTask: 20,
     fuseStreak: 3, // 保险丝（AC-024）：同一 (role, package) 连续 N 条记录签名相同即收箱；0=关
+    maxParallelPackages: 2, // 一个任务同轮最多并行几个工作包（P2b 才用得上）
+    maxPackages: 12, // 一份方案最多几个包（validatePackages 的上限）
+    packagesEnabled: false, // 阶段闸：P2b 前恒关——plan 动作被拒、spec prompt 无工作包段、router 的 packages 字段即非法
     runBudgetUsd: null,
     models: { setup: null, feasibility: null, spec: null, specVerifier: null, maker: null, verifier: null, committer: null, reviewer: null },
   };
@@ -114,7 +191,17 @@ export function loadCfg(root = resolveRoot()) {
     user = JSON.parse(fs.readFileSync(path.join(root, 'conductor.config.json'), 'utf8'));
   } catch { /* 配置缺失时用默认值 */ }
   const deprecatedMaxDrainStepsConfigured = Object.hasOwn(user, 'maxDrainSteps');
-  const merged = { ...defaults, ...user, models: { ...defaults.models, ...(user.models ?? {}) } };
+  for (const key of LEGACY_CONFIG_KEYS) {
+    if (Object.hasOwn(user, key)) warnLegacyKey(key);
+  }
+  const { maxTurns, legacyMaxTurns } = normalizeMaxTurns(user.maxTurns);
+  const merged = {
+    ...defaults,
+    ...user,
+    maxTurns,
+    legacyMaxTurns,
+    models: normalizeModels(defaults.models, user.models),
+  };
   delete merged.maxDrainSteps;
   return {
     ...merged,
@@ -176,6 +263,31 @@ function warnLegacyTasks(cfg) {
 
 // ---- run：drain 循环 ----
 
+/**
+ * 模型可用性探测（AC-052）。全部可用（或没有可探的 id）→ true；否则打印原因并令本次 run
+ * 在处理任何任务前终止，任务状态零变化。缓存命中不再探测（键 = 模型 id + claude 二进制版本）。
+ */
+async function ensureModelsAvailable(cfg) {
+  if (collectModelIds(cfg.models).length === 0) return true;
+  const probe = await probeModels({ cfg });
+  if (probe.ok) return true;
+  if (probe.rateLimited) {
+    const resets = probe.rateLimited.resets_at;
+    console.error(
+      `[conductor] 模型探测撞限额（${probe.rateLimited.type ?? 'unknown'}），本次 run 终止，任务状态未变。`
+      + (Number.isFinite(resets) ? `重置时刻：${formatLocalTime(resets)}` : '重置时刻未知'),
+    );
+  }
+  for (const u of probe.unavailable) {
+    console.error(`[conductor] 模型不可用：${u.model} —— ${u.error}`);
+  }
+  if (probe.unavailable.length > 0) {
+    console.error('[conductor] 本次 run 终止，任务状态未变。请修正 conductor.config.json 的 models 后重试。');
+  }
+  process.exitCode = 1;
+  return false;
+}
+
 async function cmdRun(cfg) {
   const lock = acquireLock(cfg.stateDir, {
     onSelfHeal: (info) => {
@@ -204,6 +316,9 @@ async function cmdRun(cfg) {
     if (!(Number(cfg.maxConcurrentTasks) > 0)) {
       console.error(`[conductor] 警告：maxConcurrentTasks=${cfg.maxConcurrentTasks} 非法，按 1 处理。`);
     }
+    // AC-052：处理任何任务之前先确认配置的模型 id 都能起会话。id 打错/没权限/被下线时，
+    // 代价是 run 启动即停，而不是四个角色各 spawn 失败、各烧一遍退避阶梯、把任务推错分支。
+    if (!(await ensureModelsAvailable(cfg))) return;
     warnLegacyTasks(cfg);
     const repaired = state.patrolBoxStageConsistency(cfg);
     for (const r of repaired) {
@@ -237,13 +352,116 @@ function nextId(cfg) {
   return `task-${ymd}-${String(max + 1).padStart(3, '0')}`;
 }
 
+/** `--x <path>` 取值：缺参或是布尔（`--x` 后面没跟值）时报错并返回 null。 */
+function requirePathOpt(opts, name, { mustExist = false } = {}) {
+  const v = opts[name];
+  if (v == null || v === true) {
+    console.error(`--${name} 需要一个${mustExist ? '存在的文件' : ''}路径`);
+    return null;
+  }
+  const resolved = path.resolve(v);
+  if (mustExist && !fs.existsSync(resolved)) {
+    console.error(`--${name} 文件不存在：${resolved}`);
+    return null;
+  }
+  return resolved;
+}
+
+/**
+ * 新建任务（router conductor）：`new --title "…" --brief <file> [--repo <path>] [--base-branch <b>]`。
+ * 没有 kind——路线由 router 每轮决定，不由建单时的一个枚举锁死。
+ *
+ * 唯一的建单前置是**目标仓的 precommit 段**（AC-019）：precommit 的三步命令由人手写，
+ * 内核不猜、不生成；缺了它这个任务将来无论如何都过不了 merge 闸，早拒比晚拒便宜。
+ *
+ * 带 `--kind` 时走遗留路径（旧五闸状态机），让 P3 之前的既有任务与测试照常。
+ */
 function cmdNew(cfg, opts) {
+  if (opts.kind != null) return cmdNewLegacy(cfg, opts);
+
+  const title = typeof opts.title === 'string' && opts.title !== '' ? opts.title : null;
+  if (title == null) {
+    console.error('用法：conductor new --title "…" --brief <file> [--repo <path>] [--base-branch <b>]');
+    process.exitCode = 1;
+    return;
+  }
+  const briefPath = requirePathOpt(opts, 'brief', { mustExist: true });
+  if (briefPath == null) { process.exitCode = 1; return; }
+
+  let targetRepo = cfg.targetRepo;
+  if (opts.repo != null) {
+    if (opts.repo === true) { console.error('--repo 需要一个仓库路径'); process.exitCode = 1; return; }
+    targetRepo = path.resolve(cfg.root, opts.repo);
+  }
+
+  // precommit profile 闸：目标仓的 setup-profile.json 必须有可用的 precommit 段。
+  const profileMeta = setupProfilePaths({ ...cfg, targetRepo }).meta;
+  const profileJson = state.readJsonIf(profileMeta);
+  const check = validatePrecommitProfile(profileJson, { testCommand: cfg.testCommand });
+  if (!check.ok) {
+    console.error(`[conductor] 拒绝建任务：${path.relative(cfg.root, profileMeta)} 的 precommit 配置不可用`);
+    for (const e of check.errors) console.error(`  - ${e}`);
+    console.error('\n照下面的样例手写 precommit 段（precommit 的每一步命令由人给定，内核不猜）：\n');
+    console.error(check.sample);
+    process.exitCode = 1;
+    return;
+  }
+
+  const id = nextId(cfg);
+  // 阶段闸（AC-044）：packagesEnabled=false 时不接受任何方案文件残留。
+  const packagesDraft = path.join(cfg.specsDir, `${id}.packages.json`);
+  if (cfg.packagesEnabled !== true && fs.existsSync(packagesDraft)) {
+    console.error(`[conductor] 拒绝建任务：${path.relative(cfg.root, packagesDraft)} 已存在，但 packagesEnabled=false（本阶段不支持工作包）`);
+    process.exitCode = 1;
+    return;
+  }
+
+  let baseBranch = opts['base-branch'] === true ? null : (opts['base-branch'] ?? cfg.baseBranch);
+  if (baseBranch == null) {
+    try { baseBranch = currentBranch(targetRepo); } catch { baseBranch = 'main'; }
+    if (!baseBranch) baseBranch = 'main';
+  }
+
+  const task = {
+    schema_version: 1,
+    id,
+    title,
+    repo: path.basename(targetRepo),
+    targetRepo,
+    baseBranch,
+    testCommand: cfg.testCommand,
+    created_at: new Date().toISOString(),
+  };
+  // runtime 只有 spec 列的字段：没有 miss / inval / epoch 计数——阶梯已经被 router 取代。
+  const runtime = {
+    schema_version: 1,
+    stage: 'ROUTING',
+    current_round: 0,
+    awaiting: null,
+    spec_approved: false,
+    plan_active: false,
+    plan_source: null,
+    rate_limit: null,
+    spent_usd: 0,
+    last_failure_type: null,
+    updated_at: new Date().toISOString(),
+  };
+  const dir = state.writeNewTask(cfg.queueDir, task, runtime);
+  state.writeFileEnsured(path.join(dir, 'brief.md'), fs.readFileSync(briefPath, 'utf8'));
+  state.appendTimeline(cfg, id, `created (stage=ROUTING, brief 已落盘)`);
+  console.log(`已创建 ${path.relative(cfg.root, dir)}/（stage=ROUTING）`);
+  console.log('conductor run 会让 router 读 brief 与内核事实，从动作闭集里选下一步；人只在 spec 闸与 merge 闸出现');
+  console.log(`id: ${id}`);
+}
+
+function cmdNewLegacy(cfg, opts) {
   const kind = opts.kind;
   if (kind !== 'bugfix' && kind !== 'feature' && kind !== 'probe') {
     console.error('用法：conductor new --kind bugfix|feature|probe --title "..."');
     process.exitCode = 1;
     return;
   }
+  console.error('[conductor] 警告：--kind 是遗留建单形态（旧五闸状态机），新任务请用 conductor new --title … --brief <file>');
   const title = opts.title ?? '(untitled)';
   // --brief <file>：需求原文落盘 <taskdir>/brief.md（喂 feasibility/spec 链，缓解「只有 title」的输入饥饿）。
   let brief = null;
@@ -379,11 +597,172 @@ async function withCliTaskMutation(cfg, id, fn) {
   }
 }
 
-async function cmdApprove(cfg, id) {
+// ---- 人闸（新状态机）：approve / reject / resume / abandon ----
+
+/**
+ * 把人的裁决合并进本轮的 human-r<n>.json（内核写的产物，可续写；agent 的 log 才是只增不改）。
+ * 合成后它就是记录列表里的一条 `role: "human"`，router 在「已裁决事项」里逐字读到 notes。
+ */
+function recordHumanDecision(cfg, ts, { decision, notes = null, noPackages = false }) {
+  const round = ts.runtime.awaiting?.round ?? ts.runtime.current_round ?? 0;
+  const p = humanRecordPath(cfg, ts.id, round);
+  const existing = state.readJsonIf(p) ?? { schema_version: 1, kind: ts.runtime.awaiting?.kind ?? null, requested_by: 'kernel', summary: '', refs: [] };
+  const merged = {
+    ...existing,
+    decision,
+    notes: typeof notes === 'string' && notes !== '' ? notes : null,
+    no_packages: noPackages === true,
+    decided_at: new Date().toISOString(),
+  };
+  state.writeJson(p, merged);
+  state.appendEventAlways(cfg, ts.id, 'human_decision', {
+    round, kind: merged.kind, decision, notes: merged.notes, no_packages: merged.no_packages,
+  });
+  return merged;
+}
+
+/** 离开人闸回 ROUTING：awaiting 置 null，其余字段由调用方通过 extra 一并落盘。 */
+function backToRouting(cfg, ts, note, extra = {}) {
+  state.transitionState(ts, cfg, 'ROUTING', note, { awaiting: null, ...extra });
+}
+
+/** spec 闸批准：冻结 spec → dossier/<id>/spec.md，草稿归档，spec_approved=true，回 ROUTING。 */
+function approveSpecGate(cfg, ts, opts) {
+  const id = ts.id;
+  const draft = specDraftPath(cfg, id);
+  if (!fs.existsSync(draft)) {
+    console.error(`拒绝 approve：specs/${id}.md 不存在（spec 闸的产物已被移走？）`);
+    process.exitCode = 1;
+    return;
+  }
+  const body = fs.readFileSync(draft, 'utf8');
+  const check = validateSpecDoc(body);
+  if (!check.ok) {
+    // 人审期间草稿可能被人工改写（合法动作），但冻结后不再过契约门：这里是最后一次终审。
+    console.error(`拒绝 approve：specs/${id}.md 不满足 spec-doc/v1，冻结会让 AC 枚举退化。`);
+    for (const e of check.errors) console.error(`  - ${e}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (opts['no-packages'] && cfg.packagesEnabled !== true) {
+    console.log('提示：packagesEnabled=false，--no-packages 本阶段无意义，已忽略');
+  }
+  state.writeFileEnsured(state.dossierPath(cfg, id, 'spec.md'), body);
+  archiveSpecDraft(cfg, id, 'approved');
+  recordHumanDecision(cfg, ts, { decision: 'approved', notes: opts.notes === true ? null : opts.notes });
+  backToRouting(cfg, ts, 'spec 批准', { spec_approved: true });
+  console.log(`${id} spec 已冻结（dossier/${id}/spec.md，AC×${check.acs.length}）→ ROUTING`);
+}
+
+/**
+ * merge 闸批准：按**批准时刻**的 H / B 重算版本规则（Invariant 4/6）。
+ * 任一为 true → 拒绝并回 ROUTING（人的 notes 不能豁免版本）。通过 → 本地 merge、清产物、DONE。
+ * 任何路径都不 push。
+ */
+function approveMergeGate(cfg, ts, opts) {
+  const id = ts.id;
+  const tcfg = taskCfg(ts, cfg);
+  const repo = tcfg.targetRepo;
+  const branch = taskBranchName(id);
+  const head = revParseOrNull(repo, branch);
+  const base = revParseOrNull(repo, ts.task.baseBranch);
+  const records = composeRecords(cfg, id, { planActive: ts.runtime.plan_active === true });
+
+  if (needReview(records, head)) {
+    state.appendEventAlways(cfg, id, 'stale_review', { head_sha: head, base_sha: base });
+    backToRouting(cfg, ts, 'merge 批准被版本规则拒绝：当前 HEAD 没有通过的整体 review');
+    console.error(`${id} merge 拒绝：任务分支 HEAD 已变，当前版本没有通过的整体 review（need_review=true）→ 回 ROUTING`);
+    process.exitCode = 1;
+    return;
+  }
+  if (needPrecommit(records, head, base)) {
+    state.appendEventAlways(cfg, id, 'main_moved', { head_sha: head, base_sha: base });
+    backToRouting(cfg, ts, 'merge 批准被版本规则拒绝：当前 H/B 上没有通过的 precommit');
+    console.error(`${id} merge 拒绝：precommit 基线已过期（need_precommit=true）→ 回 ROUTING`);
+    process.exitCode = 1;
+    return;
+  }
+  const cur = currentBranch(repo);
+  if (cur !== ts.task.baseBranch) {
+    console.error(`merge 拒绝：target 仓库当前分支 ${cur} ≠ 任务 baseBranch ${ts.task.baseBranch}（任务保持原状）`);
+    state.appendTimeline(cfg, id, `merge 拒绝：target 仓库当前分支 ${cur} ≠ ${ts.task.baseBranch}`);
+    process.exitCode = 1;
+    return;
+  }
+  const message = typeof opts.message === 'string' && opts.message !== ''
+    ? opts.message
+    : `task ${id}: ${ts.task.title ?? id}`;
+  try {
+    mergeBranch(repo, branch, message); // 本地 merge，绝不 push
+  } catch (err) {
+    console.error(`${id} merge 失败（任务保持原状）：${err.message}`);
+    state.appendTimeline(cfg, id, `merge 失败：${err.message}`);
+    process.exitCode = 1;
+    return;
+  }
+  state.appendEventAlways(cfg, id, 'merged', { branch, message, head_sha: head, base_sha: base });
+  state.appendTimeline(cfg, id, `merged ${branch} → ${ts.task.baseBranch}（${message}）`);
+  recordHumanDecision(cfg, ts, { decision: 'approved', notes: opts.notes === true ? null : opts.notes });
+  cleanupTaskArtifacts(ts, cfg, { deleteTaskBranch: true });
+  state.transitionState(ts, cfg, 'DONE', 'merge 批准', { awaiting: null });
+  console.log(`${id} 已 merge 并归档（state/done/），worktree 与任务分支已清理。未 push。`);
+}
+
+async function cmdResume(cfg, id, opts = {}) {
+  return withCliTaskMutation(cfg, id, async () => {
+    const ts = findTask(cfg, id);
+    if (!ts) { console.error(`找不到任务 ${id}`); process.exitCode = 1; return; }
+    if (ts.error) { console.error(`${id} 任务目录损坏：${ts.error}`); process.exitCode = 1; return; }
+    if (ts.runtime.stage !== 'AWAIT_HUMAN' || ts.runtime.awaiting?.kind !== 'help') {
+      console.error(`resume 仅适用于 AWAIT_HUMAN(help) 的任务（当前 stage=${ts.runtime.stage}, kind=${ts.runtime.awaiting?.kind ?? '-'}）`);
+      process.exitCode = 1;
+      return;
+    }
+    const notes = opts.notes === true ? null : (opts.notes ?? null);
+    state.appendEventAlways(cfg, id, 'human_intervened', { round: ts.runtime.awaiting?.round ?? null, notes });
+    recordHumanDecision(cfg, ts, { decision: 'resumed', notes });
+    backToRouting(cfg, ts, `help 闸 resume${notes ? `：${notes}` : ''}`);
+    console.log(`${id} → ROUTING（notes 只进记录，不豁免版本规则：HEAD 变过就还得重新 review / precommit）`);
+  });
+}
+
+async function cmdAbandon(cfg, id) {
+  return withCliTaskMutation(cfg, id, async () => {
+    const ts = findTask(cfg, id);
+    if (!ts) { console.error(`找不到任务 ${id}`); process.exitCode = 1; return; }
+    if (ts.error) { console.error(`${id} 任务目录损坏：${ts.error}`); process.exitCode = 1; return; }
+    if (ts.box !== 'queue') {
+      console.error(`abandon 仅适用于 queue 中的任务（当前 box=${ts.box}）`);
+      process.exitCode = 1;
+      return;
+    }
+    cleanupTaskArtifacts(ts, cfg, { deleteTaskBranch: true, force: true });
+    state.appendTimeline(cfg, id, 'human abandon');
+    state.transitionState(ts, cfg, 'FAILED_BOX', 'human abandon', {
+      awaiting: null, last_failure_type: 'abandoned',
+    });
+    console.log(`${id} → FAILED_BOX(abandoned)，worktree 与任务分支已清理；conductor retry ${id} 可回 ROUTING`);
+  });
+}
+
+async function cmdApprove(cfg, id, opts = {}) {
   return withCliTaskMutation(cfg, id, async () => {
   const ts = findTask(cfg, id);
   if (!ts) { console.error(`找不到任务 ${id}`); process.exitCode = 1; return; }
   if (ts.error) { console.error(`${id} 任务目录损坏：${ts.error}`); process.exitCode = 1; return; }
+  if (ts.runtime.stage === 'AWAIT_HUMAN') {
+    const kind = ts.runtime.awaiting?.kind ?? null;
+    if (kind === 'spec') return approveSpecGate(cfg, ts, opts);
+    if (kind === 'merge') return approveMergeGate(cfg, ts, opts);
+    if (kind === 'help') {
+      console.error(`${id} 停在 help 闸：用 conductor resume ${id} [--notes "…"]，approve 只用于 spec / merge 闸`);
+      process.exitCode = 1;
+      return;
+    }
+    console.error(`${id} 的 runtime.awaiting 为空或未知（kind=${kind}），无法判断在等哪道闸`);
+    process.exitCode = 1;
+    return;
+  }
   if (ts.runtime.stage !== 'AWAIT_SPEC_APPROVAL') {
     console.error(`警告：${id} 当前 stage=${ts.runtime.stage}（非 AWAIT_SPEC_APPROVAL），仍写入 approval=approved`);
   }
@@ -428,6 +807,24 @@ async function cmdReject(cfg, id, notes) {
   const ts = findTask(cfg, id);
   if (!ts) { console.error(`找不到任务 ${id}`); process.exitCode = 1; return; }
   if (ts.error) { console.error(`${id} 任务目录损坏：${ts.error}`); process.exitCode = 1; return; }
+  if (ts.runtime.stage === 'AWAIT_HUMAN') {
+    const kind = ts.runtime.awaiting?.kind ?? null;
+    if (kind !== 'spec' && kind !== 'merge') {
+      console.error(`reject 仅适用于 spec / merge 闸（当前 kind=${kind ?? '-'}；help 闸用 resume）`);
+      process.exitCode = 1;
+      return;
+    }
+    const text = notes === true ? null : (notes ?? null);
+    if (!text) {
+      console.error(`用法：conductor reject ${id} --notes "打回理由"（notes 是 router 与下一轮 agent 的唯一输入）`);
+      process.exitCode = 1;
+      return;
+    }
+    recordHumanDecision(cfg, ts, { decision: 'rejected', notes: text });
+    backToRouting(cfg, ts, `${kind} 闸打回：${text}`);
+    console.log(`${id} ${kind} 闸已打回 → ROUTING（notes 进「已裁决事项」，router 自行决定下一步）`);
+    return;
+  }
   if (ts.runtime.stage !== 'AWAIT_SPEC_APPROVAL') {
     console.error(`警告：${id} 当前 stage=${ts.runtime.stage}（非 AWAIT_SPEC_APPROVAL），仍写入 approval=rejected`);
   }
@@ -624,7 +1021,8 @@ function latestActiveSpawn(cfg, id) {
   try { names = fs.readdirSync(dir); } catch { return null; }
   const active = [];
   for (const n of names) {
-    const m = n.match(/^(setup|feasibility-agent|spec-agent|spec-verifier|maker|verifier)-r(\d+)\.json$/);
+    // 新旧两套角色名都要认（AC：status / spy 兼容新旧任务）。
+    const m = n.match(/^(setup|feasibility-agent|spec-agent|spec-verifier|verifier|router|spec-plan|spec|maker(?:-P-\d{3})?|reviewer)-r(\d+)\.json$/);
     if (!m) continue;
     const p = path.join(dir, n);
     const rec = state.readJsonIf(p);
@@ -842,6 +1240,38 @@ function applyRateLimitRetry(cfg, ts, { force = false } = {}) {
   return true;
 }
 
+/** 新状态机的可恢复失败类型（限额另有 applyRateLimitRetry 走 resume_stage）。 */
+const ROUTER_RETRY_TYPES = new Set(['fuse_no_progress', 'budget_exhausted', 'abandoned']);
+
+/**
+ * 新状态机的 retry：回 ROUTING，不归档任何轮次产物（案卷是 router 的记忆，动了它等于失忆），
+ * 并把**复位轮次**记进 router-state —— 保险丝的连击从此刻重新数（Edge Case「保险丝触发后人 retry」）。
+ */
+function applyRouterRetry(cfg, ts) {
+  const id = ts.id;
+  const from = ts.runtime.last_failure_type;
+  writeRouterState(cfg, id, {
+    failures: [],
+    last_action_rejected: null,
+    fuse_reset_round: (ts.runtime.current_round ?? 0) + 1,
+  });
+  Object.assign(ts.runtime, { stage: 'ROUTING', last_failure_type: null, awaiting: null, rate_limit: null });
+  state.saveRuntime(ts);
+  const dest = state.taskDir(cfg.queueDir, id);
+  fs.mkdirSync(cfg.queueDir, { recursive: true });
+  fs.renameSync(ts.dir, dest);
+  ts.dir = dest;
+  ts.box = 'queue';
+  state.appendTimeline(cfg, id, `human retry：FAILED_BOX(${from}) → ROUTING，案卷保留，保险丝连击从 r${(ts.runtime.current_round ?? 0) + 1} 重新计`);
+  console.log(`${id} 已重回 queue（stage=ROUTING，${from} 已恢复，案卷未动）`);
+  if ((ts.runtime.spent_usd ?? 0) >= cfg.budgetUsd) {
+    console.error(
+      `警告：spent_usd=$${ts.runtime.spent_usd} 仍 >= budgetUsd=$${cfg.budgetUsd}，`
+      + '下次 run 会再次进 FAILED_BOX。请上调 conductor.config.json 的 budgetUsd。',
+    );
+  }
+}
+
 async function cmdRetry(cfg, id, opts = {}) {
   if (opts['rate-limited']) return cmdRetryRateLimited(cfg, opts);
   return withCliTaskMutation(cfg, id, async () => {
@@ -854,6 +1284,10 @@ async function cmdRetry(cfg, id, opts = {}) {
     return;
   }
   if (isRateLimitedTask(ts)) { applyRateLimitRetry(cfg, ts, { force: opts.force === true }); return; }
+  if (ts.box === 'failed' && ROUTER_RETRY_TYPES.has(ts.runtime.last_failure_type)) {
+    applyRouterRetry(cfg, ts);
+    return;
+  }
   if (ts.box === 'failed') {
     const narrow = narrowRetryKind(cfg, ts);
     if (narrow) { applyNarrowRetry(cfg, ts, narrow); return; }
@@ -941,17 +1375,23 @@ function parseArgs(argv) {
 
 const USAGE = `用法：conductor <command>
   run                                  drain 一轮：推进所有任务直到无状态变化
+  new --title "…" --brief <file> [--repo <path>] [--base-branch <b>]
+                                       新建任务（stage=ROUTING，由 router 逐轮决定下一步）；
+                                       目标仓必须已配好 setup-profile.json 的 precommit 段
+  approve <id> [--notes "…"] [--message "…"]
+                                       人闸批准：spec 闸冻结 spec 回 ROUTING；merge 闸本地合并后归档
+                                       （按批准时刻的 H/B 重算版本规则，不满足则拒并回 ROUTING；不 push）
+  reject <id> --notes "…"              spec / merge 闸打回 → ROUTING，notes 进「已裁决事项」
+  resume <id> [--notes "…"]            help 闸恢复 → ROUTING（notes 只进记录，不豁免版本规则）
+  abandon <id>                         放弃任务 → FAILED_BOX(abandoned)，清 worktree 与任务分支
+
+遗留动词（P3 删；只服务 P2 之前建的任务）：
   new --kind bugfix|feature|probe --title "…" [--brief <file>] [--feasibility] [--repo <path>]
-                                       新建任务（--brief 落盘需求原文；--feasibility 让 feature 先走
-                                       feasibility gate，缺省随 config.feasibilityEnabled；--repo 覆盖
-                                       快照的 targetRepo，缺省用 conductor.config.json 的 targetRepo；
-                                       probe = 只读调查任务，报告人读后 close 归档）
+                                       旧五闸状态机的建单形态
   approve-feasibility <id> --option O-X [--notes "…"]
                                        按 option ID 点名批准 feasibility memo（无静默通过）
   reject-feasibility <id> [--notes "…"] 打回 feasibility memo，notes 追加进 feasibility_reject_notes.md
-  approve <id>                         批准 spec（AWAIT_SPEC_APPROVAL 闸门）
   approve-setup <id>                   批准 target repo setup profile（AWAIT_SETUP_APPROVAL 闸门）
-  reject <id> [--notes "…"]            打回 spec，notes 追加进任务目录 reject_notes.md
   approve-scope <id>                   规模人闸（AWAIT_SCOPE_DECISION）：接受当前 spec 规模，
                                        挂起的 spec-verifier fail 入账继续修复循环，此后不再升闸
   reject-scope <id> [--notes "…"]      规模人闸：选择拆分 → 任务收箱（last_failure_type=scope_split），
@@ -960,7 +1400,8 @@ const USAGE = `用法：conductor <command>
   spy                                  只读查看 queue 任务的运行中角色与最近活动
   merge <id>                           人工终点闸门：合入分支、归档、清 worktree
   close <id>                           probe 终点闸门：调查报告固化进 dossier 后归档（无 merge）
-  retry <id> [--force]                 FAILED_BOX → READY（重置 miss，保留案卷）/ 清理崩溃标记；
+  retry <id> [--force]                 新任务：FAILED_BOX(fuse_no_progress|budget_exhausted|abandoned)
+                                       → ROUTING（案卷不动，保险丝连击复位）；旧任务 → READY（重置 miss）；
                                        限额收箱（rate_limited）的任务回到命中时的 stage，且必须在
                                        重置时刻之后（--force 可越过，会再次撞限额）
   retry --rate-limited [--force]       批量恢复 failed 箱里全部限额收箱的任务`;
@@ -983,7 +1424,7 @@ export async function main(argv = process.argv.slice(2)) {
   switch (cmd) {
     case 'run': await cmdRun(cfg); break;
     case 'new': cmdNew(cfg, opts); break;
-    case 'approve': await cmdApprove(cfg, opts._[0]); break;
+    case 'approve': await cmdApprove(cfg, opts._[0], opts); break;
     case 'approve-setup': await cmdApproveSetup(cfg, opts._[0]); break;
     case 'approve-feasibility': await cmdApproveFeasibility(cfg, opts._[0], opts.option, opts.notes); break;
     case 'reject-feasibility': await cmdRejectFeasibility(cfg, opts._[0], opts.notes); break;
@@ -994,6 +1435,8 @@ export async function main(argv = process.argv.slice(2)) {
     case 'spy': cmdSpy(cfg); break;
     case 'merge': await cmdMerge(cfg, opts._[0]); break;
     case 'close': await cmdClose(cfg, opts._[0]); break;
+    case 'resume': await cmdResume(cfg, opts._[0], opts); break;
+    case 'abandon': await cmdAbandon(cfg, opts._[0]); break;
     case 'retry': await cmdRetry(cfg, opts._[0], opts); break;
     default:
       console.error(USAGE);
