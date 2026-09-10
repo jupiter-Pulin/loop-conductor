@@ -98,6 +98,10 @@ function taskEntry(ts) {
     ...computeWorkingFlags(ts.box, stage),
     spentUsd: ts.runtime.spent_usd ?? 0,
     lastFailureType: ts.runtime.last_failure_type ?? null,
+    // 限额卡片在列表上就要说清「什么时候能恢复」（spec §限额：FAILED_BOX 卡片显示
+    // `限额 <type>，重置于 <本地时间>`）——只给一个 rate_limited 徽章，人得点进详情才知道
+    // 现在能不能按恢复。非限额失败恒 null，卡片上不出这一行。
+    rateLimit: ts.runtime.last_failure_type === 'rate_limited' ? (ts.runtime.rate_limit ?? null) : null,
   };
 }
 

@@ -103,6 +103,46 @@ test('laneForStage：与 wireframes.md 映射表逐项一致（AC-006）', () =>
   assert.deepEqual(LANE_ORDER, ['setup', 'feasibility', 'spec', 'maker', 'verify', 'merge']);
 });
 
+// ---- 限额卡片：列表上就说清「什么时候能恢复」（spec §限额） ----
+
+test('taskEntry：rate_limited 的 FAILED_BOX 卡片带 rateLimit（type/resets_at），其余失败类型为 null', async (t) => {
+  const root = mkroot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cfg = baseCfg(root);
+  ensureDirs(cfg);
+
+  const resetsAt = 1_800_000_000;
+  const rateLimit = { type: 'five_hour', resets_at: resetsAt, hit_at: resetsAt - 3600, resume_stage: 'ROUTING' };
+  writeNewTask(cfg.failedDir, baseTask('task-20260910-101'), baseRuntime('FAILED_BOX', {
+    last_failure_type: 'rate_limited', rate_limit: rateLimit,
+  }));
+  // 非限额失败：即便 runtime 里还留着上一次的 rate_limit 残值，也不渲染这一行。
+  writeNewTask(cfg.failedDir, baseTask('task-20260910-102'), baseRuntime('FAILED_BOX', {
+    last_failure_type: 'fuse_no_progress', rate_limit: rateLimit,
+  }));
+
+  const board = buildBoard(cfg);
+  const byId = Object.fromEntries(board.columns.find((c) => c.column === 'FAILED_BOX').tasks.map((e) => [e.id, e]));
+  assert.deepEqual(byId['task-20260910-101'].rateLimit, rateLimit);
+  assert.equal(byId['task-20260910-102'].rateLimit, null, '不是限额失败就不给限额面板数据');
+
+  // 卡片那一行文案与详情页、CLI retry 同一条规则（view.mjs::rateLimitPanel）。
+  const { rateLimitPanel } = await import('../../conductor/dashboard/static/view.mjs');
+  const panel = rateLimitPanel(byId['task-20260910-101'].rateLimit, resetsAt * 1000 - 1);
+  assert.match(panel.label, /^限额 five_hour，重置于 /);
+  assert.equal(panel.canResume, false);
+  assert.equal(rateLimitPanel(byId['task-20260910-102'].rateLimit), null);
+});
+
+test('列卡片渲染出限额重置那一行（AC-023 的看板面）', async () => {
+  const src = fs.readFileSync(path.join(STATIC_DIR, 'app.mjs'), 'utf8');
+  const card = src.slice(src.indexOf('function buildColumnCardNode'), src.indexOf('function buildCardNode'));
+  assert.match(card, /rateLimitPanel\(entry\.rateLimit\)/, '卡片要用同一份 rateLimitPanel 生成文案');
+  assert.match(card, /class: 'rate-limit', text: rateLimit\.label/);
+  // 卡片指纹要认得限额，否则「到点了」不会触发重渲染。
+  assert.match(src, /entry\.rateLimit\?\.resets_at/);
+});
+
 // ---- AC-007：needsHuman / working 判据 ----
 
 test('buildBoard：needsHuman 仅人审 stage 为 true，working 仅非人审推进 stage 为 true（AC-007）', (t) => {
@@ -146,7 +186,7 @@ test('buildBoard：needsHuman 仅人审 stage 为 true，working 仅非人审推
   // 契约字段齐全（AC-005 + 新状态机的列/闸别/遗留标记）
   assert.deepEqual(
     Object.keys(spec).sort(),
-    ['awaitingKind', 'box', 'column', 'id', 'kind', 'lane', 'lastFailureType', 'legacy', 'needsHuman', 'spentUsd', 'stage', 'title', 'working'].sort(),
+    ['awaitingKind', 'box', 'column', 'id', 'kind', 'lane', 'lastFailureType', 'legacy', 'needsHuman', 'rateLimit', 'spentUsd', 'stage', 'title', 'working'].sort(),
   );
 });
 

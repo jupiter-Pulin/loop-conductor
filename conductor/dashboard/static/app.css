@@ -144,6 +144,7 @@ main { padding: 0 28px 8px; }
 }
 .card .review-btn { margin-top: 8px; display: inline-block; font: var(--t-caption) var(--font-ui); font-weight: 700; color: var(--attn); }
 .card .working { margin-top: 8px; font: var(--t-caption) var(--font-ui); color: var(--ink-2); }
+.card .rate-limit { margin-top: 6px; font: var(--t-caption) var(--font-ui); color: var(--ink-2); }
 .spin { display: inline-block; animation: spin 1.4s linear infinite; }
 
 /* ---- 闲置泳道静默条 ---- */
