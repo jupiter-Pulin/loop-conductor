@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { setupProfileKey, setupProfilePaths, writeApprovedSetupProfile, hasApprovedSetupProfile } from '../../conductor/lib/profile.mjs';
+import { setupProfileKey, setupProfilePaths, readPrecommitProfile } from '../../conductor/lib/profile.mjs';
 import { taskCfg } from '../../conductor/stages/router-kernel.mjs';
 
 function tmpRoot(t) {
@@ -32,7 +32,7 @@ test('两个不同 targetRepo 路径派生出不同 profile key', (t) => {
   assert.notEqual(setupProfileKey(tcfgA), setupProfileKey(tcfgB));
 });
 
-test('各任务读写各自仓库的 profile，互不命中对方', (t) => {
+test('各任务读各自仓库的 profile，互不命中对方', (t) => {
   const root = tmpRoot(t);
   const cfg = { targetProfilesDir: path.join(root, 'target-profiles') };
   const repoA = path.join(root, 'repo-a');
@@ -40,16 +40,20 @@ test('各任务读写各自仓库的 profile，互不命中对方', (t) => {
   const tcfgA = taskCfg({ task: { targetRepo: repoA } }, { ...cfg, targetRepo: repoA });
   const tcfgB = taskCfg({ task: { targetRepo: repoB } }, { ...cfg, targetRepo: repoB });
 
-  writeApprovedSetupProfile(tcfgA, { markdown: '# Setup A\n', sourceTaskId: 'task-a' });
-  assert.equal(hasApprovedSetupProfile(tcfgA), true);
-  assert.equal(hasApprovedSetupProfile(tcfgB), false, '仓库 B 未审批，不该被仓库 A 的审批带过');
-
-  writeApprovedSetupProfile(tcfgB, { markdown: '# Setup B\n', sourceTaskId: 'task-b' });
-  assert.equal(hasApprovedSetupProfile(tcfgB), true);
-
   const pathsA = setupProfilePaths(tcfgA);
   const pathsB = setupProfilePaths(tcfgB);
-  assert.notEqual(pathsA.dir, pathsB.dir);
-  assert.equal(fs.readFileSync(pathsA.approved, 'utf8'), '# Setup A\n');
-  assert.equal(fs.readFileSync(pathsB.approved, 'utf8'), '# Setup B\n');
+  assert.notEqual(pathsA.dir, pathsB.dir, '两个仓库各有自己的 profile 目录');
+
+  // profile 是人手写的：这里直接落盘 A 仓的 precommit 段，B 仓什么都不配。
+  fs.mkdirSync(pathsA.dir, { recursive: true });
+  fs.writeFileSync(pathsA.meta, `${JSON.stringify({
+    schema_version: 1, profile_key: pathsA.key, targetRepo: repoA, precommit: { unit: 'forge test' },
+  }, null, 2)}\n`);
+
+  const readMeta = (p) => (fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf8')) : null);
+  assert.equal(readPrecommitProfile(readMeta(pathsA.meta)).unit, 'forge test');
+  assert.equal(readMeta(pathsB.meta), null, '仓库 B 没配 profile，不该被仓库 A 的带过');
+  assert.equal(readPrecommitProfile(readMeta(pathsB.meta)).unit, null);
+  // 任务快照的 testCommand 才是 B 仓 unit 的回落来源。
+  assert.equal(readPrecommitProfile(readMeta(pathsB.meta), { testCommand: 'node --test' }).unit, 'node --test');
 });
