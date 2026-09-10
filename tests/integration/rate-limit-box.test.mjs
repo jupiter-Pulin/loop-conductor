@@ -55,6 +55,26 @@ test('AC-021: maker spawn 撞限额 → FAILED_BOX(rate_limited) + runtime.rate_
   assert.equal(rl.resume_stage, 'ROUTING');
 });
 
+test('AC-021: eventsLogEnabled 缺省（false）时 rate_limited 事件照样落 events.jsonl', (t) => {
+  // 收箱理由是内核对人与 dashboard 的固定交代（案卷布局表列了 `rate_limited`），不是可选观测：
+  // 观测开关关着时它仍必须在 events.jsonl 里，否则「为什么进箱、什么时候能恢复」只剩 timeline 散文。
+  const { env, id } = newRouterEnv(t, { config: { eventsLogEnabled: false } });
+  const resetsAt = nowSec() + 2 * HOUR;
+  env.setScenario([routerStep('maker'), rateLimitStep(resetsAt)]);
+
+  const run = env.run('run');
+  assert.equal(run.status, 0, run.stderr);
+  assert.equal(env.findTask(id).runtime.last_failure_type, 'rate_limited');
+
+  const events = readEvents(env, id);
+  const rl = events.find((e) => e.type === 'rate_limited');
+  assert.ok(rl, '开关关着也要写 rate_limited 事件');
+  assert.equal(rl.limit_type, 'five_hour');
+  assert.equal(rl.resets_at, resetsAt);
+  // 对照组：`stage` 事件归 eventsLogEnabled 管，本用例确实处在开关关闭的分支上。
+  assert.equal(events.some((e) => e.type === 'stage'), false, 'stage 事件仍受观测开关约束');
+});
+
 test('AC-021: 同一次 run 内其余任务不再 spawn，stage 不变并记 spawn skipped', (t) => {
   const env = routerEnv(t, { config: { maxConcurrentTasks: 1 } });
   const hit = 'task-20260830-402';

@@ -160,8 +160,10 @@ export function rateLimitedToBox(ts, cfg, role, res) {
   const resumeStage = ts.runtime.stage;
   markRunRateLimited(cfg, resetsAt);
   state.appendTimeline(cfg, ts.id, `${role} spawn 命中限额（${type ?? 'unknown'}），重置于 ${iso}`);
-  // 字段名不能叫 `type`：appendEvent 以 `{ts, type, ...fields}` 展开，会把事件类型顶掉。
-  state.appendEvent(cfg, ts.id, 'rate_limited', {
+  // 字段名不能叫 `type`：事件以 `{ts, type, ...fields}` 展开，会把事件类型顶掉。
+  // appendEventAlways：限额是内核对人与 dashboard 的固定交代（案卷布局表列了 `rate_limited`），
+  // 不是 `eventsLogEnabled` 管的可选观测——开关关着也必须落盘，否则收箱理由只剩 timeline 散文。
+  state.appendEventAlways(cfg, ts.id, 'rate_limited', {
     role, limit_type: type, resets_at: resetsAt, resume_stage: resumeStage,
   });
   return failToBox(ts, cfg, `rate limited (${type ?? 'unknown'})，重置于 ${iso}`, 'rate_limited', {
