@@ -3,6 +3,9 @@
 // 按调用序消费 FAKE_CLAUDE_SCRIPT（JSON 数组），每步可：
 //   actions: [{type:'writeFile', path, content}]  在 cwd（即任务 worktree）落盘文件
 //            [{type:'deleteFile', path}]          在 cwd 删除文件（对抗性删测试场景）
+//            [{type:'rateLimit', resets_at, rate_limit_type}]
+//                                                 发一条 rejected rate_limit_event + is_error result
+//                                                 后非零退出（五小时/周限额，真实末三行形状）
 //   exitCode: 非零则报错退出（模拟 CLI 失败 / resume 失效）
 //   exitCodeAfterResult: 先照常发 result 事件再以该码退出（模拟 error_max_turns：CLI 留下
 //                        subtype=error_max_turns 的 result 事件后 exit 1）
@@ -46,6 +49,41 @@ for (const a of step.actions ?? []) {
     fs.writeFileSync(p, a.content);
   } else if (a.type === 'deleteFile') {
     fs.rmSync(path.resolve(process.cwd(), a.path), { force: true });
+  } else if (a.type === 'rateLimit') {
+    // 五小时/周限额：形状照抄 dossier/task-20260829-002/maker-r1.stream.jsonl 的末三行
+    // （rejected rate_limit_event → 合成 assistant 报错消息 → is_error 的 result 后非零退出）。
+    const sid = step.session_id ?? `fake-sess-${n}`;
+    const resultText = a.text ?? "You've hit your session limit · resets 1:40pm (Asia/Singapore)";
+    await writeEvent({
+      type: 'rate_limit_event',
+      rate_limit_info: {
+        status: 'rejected',
+        resetsAt: a.resets_at ?? a.resetsAt ?? 0,
+        rateLimitType: a.rate_limit_type ?? a.rateLimitType ?? 'five_hour',
+        overageStatus: 'rejected',
+        overageDisabledReason: 'org_level_disabled',
+        isUsingOverage: false,
+      },
+      session_id: sid,
+    });
+    await writeEvent({
+      type: 'assistant',
+      message: { role: 'assistant', model: '<synthetic>', content: [{ type: 'text', text: resultText }] },
+      session_id: sid,
+      error: 'rate_limit',
+      is_api_error_message: true,
+    });
+    await writeEvent({
+      type: 'result',
+      subtype: 'success',
+      is_error: true,
+      api_error_status: 429,
+      num_turns: 1,
+      session_id: sid,
+      total_cost_usd: step.cost ?? 0,
+      result: resultText,
+    });
+    process.exit(a.exitCode ?? 1);
   } else {
     console.error(`fake-claude: unknown action type ${a.type}`);
     process.exit(2);

@@ -8,7 +8,7 @@ import { specContractInvalidNext } from './decisions.mjs';
 import {
   accountSpawnCost, budgetExceeded, buildSpecAgentPrompt, failToBox,
   finishSpawnRecord, nextRoleRound, runSpecContractGate, SPEC_AGENT_TOOLS,
-  startSpawnRecord, writeSpecAgentSettings, canStartSpawn, acquireSpecChainCwd,
+  startSpawnRecord, writeSpecAgentSettings, canStartSpawn, acquireSpecChainCwd, rateLimitedToBox,
 } from './shared.mjs';
 
 export default async function specFixingHandler(ts, cfg) {
@@ -44,6 +44,8 @@ export default async function specFixingHandler(ts, cfg) {
   }
   finishSpawnRecord(rec, res);
   accountSpawnCost(ts, cfg, 'spec-agent', round, res);
+  const limited = rateLimitedToBox(ts, cfg, 'spec-agent', res);
+  if (limited) return limited; // 限额：进箱等人在 resets_at 后 retry
   if (!res.ok) {
     state.saveRuntime(ts);
     state.appendTimeline(cfg, id, `spec-agent repair failed: ${res.error ?? 'unknown'}`);

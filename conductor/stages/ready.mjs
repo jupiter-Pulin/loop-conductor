@@ -16,7 +16,7 @@ import { isEnvFailureSignature } from '../lib/failure-signature.mjs';
 import {
   worktreePath, runGreenGate, writeGreenGateResult, runTestGateProbe,
   buildRepairContext, writeRepairContext, readGreenGateSignatures,
-  runMakerRound, buildMakerColdPrompt, ensureDossierSpec, budgetExceeded, failToBox,
+  runMakerRound, buildMakerColdPrompt, ensureDossierSpec, budgetExceeded, failToBox, rateLimitedToBox,
   HARNESS_ARTIFACTS, canStartSpawn, resolveGateCommandsForTask, runGateCommands,
   recoverCrashedMakerRound,
 } from './shared.mjs';
@@ -59,6 +59,8 @@ export default async function readyHandler(ts, cfg) {
     ts.runtime.verifier_invalid_count = 0; // 新 maker 轮：重置 verifier 协议失败计数
     const prompt = buildMakerColdPrompt(ts, cfg, round);
     const res = await runMakerRound(ts, cfg, round, { mode: 'cold', prompt, wt });
+    const limited = rateLimitedToBox(ts, cfg, 'maker', res);
+    if (limited) return limited; // 限额：不跑绿门、不计 miss，进箱等人在 resets_at 后 retry
     if (res?.retriesExhausted) {
       // maker spawn 瞬态重试耗尽（基础设施失败，非 maker 可行动失败）：
       // 保留旧行为，直接收箱，不跑 green gate、不进 miss 阶梯（契约 §15）。

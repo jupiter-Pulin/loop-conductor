@@ -12,7 +12,7 @@ import {
 import {
   accountSpawnCost, archiveSpecDraft, budgetExceeded, buildSpecVerifierPrompt, failToBox,
   finishSpawnRecord, renderSpecVerifyReport, SPEC_TOOLS, startSpawnRecord, writeSpecRepairContext, canStartSpawn,
-  acquireSpecChainCwd,
+  acquireSpecChainCwd, rateLimitedToBox,
 } from './shared.mjs';
 
 export default async function specVerifyHandler(ts, cfg) {
@@ -78,6 +78,8 @@ export default async function specVerifyHandler(ts, cfg) {
   accountSpawnCost(ts, cfg, 'spec-verifier', round, res);
   state.saveRuntime(ts);
 
+  const limited = rateLimitedToBox(ts, cfg, 'spec-verifier', res);
+  if (limited) return limited; // 限额：进箱等人在 resets_at 后 retry
   if (!res.ok) {
     // 基建失败：不是 spec-verifier 的协议失败，不计 invalid、不动 spec_verifier_invalid_count，
     // 留在 SPEC_VERIFY 下次 run 重 spawn。

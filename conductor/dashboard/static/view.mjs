@@ -116,3 +116,24 @@ export function parseRouteHash(hash) {
   if (hash === '#/metrics') return { view: 'metrics' };
   return { view: 'board' };
 }
+
+/**
+ * 限额收箱卡片（AC-023）：runtime.rate_limit → { type, resetsAtMs, resetText, canResume }。
+ * `canResume` 是「恢复」按钮的唯一开关，与 CLI `retry` 同一条规则——必须到达重置时刻之后；
+ * `resets_at` 缺失（CLI 没给时刻）时不把人锁死，允许恢复。传 null 返回 null（非限额失败）。
+ */
+export function rateLimitPanel(rateLimit, nowMs = Date.now()) {
+  if (!rateLimit) return null;
+  const resetsAt = typeof rateLimit.resets_at === 'number' && Number.isFinite(rateLimit.resets_at)
+    ? rateLimit.resets_at
+    : null;
+  const resetsAtMs = resetsAt == null ? null : resetsAt * 1000;
+  const resetText = resetsAtMs == null ? '未知' : new Date(resetsAtMs).toLocaleString();
+  return {
+    type: rateLimit.type || 'unknown',
+    resetsAtMs,
+    resetText,
+    canResume: resetsAtMs == null || nowMs >= resetsAtMs,
+    label: `限额 ${rateLimit.type || 'unknown'}，重置于 ${resetText}`,
+  };
+}

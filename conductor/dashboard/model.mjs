@@ -285,7 +285,14 @@ function buildReview(cfg, ts, stage) {
   if (stage === 'AWAIT_SCOPE_DECISION') return buildScopeReview(cfg, ts.id);
   if (stage === 'AWAIT_HUMAN_MERGE') return buildMergeReview(cfg, ts);
   if (ts.box === 'failed') {
-    return { kind: 'failed', lastFailureType: ts.runtime.last_failure_type ?? null, verdict: buildVerdictPanel(cfg, ts.id) };
+    return {
+      kind: 'failed',
+      lastFailureType: ts.runtime.last_failure_type ?? null,
+      // 限额收箱：卡片要显示限额类型与重置时刻，「恢复」按钮在 resets_at 之前 disabled
+      // （按钮语义等同 CLI retry；没有任何路径在无人操作时把它搬出 FAILED_BOX）。
+      rateLimit: ts.runtime.last_failure_type === 'rate_limited' ? (ts.runtime.rate_limit ?? null) : null,
+      verdict: buildVerdictPanel(cfg, ts.id),
+    };
   }
   if (ts.box === 'done') return { kind: 'done', verdict: buildVerdictPanel(cfg, ts.id) };
   return { kind: 'info', stage };

@@ -8,7 +8,7 @@ import { taskCfg } from '../lib/task-cfg.mjs';
 import * as state from '../lib/state.mjs';
 import {
   accountSpawnCost, budgetExceeded, buildSetupPrompt, entryStageAfterSetup, failToBox,
-  finishSpawnRecord, nextRoleRound, READONLY_TOOLS, startSpawnRecord, canStartSpawn,
+  finishSpawnRecord, nextRoleRound, READONLY_TOOLS, startSpawnRecord, canStartSpawn, rateLimitedToBox,
 } from './shared.mjs';
 
 const setupLocks = new Map();
@@ -64,6 +64,8 @@ export default async function needsTargetSetupHandler(ts, cfg) {
     finishSpawnRecord(rec, res);
     accountSpawnCost(ts, cfg, 'setup', round, res);
     state.saveRuntime(ts);
+    const limited = rateLimitedToBox(ts, cfg, 'setup', res);
+    if (limited) return limited; // 限额：进箱等人在 resets_at 后 retry
     if (!res.ok || !res.result?.trim()) {
       state.appendTimeline(cfg, id, `setup-agent failed: ${res.error ?? 'empty result'}`);
       console.error(`[${id}] setup-agent 失败（${res.error ?? 'empty result'}），任务停留在 NEEDS_TARGET_SETUP`);

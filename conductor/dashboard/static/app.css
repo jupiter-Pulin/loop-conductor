@@ -306,6 +306,10 @@ summary:hover { background: var(--surface-hover); }
   background: var(--fail-bg); border: 1px solid var(--fail); color: var(--fail); padding: 10px 14px;
   border-radius: 12px; font: var(--t-caption) var(--font-ui); margin-bottom: 16px;
 }
+/* 限额收箱说明：类型 + 本地重置时刻；到点前「恢复」按钮 disabled。 */
+.rate-limit-note {
+  margin-top: 8px; color: var(--ink-2); font: var(--t-caption) var(--font-data);
+}
 
 /* ---- 裁决 chip（pass/fail/unknown，颜色 + 符号 + 文字，§7 可达性） ---- */
 .chip {

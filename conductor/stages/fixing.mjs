@@ -13,7 +13,7 @@ import {
   worktreePath, runGreenGate, writeGreenGateResult, runTestGateProbe,
   buildRepairContext, writeRepairContext, readGreenGateSignatures,
   runMakerRound, buildMakerColdPrompt, buildMakerRepairPrompt,
-  budgetExceeded, failToBox, HARNESS_ARTIFACTS, canStartSpawn,
+  budgetExceeded, failToBox, rateLimitedToBox, HARNESS_ARTIFACTS, canStartSpawn,
   resolveGateCommandsForTask, runGateCommands, recoverCrashedMakerRound,
 } from './shared.mjs';
 
@@ -57,6 +57,8 @@ export default async function fixingHandler(ts, cfg) {
     const coldPrompt = buildMakerColdPrompt(ts, cfg, round, { fullDossier: true });
     const prompt = mode === 'resume' ? buildMakerRepairPrompt(ts, cfg, round) : coldPrompt;
     const res = await runMakerRound(ts, cfg, round, { mode, prompt, coldPrompt, wt });
+    const limited = rateLimitedToBox(ts, cfg, 'maker', res);
+    if (limited) return limited; // 限额：不跑绿门、不计 miss，进箱等人在 resets_at 后 retry
     if (res?.retriesExhausted) {
       // maker spawn 瞬态重试耗尽（基础设施失败）：直接收箱，不跑 green gate、不进 miss 阶梯（契约 §15）。
       return failToBox(ts, cfg, `maker spawn 瞬态重试耗尽 (r${round})`, 'spawn_transient_exhausted');
