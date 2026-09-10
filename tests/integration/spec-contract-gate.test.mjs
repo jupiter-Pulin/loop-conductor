@@ -79,6 +79,43 @@ test('契约门 fail：事件 spec_invalid、不开闸、留在 ROUTING 交 rout
   assert.equal(after.runtime.spec_approved, false);
 });
 
+test('spec 闸打回即销草稿：下一轮 spec 没写文件 → spec_invalid，不拿旧稿重开闸', (t) => {
+  const { env, id } = newRouterEnv(t);
+  const specAbs = path.join(env.root, 'specs', `${id}.md`);
+  env.setScenario([routerStep('spec'), specStep(GOOD_SPEC, { specPath: specAbs })]);
+  assert.equal(env.run('run').status, 0);
+  assert.equal(env.findTask(id).runtime.awaiting.kind, 'spec');
+
+  assert.equal(env.run('reject', id, '--notes', 'AC-001 是套话，换成可观察行为').status, 0);
+  assert.equal(fs.existsSync(specAbs), false, '打回后草稿不再在原位');
+  const archived = fs.readdirSync(path.join(env.root, 'specs', 'archive')).filter((n) => n.startsWith(`${id}-rejected-`));
+  assert.equal(archived.length, 1, '归档不删：被否掉的那一版仍可追');
+  assert.equal(fs.readFileSync(path.join(env.root, 'specs', 'archive', archived[0]), 'utf8'), GOOD_SPEC);
+
+  env.appendScenario([
+    // r2：spec-agent 崩在写文件之前（只写了 log）。内核没有旧稿可拿，只能记 spec_invalid。
+    routerStep('spec', { summary: '按 notes 重写' }),
+    { cost: 0.05, actions: [{ type: 'writeLog', content: { role: 'spec', outcome: 'ok', summary: '写完了（其实没写）' } }], result: 'ok' },
+    // r3：草稿没了也不等于「本任务没出过 spec」——maker 仍被 spec 人闸挡住。
+    routerStep('maker', { summary: '直接实现' }),
+    // r4：停在 help 闸，让 drain 有个终点。
+    routerStep('human', { summary: 'spec 连着两轮没写出来，请人裁决' }),
+  ]);
+  assert.equal(env.run('run').status, 0);
+
+  const invalid = env.events(id).filter((e) => e.type === 'spec_invalid');
+  assert.equal(invalid.length, 1, '没写文件的那一轮记一条 spec_invalid');
+  assert.equal(invalid[0].round, 2);
+  const specGates = env.events(id).filter((e) => e.type === 'human_gate_opened' && e.kind === 'spec');
+  assert.equal(specGates.length, 1, '只有 r1 那一次开过 spec 闸，被打回的草稿没有再开第二次');
+  assert.equal(env.findTask(id).runtime.spec_approved, false);
+
+  const rejectedAction = env.events(id).filter((e) => e.type === 'action_rejected');
+  assert.equal(rejectedAction.length, 1);
+  assert.match(rejectedAction[0].reason, /曾产出 spec/);
+  assert.equal(env.findTask(id).runtime.awaiting.kind, 'help');
+});
+
 test('送不送人审只看文件：log 说 needs_human 但文件合格，照样开闸', (t) => {
   const { env, id } = newRouterEnv(t);
   const specAbs = path.join(env.root, 'specs', `${id}.md`);
