@@ -762,6 +762,19 @@ function isRateLimitedTask(ts) {
 }
 
 /**
+ * failed → queue 的目录搬回。`transitionState` 只负责「写 stage + 向 failed/done 归档」，
+ * 回程（人把任务放回 queue）由它的调用方补——两处 retry 共用这一份，免得各写一份 rename。
+ */
+function moveBackToQueue(cfg, ts) {
+  const dest = state.taskDir(cfg.queueDir, ts.id);
+  if (dest === ts.dir) return;
+  fs.mkdirSync(cfg.queueDir, { recursive: true });
+  fs.renameSync(ts.dir, dest);
+  ts.dir = dest;
+  ts.box = 'queue';
+}
+
+/**
  * 限额恢复（契约 §限额）：`now < resets_at` 拒绝（打印本地重置时刻，exit 非 0，--force 越过）；
  * 到点则回到命中时所在 stage（runtime.rate_limit.resume_stage），**不归档任何轮次产物、
  * 不重置任何计数**——限额不是任务的失败，产物与进度原样接着用。
@@ -780,15 +793,12 @@ function applyRateLimitRetry(cfg, ts, { force = false } = {}) {
     return false;
   }
   const stage = rl.resume_stage ?? 'ROUTING';
-  Object.assign(ts.runtime, { stage, last_failure_type: null, rate_limit: null });
-  state.saveRuntime(ts);
-  const dest = state.taskDir(cfg.queueDir, id);
-  fs.mkdirSync(cfg.queueDir, { recursive: true });
-  fs.renameSync(ts.dir, dest);
-  ts.dir = dest;
-  ts.box = 'queue';
   const forced = force && resetsAt != null && nowSec < resetsAt ? '（--force 越过重置时刻）' : '';
-  state.appendTimeline(cfg, id, `human retry：限额恢复 → ${stage}${forced}，无产物归档、计数不变`);
+  state.transitionState(ts, cfg, stage, `human retry：限额恢复${forced}，无产物归档、计数不变`, {
+    last_failure_type: null,
+    rate_limit: null,
+  });
+  moveBackToQueue(cfg, ts);
   console.log(`${id} 已重回 queue（stage=${stage}），限额已恢复${forced}；执行 \`conductor run\` 继续`);
   return true;
 }
@@ -803,19 +813,18 @@ const ROUTER_RETRY_TYPES = new Set(['fuse_no_progress', 'budget_exhausted', 'aba
 function applyRouterRetry(cfg, ts) {
   const id = ts.id;
   const from = ts.runtime.last_failure_type;
+  const resetRound = (ts.runtime.current_round ?? 0) + 1;
   writeRouterState(cfg, id, {
     failures: [],
     last_action_rejected: null,
-    fuse_reset_round: (ts.runtime.current_round ?? 0) + 1,
+    fuse_reset_round: resetRound,
   });
-  Object.assign(ts.runtime, { stage: 'ROUTING', last_failure_type: null, awaiting: null, rate_limit: null });
-  state.saveRuntime(ts);
-  const dest = state.taskDir(cfg.queueDir, id);
-  fs.mkdirSync(cfg.queueDir, { recursive: true });
-  fs.renameSync(ts.dir, dest);
-  ts.dir = dest;
-  ts.box = 'queue';
-  state.appendTimeline(cfg, id, `human retry：FAILED_BOX(${from}) → ROUTING，案卷保留，保险丝连击从 r${(ts.runtime.current_round ?? 0) + 1} 重新计`);
+  state.transitionState(
+    ts, cfg, 'ROUTING',
+    `human retry：FAILED_BOX(${from}) → ROUTING，案卷保留，保险丝连击从 r${resetRound} 重新计`,
+    { last_failure_type: null, awaiting: null, rate_limit: null },
+  );
+  moveBackToQueue(cfg, ts);
   console.log(`${id} 已重回 queue（stage=ROUTING，${from} 已恢复，案卷未动）`);
   if ((ts.runtime.spent_usd ?? 0) >= cfg.budgetUsd) {
     console.error(
