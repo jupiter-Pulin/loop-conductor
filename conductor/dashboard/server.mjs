@@ -213,9 +213,9 @@ function handleEvents(req, res, changeBus) {
   res.on('error', cleanup);
 }
 
-// ---- merge/retry 异步 job（P4-G4/AC-009/010/011）：立即 202+jobId，job 只存内存，完成后经 SSE 推 job 事件。 ----
+// ---- retry 异步 job（P4-G4/AC-009/010/011）：立即 202+jobId，job 只存内存，完成后经 SSE 推 job 事件。 ----
 
-const ASYNC_ACTIONS = ['merge', 'retry'];
+const ASYNC_ACTIONS = ['retry'];
 const jobs = new Map(); // jobId -> { id, action, taskId, state:'running'|'ok'|'fail', message }
 const runningJobKeys = new Set(); // `${taskId}:${action}`，同任务同动作互斥
 let jobSeq = 0;
@@ -242,7 +242,7 @@ function startJob(cfg, action, id, changeBus, autoRun) {
     job.state = result.exitCode === 0 ? 'ok' : 'fail';
     job.message = formatCliMessage(result);
     runningJobKeys.delete(key);
-    // merge 历来不触发后台 run（committer 舞步已在 conductor 内完成推进）；仅 retry 沿用旧同步语义。
+    // retry 把任务放回 ROUTING，接着就该有人推它一把——这里替人点那一下。
     if (job.state === 'ok' && autoRun && action === 'retry') spawnDetachedConductor(['run']);
     changeBus.broadcastJob(job);
   });

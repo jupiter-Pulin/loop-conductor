@@ -9,7 +9,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
-import { makeEnv, REPO_ROOT, FAKE_CLAUDE, verifierStep } from '../helpers/env.mjs';
+import { makeEnv, REPO_ROOT, FAKE_CLAUDE } from '../helpers/env.mjs';
 import { makerStep, newRouterEnv, reviewerStep, routerStep, specStep } from '../helpers/router-env.mjs';
 import { FIXED_STATS } from '../helpers/target-fixture.mjs';
 import { loadCfg } from '../../conductor/conductor.mjs';
@@ -679,94 +679,86 @@ test('P4-AC-008: GET /api/task/:id/stream-tail 非法 id 400；任务/文件缺�
   assert.deepEqual(okRes.body, { lines: ['hello from stream tail'] });
 });
 
-// ---- AC-013/AC-014：六个同步动作 argv 透传 + 非零退出/锁忙以 200+ok:false 呈现 ----
+// ---- AC-013/AC-014：四个同步动作 argv 透传 + 非零退出/锁忙以 200+ok:false 呈现 ----
 
-test('AC-013/AC-014: 五个同步动作 spawn CLI 并同步回传；retry 已 job 化（P4-AC-014③）；非法 option 与锁忙均 200 且 ok:false', async (t) => {
-  const env = makeEnv(t);
+/** 驱动一个任务到指定人闸，返回 id。gate ∈ {spec, merge, help}。 */
+function driveToGate(env, id, gate) {
+  const specBody = ['# spec 草稿', '', '## 验收标准', '', '- AC-001: `node --test` 全绿', ''].join('\n');
+  if (gate === 'spec') {
+    env.setScenario([routerStep('spec'), specStep(specBody, { specPath: path.join(env.root, 'specs', `${id}.md`) })]);
+  } else if (gate === 'merge') {
+    env.setScenario([
+      routerStep('maker'), makerStep(),
+      routerStep('review'), reviewerStep(),
+      routerStep('precommit', { tier: 'unit' }),
+      routerStep('merge'),
+    ]);
+  } else {
+    env.setScenario([routerStep('human', { summary: '请人裁决' })]);
+  }
+  const run = env.run('run');
+  assert.equal(run.status, 0, run.stderr);
+  assert.equal(env.findTask(id).runtime.awaiting.kind, gate);
+}
+
+test('AC-013/AC-014: 四个同步动作 spawn CLI 并同步回传；retry 已 job 化（P4-AC-014③）；遗留任务与锁忙均 200 且 ok:false', async (t) => {
+  const { env, id: specId } = newRouterEnv(t);
   const cfg = loadCfg(env.root);
-
-  const approveId = 'task-20260705-140';
-  env.writeTask(approveId, { stage: 'AWAIT_SPEC_APPROVAL' });
-
-  const rejectId = 'task-20260705-141';
-  env.writeTask(rejectId, { stage: 'AWAIT_SPEC_APPROVAL' });
-
-  const feasApproveId = 'task-20260705-142';
-  const feasApproveDir = env.writeTask(feasApproveId, { kind: 'feature', stage: 'AWAIT_FEASIBILITY_APPROVAL' });
-  fs.writeFileSync(path.join(feasApproveDir, 'feasibility-study.md'), FEASIBILITY_MD);
-
-  const feasInvalidId = 'task-20260705-143';
-  const feasInvalidDir = env.writeTask(feasInvalidId, { kind: 'feature', stage: 'AWAIT_FEASIBILITY_APPROVAL' });
-  fs.writeFileSync(path.join(feasInvalidDir, 'feasibility-study.md'), FEASIBILITY_MD);
-
-  const feasRejectId = 'task-20260705-144';
-  const feasRejectDir = env.writeTask(feasRejectId, { kind: 'feature', stage: 'AWAIT_FEASIBILITY_APPROVAL' });
-  fs.writeFileSync(path.join(feasRejectDir, 'feasibility-study.md'), FEASIBILITY_MD);
-
-  const setupId = 'task-20260705-145';
-  env.writeTask(setupId, { stage: 'AWAIT_SETUP_APPROVAL' });
-  const draftPaths = setupProfilePaths(cfg);
-  fs.mkdirSync(draftPaths.dir, { recursive: true });
-  fs.writeFileSync(draftPaths.draft, '# Setup Profile Draft\n');
-
-  const retryId = 'task-20260705-146';
-  env.writeTask(retryId, { stage: 'READY' });
-
-  const busyId = 'task-20260705-147';
-  env.writeTask(busyId, { stage: 'AWAIT_SPEC_APPROVAL' });
+  driveToGate(env, specId, 'spec');
 
   const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
 
-  const approveRes = await postJson(srv.baseUrl, `/api/task/${approveId}/approve`, {});
+  // approve：spec 闸冻结 → ROUTING
+  const approveRes = await postJson(srv.baseUrl, `/api/task/${specId}/approve`, { notes: '按最小改动做' });
   assert.equal(approveRes.status, 200);
   assert.deepEqual(Object.keys(approveRes.body).sort(), ['exitCode', 'message', 'ok'].sort());
   assert.equal(approveRes.body.ok, true);
   assert.equal(approveRes.body.exitCode, 0);
-  assert.match(approveRes.body.message, /approval=approved/);
-  assert.equal(env.findTask(approveId).runtime.approval, 'approved');
+  assert.match(approveRes.body.message, /spec 已冻结/);
+  assert.equal(env.findTask(specId).runtime.spec_approved, true);
 
-  const rejectRes = await postJson(srv.baseUrl, `/api/task/${rejectId}/reject`, { notes: '需要更清晰的验证方式' });
+  // resume：help 闸恢复；notes 透传成 --notes
+  env.appendScenario([routerStep('human', { summary: '再问一次别的' })]);
+  assert.equal(env.run('run').status, 0);
+  const resumeRes = await postJson(srv.baseUrl, `/api/task/${specId}/resume`, { notes: '我在 worktree 里改好了' });
+  assert.equal(resumeRes.body.ok, true);
+  assert.match(resumeRes.body.message, /→ ROUTING/);
+  const humanRecord = env.readJson(env.dossier(specId, 'human-r2.json'));
+  assert.equal(humanRecord.decision, 'resumed');
+  assert.equal(humanRecord.notes, '我在 worktree 里改好了');
+
+  // reject：必须带 notes，缺了就是 CLI 非零退出（200 + ok:false）
+  const { env: env2, id: rejectId } = newRouterEnv(t);
+  driveToGate(env2, rejectId, 'spec');
+  const srv2 = await startDashboard(t, env2, ['--port', '0', '--no-auto-run']);
+  const noNotes = await postJson(srv2.baseUrl, `/api/task/${rejectId}/reject`, {});
+  assert.equal(noNotes.status, 200, 'CLI 非零退出也应 200，而非 5xx');
+  assert.equal(noNotes.body.ok, false);
+  assert.equal(noNotes.body.exitCode, 1);
+  assert.match(noNotes.body.message, /--notes/);
+  const rejectRes = await postJson(srv2.baseUrl, `/api/task/${rejectId}/reject`, { notes: '验证方式写得不清楚' });
   assert.equal(rejectRes.body.ok, true);
-  assert.match(rejectRes.body.message, /approval=rejected/);
-  const rejectNotes = fs.readFileSync(path.join(env.root, 'state', 'queue', rejectId, 'reject_notes.md'), 'utf8');
-  assert.match(rejectNotes, /需要更清晰的验证方式/);
+  assert.match(rejectRes.body.message, /已打回/);
+  assert.equal(env2.findTask(rejectId).runtime.stage, 'ROUTING');
 
-  const feasApproveRes = await postJson(srv.baseUrl, `/api/task/${feasApproveId}/approve-feasibility`, { option: 'O-B', notes: '按 O-B 走' });
-  assert.equal(feasApproveRes.body.ok, true);
-  assert.match(feasApproveRes.body.message, /feasibility_approval=approved/);
-  assert.match(feasApproveRes.body.message, /option=O-B/);
-  const feasApproved = env.findTask(feasApproveId);
-  assert.equal(feasApproved.runtime.chosen_option, 'O-B');
-  assert.equal(feasApproved.runtime.feasibility_decision_notes, '按 O-B 走');
+  // abandon：queue 任务 → FAILED_BOX(abandoned)
+  const abandonRes = await postJson(srv2.baseUrl, `/api/task/${rejectId}/abandon`, {});
+  assert.equal(abandonRes.body.ok, true);
+  assert.equal(env2.findTask(rejectId).runtime.last_failure_type, 'abandoned');
 
-  const feasInvalidRes = await postJson(srv.baseUrl, `/api/task/${feasInvalidId}/approve-feasibility`, { option: 'O-Z' });
-  assert.equal(feasInvalidRes.status, 200, 'CLI 非零退出也应 200，而非 5xx');
-  assert.equal(feasInvalidRes.body.ok, false);
-  assert.equal(feasInvalidRes.body.exitCode, 1);
-  assert.match(feasInvalidRes.body.message, /不在草稿枚举/);
-  assert.notEqual(env.findTask(feasInvalidId).runtime.feasibility_approval, 'approved', '拒绝后任务保持原状');
-
-  const feasRejectRes = await postJson(srv.baseUrl, `/api/task/${feasRejectId}/reject-feasibility`, { notes: '证据不足' });
-  assert.equal(feasRejectRes.body.ok, true);
-  assert.match(feasRejectRes.body.message, /feasibility_approval=rejected/);
-  const feasRejectNotes = fs.readFileSync(path.join(feasRejectDir, 'feasibility_reject_notes.md'), 'utf8');
-  assert.match(feasRejectNotes, /证据不足/);
-
-  const setupRes = await postJson(srv.baseUrl, `/api/task/${setupId}/approve-setup`, {});
-  assert.equal(setupRes.body.ok, true);
-  assert.match(setupRes.body.message, /setup_approval=approved/);
-
-  const retryJobRes = await postJson(srv.baseUrl, `/api/task/${retryId}/retry`, {});
+  // retry 是 job 化的异步动作：立即 202，终态经 /api/jobs 查
+  const retryJobRes = await postJson(srv2.baseUrl, `/api/task/${rejectId}/retry`, {});
   assert.equal(retryJobRes.status, 202, 'retry 应立即 202，不再同步等待（P4-AC-014③）');
   assert.ok(retryJobRes.body.jobId && typeof retryJobRes.body.jobId === 'string');
-  const retryJob = await waitForJobTerminal(srv.baseUrl, retryJobRes.body.jobId);
+  const retryJob = await waitForJobTerminal(srv2.baseUrl, retryJobRes.body.jobId);
   assert.equal(retryJob.state, 'ok');
-  assert.equal(env.findTask(retryId).runtime.stage, 'READY');
+  assert.equal(env2.findTask(rejectId).runtime.stage, 'ROUTING');
 
-  const lock = tryAcquireTaskLock(cfg, busyId);
+  // 锁忙：per-task 锁被别人持有时 200 + ok:false，任务不动
+  const lock = tryAcquireTaskLock(cfg, specId);
   assert.equal(lock.acquired, true);
   try {
-    const busyRes = await postJson(srv.baseUrl, `/api/task/${busyId}/approve`, {});
+    const busyRes = await postJson(srv.baseUrl, `/api/task/${specId}/approve`, {});
     assert.equal(busyRes.status, 200);
     assert.equal(busyRes.body.ok, false);
     assert.match(busyRes.body.message, /任务正被推进/);
@@ -775,115 +767,125 @@ test('AC-013/AC-014: 五个同步动作 spawn CLI 并同步回传；retry 已 jo
   }
 });
 
+test('AC-013: 遗留任务的动作按钮已从 SYNC_ACTIONS 删除；硬 POST 也只得到 200 + ok:false，状态零变化', async (t) => {
+  const env = makeEnv(t);
+  const legacyId = 'task-20260705-149';
+  env.writeTask(legacyId, { stage: 'AWAIT_SPEC_APPROVAL' });
+
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+  for (const gone of ['approve-setup', 'approve-feasibility', 'reject-feasibility', 'approve-scope', 'reject-scope', 'merge']) {
+    const res = await postJson(srv.baseUrl, `/api/task/${legacyId}/${gone}`, {});
+    assert.equal(res.status, 400, `${gone} 应已不是合法动作`);
+  }
+  const approveRes = await postJson(srv.baseUrl, `/api/task/${legacyId}/approve`, {});
+  assert.equal(approveRes.status, 200);
+  assert.equal(approveRes.body.ok, false);
+  assert.match(approveRes.body.message, /legacy task, not operable by this conductor/);
+  assert.equal(env.findTask(legacyId).runtime.stage, 'AWAIT_SPEC_APPROVAL');
+});
+
 // ---- AC-015：同步动作成功后 detached 后台触发 run（不阻塞响应）；--no-auto-run 跳过 ----
 
 test('AC-015: 同步动作 exitCode=0 后，server 后台触发一次 conductor run，响应不等待其完成', async (t) => {
-  const env = makeEnv(t, { config: { spawnRetries: 0 } });
-  const id = 'task-20260705-150';
-  env.writeTask(id, { stage: 'AWAIT_SETUP_APPROVAL' });
-  const cfg = loadCfg(env.root);
-  const draftPaths = setupProfilePaths(cfg);
-  fs.mkdirSync(draftPaths.dir, { recursive: true });
-  fs.writeFileSync(draftPaths.draft, '# Setup Profile Draft\n\n- test: node --test\n');
-  env.setScenario([
-    {
-      delayMs: 800,
-      actions: [{ type: 'writeFile', path: 'lib/stats.mjs', content: FIXED_STATS }],
-      session_id: 'sess-maker-ac015',
-      cost: 0.05,
-      result: '已修复',
-    },
-    verifierStep(1, { 'AC-001': 'pass', 'AC-002': 'pass' }),
+  const { env, id } = newRouterEnv(t, { config: { spawnRetries: 0 } });
+  driveToGate(env, id, 'spec');
+  env.appendScenario([
+    { delayMs: 800, ...routerStep('maker') },
+    makerStep(),
+    routerStep('human', { summary: '后台 run 跑完就停这儿' }),
   ]);
 
   const srv = await startDashboard(t, env, ['--port', '0']); // 默认 autoRun=true
 
   const startedAt = Date.now();
-  const res = await postJson(srv.baseUrl, `/api/task/${id}/approve-setup`, {});
+  const res = await postJson(srv.baseUrl, `/api/task/${id}/approve`, {});
   const elapsedMs = Date.now() - startedAt;
   assert.equal(res.body.ok, true);
-  assert.ok(elapsedMs < 500, `响应应在后台 maker 完成（含 800ms 延时）之前返回，实际耗时 ${elapsedMs}ms`);
+  assert.ok(elapsedMs < 700, `响应应在后台 router 完成（含 800ms 延时）之前返回，实际耗时 ${elapsedMs}ms`);
 
-  await waitFor(() => env.findTask(id)?.runtime.stage === 'AWAIT_HUMAN_MERGE', 6000);
+  await waitFor(() => env.findTask(id)?.runtime.awaiting?.kind === 'help', 8000);
 });
 
 test('AC-015: --no-auto-run 启动时，同步动作成功后不触发后台 run', async (t) => {
-  const env = makeEnv(t);
-  const id = 'task-20260705-151';
-  env.writeTask(id, { stage: 'AWAIT_SETUP_APPROVAL' });
-  const cfg = loadCfg(env.root);
-  const draftPaths = setupProfilePaths(cfg);
-  fs.mkdirSync(draftPaths.dir, { recursive: true });
-  fs.writeFileSync(draftPaths.draft, '# Setup Profile Draft\n\n- test: node --test\n');
+  const { env, id } = newRouterEnv(t);
+  driveToGate(env, id, 'spec');
 
   const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
-  const res = await postJson(srv.baseUrl, `/api/task/${id}/approve-setup`, {});
+  const res = await postJson(srv.baseUrl, `/api/task/${id}/approve`, {});
   assert.equal(res.body.ok, true);
 
   await new Promise((r) => setTimeout(r, 500));
   const after = env.findTask(id);
-  assert.equal(after.runtime.setup_approval, 'approved', 'CLI 动作本身的效果应生效');
-  assert.equal(after.runtime.stage, 'AWAIT_SETUP_APPROVAL', '未触发 run，stage 不应推进');
+  assert.equal(after.runtime.spec_approved, true, 'CLI 动作本身的效果应生效');
+  assert.equal(after.runtime.stage, 'ROUTING', '未触发 run，stage 停在 ROUTING');
+  assert.equal(env.calls().length, 2, '只有 driveToGate 那两次 spawn');
 });
 
-// ---- AC-016：merge 与其余 6 个动作一致，同步等待 conductor merge 并回传真实结果 ----
+// ---- AC-016：merge 闸批准是同步动作（approve），失败真实回传；retry 的 job 失败态同理 ----
 
-test('AC-016: POST .../merge 立即 202+jobId；job 终态经 GET /api/jobs 为 fail 且 message 含 stderr；任务保持原状（P4-AC-014①）', async (t) => {
+test('AC-016: merge 闸 approve 同步回传真实结果；版本规则不满足时 200 + ok:false 且任务回 ROUTING', async (t) => {
+  const { env, id } = newRouterEnv(t);
+  driveToGate(env, id, 'merge');
+
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+
+  // base 往前走一步 → precommit 基线过期，approve 必须被版本规则拒
+  fs.writeFileSync(path.join(env.targetDir, 'BASE_MOVED.md'), 'base moved\n');
+  execFileSync('git', ['-C', env.targetDir, 'add', '-A'], { stdio: 'pipe' });
+  execFileSync('git', ['-C', env.targetDir, 'commit', '-m', 'base moved'], { stdio: 'pipe' });
+
+  const refused = await postJson(srv.baseUrl, `/api/task/${id}/approve`, {});
+  assert.equal(refused.status, 200, 'CLI 非零退出也应 200，而非 5xx');
+  assert.equal(refused.body.ok, false);
+  assert.match(refused.body.message, /need_precommit=true/);
+  assert.equal(env.findTask(id).runtime.stage, 'ROUTING', '被版本规则拒 → 回 ROUTING');
+});
+
+test('P4-AC-014①: retry 的 job 失败态经 GET /api/jobs 为 fail 且 message 含 stderr；任务保持原状', async (t) => {
   const env = makeEnv(t);
   const id = 'task-20260705-160';
-  // spent_usd >= 默认 budgetUsd=5：committer 提案 fail-open 直接跳过，merge 失败路径不依赖 fake-claude。
-  env.writeTask(id, { stage: 'AWAIT_HUMAN_MERGE', spent: 6 });
+  env.writeRouterTask(id, { stage: 'FAILED_BOX', lastFailureType: 'crashed' }); // 不是可恢复类型
+  fs.mkdirSync(path.join(env.root, 'state', 'failed'), { recursive: true });
+  fs.renameSync(path.join(env.root, 'state', 'queue', id), path.join(env.root, 'state', 'failed', id));
 
   const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
 
   const startedAt = Date.now();
-  const res = await postJson(srv.baseUrl, `/api/task/${id}/merge`, {});
-  assert.equal(res.status, 202, '无 task/<id> 分支的 merge 也应立即 202，不同步等待子进程');
+  const res = await postJson(srv.baseUrl, `/api/task/${id}/retry`, {});
+  assert.equal(res.status, 202, 'retry 立即 202，不同步等待子进程');
   assert.ok(res.body.jobId && typeof res.body.jobId === 'string');
-  assert.ok(Date.now() - startedAt < 500, '响应不应等待 conductor merge 子进程完成');
+  assert.ok(Date.now() - startedAt < 500, '响应不应等待 conductor retry 子进程完成');
 
   const job = await waitForJobTerminal(srv.baseUrl, res.body.jobId);
-  assert.equal(job.state, 'fail', '无 task/<id> 分支，merge 应真实失败而非恒 ok');
-  assert.match(job.message, /merge 失败/, 'fail 态 message 应携带子进程 stderr 文本');
+  assert.equal(job.state, 'fail', '不可恢复的失败类型必须真实失败而非恒 ok');
+  assert.match(job.message, /不是可恢复类型/, 'fail 态 message 应携带子进程 stderr 文本');
 
   const after = env.findTask(id);
-  assert.equal(after.box, 'queue');
-  assert.equal(after.runtime.stage, 'AWAIT_HUMAN_MERGE', '无 task/<id> 分支，merge 应失败，任务保持原状');
+  assert.equal(after.box, 'failed');
+  assert.equal(after.runtime.stage, 'FAILED_BOX', '任务保持原状');
 });
 
-// ---- AC-003：merge 成功路径不应额外 spawn run（与其余 5 个同步动作不同）----
+// ---- AC-003：merge 闸 approve 成功后不该把队列里其它任务连带跑起来 ----
 
-test('AC-003: merge 立即 202+jobId，job 终态为 ok；成功后不 spawn conductor run，队列里其它任务不被连带触发（P4-AC-014②）', async (t) => {
-  const env = makeEnv(t, { config: { spawnRetries: 0 } });
+test('AC-003: merge 闸 approve 成功 → 任务归档 done；--no-auto-run 下队列里其它任务不被连带触发', async (t) => {
+  const { env, id } = newRouterEnv(t, { config: { spawnRetries: 0 } });
+  driveToGate(env, id, 'merge');
 
-  const mergeId = 'task-20260705-161';
-  env.writeTask(mergeId, { stage: 'AWAIT_HUMAN_MERGE', spent: 6 });
-  execFileSync('git', ['-C', env.targetDir, 'checkout', '-b', `task/${mergeId}`], { stdio: 'pipe' });
-  fs.writeFileSync(path.join(env.targetDir, 'DASHBOARD_AC003.md'), 'fixture change for AC-003\n');
-  execFileSync('git', ['-C', env.targetDir, 'add', '-A'], { stdio: 'pipe' });
-  execFileSync('git', ['-C', env.targetDir, 'commit', '-m', 'fixture: AC-003 merge diff'], { stdio: 'pipe' });
-  execFileSync('git', ['-C', env.targetDir, 'checkout', 'main'], { stdio: 'pipe' });
-
-  // probe 任务留在 READY：若后台 run 被 spawn，它会被拿去跑 maker（调用 fake-claude）。
+  // probe 任务留在 ROUTING：若后台 run 被 spawn，它会被拿去问 router（调用 fake-claude）。
   const probeId = 'task-20260705-162';
-  env.writeTask(probeId, { stage: 'READY' });
-  env.setScenario([
-    { delayMs: 50, actions: [], session_id: 'sess-probe-ac003', cost: 0.01, result: '(probe，不应被触发)' },
-  ]);
+  env.writeRouterTask(probeId);
 
-  const srv = await startDashboard(t, env, ['--port', '0']); // 默认 autoRun=true
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+  const callsBefore = env.calls().length;
 
-  const res = await postJson(srv.baseUrl, `/api/task/${mergeId}/merge`, {});
-  assert.equal(res.status, 202);
-  assert.ok(res.body.jobId);
+  const res = await postJson(srv.baseUrl, `/api/task/${id}/approve`, {});
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true, res.body.message);
 
-  const job = await waitForJobTerminal(srv.baseUrl, res.body.jobId);
-  assert.equal(job.state, 'ok', 'merge 应成功');
-
-  await waitFor(() => env.findTask(mergeId)?.box === 'done', 4000);
-  await new Promise((r) => setTimeout(r, 1000));
-  assert.equal(env.calls().length, 0, 'merge 成功不应触发后台 run，probe 任务的 fake-claude 不应被调用');
-  assert.equal(env.findTask(probeId).runtime.stage, 'READY', 'merge 成功不应连带推进队列里其它任务');
+  await waitFor(() => env.findTask(id)?.box === 'done', 4000);
+  await new Promise((r) => setTimeout(r, 800));
+  assert.equal(env.calls().length, callsBefore, 'probe 任务的 fake-claude 不应被调用');
+  assert.equal(env.findTask(probeId).runtime.stage, 'ROUTING', '不连带推进队列里其它任务');
 });
 
 // ---- P4-AC-010/011：job SSE 推送 + 同任务同动作并发 409 ----
@@ -891,7 +893,9 @@ test('AC-003: merge 立即 202+jobId，job 终态为 ok；成功后不 spawn con
 test('P4-AC-010: job 完成经 SSE 推送 type:job 事件，字段与 GET /api/jobs 记录一致', async (t) => {
   const env = makeEnv(t, { config: { spawnRetries: 0 } });
   const id = 'task-20260705-163';
-  env.writeTask(id, { stage: 'READY' });
+  env.writeRouterTask(id, { stage: 'FAILED_BOX', lastFailureType: 'abandoned' });
+  fs.mkdirSync(path.join(env.root, 'state', 'failed'), { recursive: true });
+  fs.renameSync(path.join(env.root, 'state', 'queue', id), path.join(env.root, 'state', 'failed', id));
 
   const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
   const sse = await openSse(t, srv.baseUrl);
@@ -911,28 +915,31 @@ test('P4-AC-010: job 完成经 SSE 推送 type:job 事件，字段与 GET /api/j
   assert.equal(jobEvent.message, recorded.message);
 });
 
-test('P4-AC-011: 同任务同动作已有 running job 时再次 POST 返回 409，不新登记第二个 job；不同任务/不同动作不受影响', async (t) => {
+test('P4-AC-011: 同任务同动作已有 running job 时再次 POST 返回 409，不新登记第二个 job；不同任务不受影响', async (t) => {
   const env = makeEnv(t);
-  const mergeId = 'task-20260705-164';
-  env.writeTask(mergeId, { stage: 'AWAIT_HUMAN_MERGE', spent: 6 }); // 无 task/<id> 分支，merge 会失败但仍占用 running 一段时间
-
-  const retryId = 'task-20260705-165';
-  env.writeTask(retryId, { stage: 'READY' });
+  const busyId = 'task-20260705-164';
+  env.writeRouterTask(busyId, { stage: 'FAILED_BOX', lastFailureType: 'crashed' }); // retry 会失败但仍占用 running 一段时间
+  const otherId = 'task-20260705-165';
+  env.writeRouterTask(otherId, { stage: 'FAILED_BOX', lastFailureType: 'abandoned' });
+  fs.mkdirSync(path.join(env.root, 'state', 'failed'), { recursive: true });
+  for (const id of [busyId, otherId]) {
+    fs.renameSync(path.join(env.root, 'state', 'queue', id), path.join(env.root, 'state', 'failed', id));
+  }
 
   const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
 
-  const first = await postJson(srv.baseUrl, `/api/task/${mergeId}/merge`, {});
+  const first = await postJson(srv.baseUrl, `/api/task/${busyId}/retry`, {});
   assert.equal(first.status, 202);
-  const second = await postJson(srv.baseUrl, `/api/task/${mergeId}/merge`, {});
+  const second = await postJson(srv.baseUrl, `/api/task/${busyId}/retry`, {});
   assert.equal(second.status, 409, '同任务同动作已有 running job 时应 409');
 
-  const otherTask = await postJson(srv.baseUrl, `/api/task/${retryId}/retry`, {});
+  const otherTask = await postJson(srv.baseUrl, `/api/task/${otherId}/retry`, {});
   assert.equal(otherTask.status, 202, '不同任务不应被同任务的 running job 挡住');
 
   await waitForJobTerminal(srv.baseUrl, first.body.jobId);
   const jobsRes = await getJson(srv.baseUrl, '/api/jobs');
-  const mergeJobs = jobsRes.body.jobs.filter((j) => j.taskId === mergeId && j.action === 'merge');
-  assert.equal(mergeJobs.length, 1, '409 不应新登记第二个 job');
+  const retryJobs = jobsRes.body.jobs.filter((j) => j.taskId === busyId && j.action === 'retry');
+  assert.equal(retryJobs.length, 1, '409 不应新登记第二个 job');
 });
 
 // ---- AC-017：new-task 透传 CLI + brief 临时文件生命周期 + id 解析 + feasibility 显式布尔 ----

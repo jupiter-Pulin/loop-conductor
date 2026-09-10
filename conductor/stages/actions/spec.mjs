@@ -14,14 +14,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import * as state from '../../lib/state.mjs';
 import { addDetachedWorktree, removeWorktree } from '../../lib/git.mjs';
-import { taskCfg } from '../../lib/task-cfg.mjs';
 import { validateSpecDoc } from '../../lib/spec-contract.mjs';
 import { buildSpecPrompt } from '../../lib/prompts.mjs';
 import { logPathFor } from '../../lib/agent-settings.mjs';
 import { rateLimitedToBox } from '../shared.mjs';
 import {
   checkBudgetAndBox, openHumanGate, packagesDraftPath, readBriefText, relRef,
-  spawnAgentRound, specDraftPath, specRejectNotes,
+  spawnAgentRound, specDraftPath, specRejectNotes, taskCfg,
 } from '../router-kernel.mjs';
 
 /**

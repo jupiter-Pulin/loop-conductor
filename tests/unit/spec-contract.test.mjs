@@ -1,10 +1,9 @@
-// 单元：spec-doc/v1 契约（validateSpecDoc）、AC 枚举拆分（enumerate 无兜底 / extract 有兜底）、
-// specContractInvalidNext 阶梯。契约门与 Stop hook 共用同一份裁判代码，这里锁行为。
+// 单元：spec-doc/v1 契约（validateSpecDoc）与 AC 枚举拆分（enumerate 无兜底 / extract 有兜底）。
+// 契约门（内核终审）与 check-spec Stop hook 共用同一份裁判代码，这里锁行为。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { validateSpecDoc, SPEC_DOC_CONTRACT } from '../../conductor/lib/spec-contract.mjs';
 import { enumerateAcceptanceCriteria, extractAcceptanceCriteria } from '../../conductor/lib/state.mjs';
-import { specContractInvalidNext } from '../../conductor/stages/decisions.mjs';
 
 const GOOD = [
   '# 功能 spec',
@@ -76,13 +75,4 @@ test('enumerateAcceptanceCriteria 无兜底返回 []；extractAcceptanceCriteria
   assert.equal(fallback.length, 1);
   assert.equal(fallback[0].ac_id, 'AC-001');
   assert.match(fallback[0].text, /testCommand 全绿/);
-});
-
-test('specContractInvalidNext：max=2 → 0→1 留、1→2 留、2→3 耗尽收箱', () => {
-  assert.deepEqual(specContractInvalidNext(0, 2), { exhausted: false, invalidCount: 1, failureType: null });
-  assert.deepEqual(specContractInvalidNext(1, 2), { exhausted: false, invalidCount: 2, failureType: null });
-  assert.deepEqual(
-    specContractInvalidNext(2, 2),
-    { exhausted: true, invalidCount: 3, failureType: 'spec_contract_exhausted' },
-  );
 });

@@ -28,7 +28,6 @@ let detailMode = null; // 'drawer'（监控 peek）| 'page'（全屏审查页）
 let detailTaskId = null;
 let lastDetail = null;
 let lastDiff = null;
-let selectedOption = null;
 let pendingActionMessage = null;
 let expandedDiffFiles = new Set();
 let drawerTriggerEl = null;
@@ -712,7 +711,6 @@ function resetDetailState() {
   lastDetail = null;
   lastDiff = null;
   lastStreamTail = null;
-  selectedOption = null;
   pendingActionMessage = null;
   expandedDiffFiles = new Set();
 }
@@ -1518,6 +1516,16 @@ function buildHumanGateMain(id, detail, content, actions) {
 
 // ---- 屏 2b：全屏审查页（报告优先：verify/spec 报告是主角，diff 只做分诊，决策按钮固定在底部动作条） ----
 
+/** 旧状态机遗留的 review 形态：只读渲染，没有任何决策按钮（对应动词已随 P3 一起删）。 */
+const LEGACY_REVIEW_KINDS = new Set(['feasibility', 'setup', 'spec', 'scope', 'merge']);
+const LEGACY_REVIEW_LABEL = {
+  feasibility: '遗留任务：feasibility memo（旧状态机产物，只读）',
+  setup: '遗留任务：setup profile 草稿（旧状态机产物，只读）',
+  spec: '遗留任务：spec 草稿与 spec-verifier 裁决（旧状态机产物，只读）',
+  scope: '遗留任务：spec 规模升闸（旧状态机产物，只读）',
+  merge: '遗留任务：旧 merge 闸（旧状态机产物，只读）',
+};
+
 /** review kind → { content: node[], actions: node[] }。content 顺序即页面主列顺序：报告在前。 */
 function buildReviewMain(id, detail) {
   const task = detail.task;
@@ -1527,95 +1535,23 @@ function buildReviewMain(id, detail) {
 
   if (review.kind === 'human') {
     buildHumanGateMain(id, detail, content, actions);
-  } else if (review.kind === 'feasibility') {
-    content.push(el('h3', { text: 'Feasibility memo' }));
-    content.push(el('pre', { class: 'readonly', text: review.missing ? review.message : review.markdown }));
-    content.push(el('h3', { text: 'YOUR DECISION · PICK AN OPTION' }));
-    const optionsWrap = el('div', {});
-    for (const opt of review.options || []) {
-      optionsWrap.appendChild(el('div', {
-        class: 'option-card' + (selectedOption === opt.option_id ? ' selected' : ''),
-        onclick: () => { selectedOption = opt.option_id; renderDetailFromCache(); },
-      }, [
-        el('span', { class: 'option-id', text: opt.option_id }),
-        el('span', { text: opt.text }),
-      ]));
+  } else if (LEGACY_REVIEW_KINDS.has(review.kind)) {
+    // 旧状态机的人闸（feasibility / setup / spec-verifier / 规模 / 旧 merge）已在 P3 删除：
+    // 案卷与草稿仍要看得见（AC-029），但一个决策按钮都不给——对应的 CLI 动词已经没了，
+    // 点下去只会得到「legacy task, not operable by this conductor」。
+    content.push(el('div', { class: 'legacy-note', text: LEGACY_REVIEW_LABEL[review.kind] }));
+    if (review.markdown || review.message) {
+      content.push(el('pre', { class: 'readonly readonly-tall', text: review.missing ? review.message : review.markdown }));
     }
-    content.push(optionsWrap);
-    const notes = el('textarea', { id: 'fb-notes', rows: 3 });
-    content.push(el('div', { class: 'field' }, [el('label', { text: '备注（可选）' }), notes]));
-    const approveLabel = selectedOption ? `通过 · 选 ${selectedOption} 继续` : '通过 · 请先选择一个 option';
-    const approveBtn = el('button', {
-      class: 'btn btn-primary', text: approveLabel,
-      onclick: () => confirmAndSubmit(
-        id, 'approve-feasibility', { option: selectedOption, notes: notes.value },
-        `确定通过 feasibility 并选 ${selectedOption} 继续？`,
-      ),
-    });
-    approveBtn.disabled = !selectedOption;
-    const rejectBtn = el('button', {
-      class: 'btn btn-danger', text: '打回并留言',
-      onclick: () => confirmAndSubmit(id, 'reject-feasibility', { notes: notes.value }, '确定打回 feasibility 并留言？'),
-    });
-    actions.push(approveBtn, rejectBtn);
-  } else if (review.kind === 'setup') {
-    content.push(el('h3', { text: 'Setup profile 草稿' }));
-    content.push(el('pre', { class: 'readonly', text: review.missing ? review.message : review.markdown }));
-    actions.push(el('button', {
-      class: 'btn btn-primary', text: '通过',
-      onclick: () => confirmAndSubmit(id, 'approve-setup', {}, '确定通过 setup profile？'),
-    }));
-  } else if (review.kind === 'spec') {
-    // 报告优先：spec-verifier 机器审在草稿之前——人先看机器挑出的问题，再对着草稿核对。
-    content.push(buildSpecVerifyNode(review.specVerify));
-    content.push(el('h3', { text: 'Spec 草稿' }));
-    content.push(el('pre', { class: 'readonly readonly-tall', text: review.missing ? review.message : review.markdown }));
-    const notes = el('textarea', { id: 'spec-notes', rows: 3 });
-    content.push(el('div', { class: 'field' }, [el('label', { text: 'Reject 备注（必填）' }), notes]));
-    const approveBtn = el('button', {
-      class: 'btn btn-primary', text: '通过 spec',
-      onclick: () => confirmAndSubmit(id, 'approve', {}, '确定通过 spec？'),
-    });
-    const rejectBtn = el('button', {
-      class: 'btn btn-danger', text: '打回并留言',
-      onclick: () => confirmAndSubmit(id, 'reject', { notes: notes.value }, '确定打回 spec 并留言？'),
-    });
-    rejectBtn.disabled = true;
-    notes.addEventListener('input', () => { rejectBtn.disabled = notes.value.trim() === ''; });
-    actions.push(approveBtn, rejectBtn);
-  } else if (review.kind === 'scope') {
-    // 规模升闸：人裁的是「要不要拆」，不是 spec 内容对错——规模对照排在机器审与草稿之前。
-    content.push(el('h3', { text: '规模升闸 · 要不要拆' }));
-    content.push(el('div', {
-      text: review.scope.acCount == null
-        ? 'spec 草稿缺失，无法机械计数'
-        : `本 spec 含 ${review.scope.acCount} 条 AC，阈值 ${review.scope.max == null ? '?' : review.scope.max}；`
-          + 'spec-verifier 本轮 fail 已挂起（miss 未计），等你裁决。',
-    }));
-    content.push(buildSpecVerifyNode(review.specVerify));
-    content.push(el('h3', { text: 'Spec 草稿' }));
-    content.push(el('pre', { class: 'readonly readonly-tall', text: review.missing ? review.message : review.markdown }));
-    const notes = el('textarea', { id: 'scope-notes', rows: 3 });
-    content.push(el('div', { class: 'field' }, [el('label', { text: '拆分意图备注（可选）' }), notes]));
-    actions.push(el('button', {
-      class: 'btn btn-primary', text: '接受规模 · 继续修复',
-      onclick: () => confirmAndSubmit(id, 'approve-scope', {}, '确定接受当前规模、让挂起的 fail 入账继续修复循环？'),
-    }));
-    actions.push(el('button', {
-      class: 'btn btn-danger', text: '选择拆分 · 收箱',
-      onclick: () => confirmAndSubmit(id, 'reject-scope', { notes: notes.value }, '确定选择拆分？任务会进 failed 箱等你手工拆成多个任务。'),
-    }));
-  } else if (review.kind === 'merge') {
-    // 报告优先：verifier 裁决（AC 逐条证据）在 diff 之前。
-    content.push(buildVerdictPanelNode(review.verdict));
-    content.push(buildDiffSectionNode(lastDiff, {
-      taskId: id,
-      shortstat: review.error ? review.error : review.diffShortstat,
-    }));
-    actions.push(el('button', {
-      class: 'btn btn-primary', text: `合并到 ${task ? task.baseBranch : 'base'}`,
-      onclick: () => confirmAndSubmitJob(id, 'merge', `确定合并到 ${task ? task.baseBranch : 'base'}？此操作不可撤销。`),
-    }));
+    if (review.kind === 'merge') {
+      content.push(buildVerdictPanelNode(review.verdict));
+      content.push(buildDiffSectionNode(lastDiff, {
+        taskId: id,
+        shortstat: review.error ? review.error : review.diffShortstat,
+      }));
+    } else {
+      content.push(buildSpecVerifyNode(review.specVerify));
+    }
   } else if (review.kind === 'failed') {
     content.push(el('h3', { text: '失败信息' }));
     content.push(el('div', { text: review.lastFailureType || '(未知失败类型)' }));

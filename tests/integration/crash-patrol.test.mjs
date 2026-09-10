@@ -1,12 +1,14 @@
+// 集成：run 启动巡检——queue 里 stage 已是终态（FAILED_BOX / DONE）却没搬箱的僵尸任务，
+// 由 patrolBoxStageConsistency 自动补搬，并留痕 timeline。崩在搬箱前的进程不该留下永久滞留。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { makeEnv } from '../helpers/env.mjs';
+import { routerEnv } from '../helpers/router-env.mjs';
 
-test('run 启动巡检：queue/stage=FAILED_BOX 僵尸自动补搬 failed，retry 可复活', (t) => {
-  const env = makeEnv(t);
+test('run 启动巡检：queue/stage=FAILED_BOX 僵尸自动补搬 failed，retry 可复活到 ROUTING', (t) => {
+  const env = routerEnv(t);
   const id = 'task-20260611-610';
-  env.writeTask(id, { stage: 'FAILED_BOX', lastFailureType: 'crashed' });
+  env.writeRouterTask(id, { stage: 'FAILED_BOX', lastFailureType: 'fuse_no_progress' });
   env.setScenario([]);
 
   const run = env.run('run');
@@ -21,13 +23,13 @@ test('run 启动巡检：queue/stage=FAILED_BOX 僵尸自动补搬 failed，retr
   assert.equal(retry.status, 0, retry.stderr);
   after = env.findTask(id);
   assert.equal(after.box, 'queue');
-  assert.equal(after.runtime.stage, 'READY');
+  assert.equal(after.runtime.stage, 'ROUTING');
 });
 
 test('run 启动巡检：queue/stage=DONE 僵尸自动补搬 done', (t) => {
-  const env = makeEnv(t);
+  const env = routerEnv(t);
   const id = 'task-20260611-611';
-  env.writeTask(id, { stage: 'DONE' });
+  env.writeRouterTask(id, { stage: 'DONE' });
   env.setScenario([]);
 
   const run = env.run('run');

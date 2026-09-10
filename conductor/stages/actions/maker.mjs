@@ -6,12 +6,12 @@
 
 import * as state from '../../lib/state.mjs';
 import { commitAll, ensureWorktree } from '../../lib/git.mjs';
-import { taskCfg } from '../../lib/task-cfg.mjs';
 import { buildMakerPrompt } from '../../lib/prompts.mjs';
 import { logPathFor } from '../../lib/agent-settings.mjs';
 import { HARNESS_ARTIFACTS, rateLimitedToBox, worktreePath } from '../shared.mjs';
 import {
   checkBudgetAndBox, readBriefText, readFrozenSpec, spawnAgentRound, specGateNotes, taskBranchName,
+  taskCfg,
 } from '../router-kernel.mjs';
 
 /**

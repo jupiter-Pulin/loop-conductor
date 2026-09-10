@@ -1,22 +1,13 @@
-// 集成：结构化事件流（R5-H17）。契约：
-//   1) 默认关：全链跑完（含 merge）零 events.jsonl（旧行为，timeline 独存）；
-//   2) 开启：stage / verifier_verdict / committer_attempt 事件齐全且字段正确，
-//      dossier-stats 从事件流拿到 committer 有效性（不再依赖 timeline 文案）；
-//   3) 事件流是观测面：开关开与关的任务路由完全一致。
+// 集成：结构化事件流（R5-H17 + router 纪元）。契约：
+//   1) router 纪元的事实事件（router_decision / human_gate_opened / human_decision / merged …）
+//      不受 `eventsLogEnabled` 约束——它们是内核事实，不是观测选项；
+//   2) `stage` 事件仍归观测开关：默认关不写，开启才写；
+//   3) 事件流是观测面：开关开与关的任务路由完全一致；
+//   4) 每条事件都有 ts / type。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { makeEnv, verifierStep } from '../helpers/env.mjs';
-import { FIXED_STATS } from '../helpers/target-fixture.mjs';
-import { collectTask } from '../../tools/dossier-stats.mjs';
-
-const FIX = { type: 'writeFile', path: 'lib/stats.mjs', content: FIXED_STATS };
-// 提案用英文：F13/006 语言门默认 commitLanguage='en'（中文提案会被判 invalid——
-// 该测试与 006 各自绿、合入后才暴露的语义冲突，2026-07-10 修正）。
-const GOOD_PROPOSAL = JSON.stringify({
-  subject: 'fix(stats): average the two middle values for even-length median',
-  body: 'Events-log integration fixture proposal.\n\nVerified: node --test all green.',
-});
+import { makerStep, newRouterEnv, reviewerStep, routerStep } from '../helpers/router-env.mjs';
 
 function readEvents(env, id) {
   try {
@@ -27,62 +18,52 @@ function readEvents(env, id) {
   }
 }
 
-test('契约1：默认关——全链（run+merge）零 events.jsonl，路由不变', (t) => {
-  const env = makeEnv(t);
-  const id = 'task-20260708-990';
-  env.writeTask(id);
-  env.setScenario([
-    { actions: [FIX], session_id: 'sess-m1', cost: 0.1, result: 'r1' },
-    verifierStep(1),
-    { cost: 0.01, result: GOOD_PROPOSAL },
-  ]);
-  assert.equal(env.run('run').status, 0);
-  assert.equal(env.findTask(id).runtime.stage, 'AWAIT_HUMAN_MERGE');
-  assert.equal(env.run('merge', id).status, 0);
-  assert.equal(env.findTask(id).box, 'done');
-  assert.equal(readEvents(env, id), null, '默认关闭不得产生 events.jsonl');
-});
+function fullRun(env) {
+  return [
+    routerStep('maker'), makerStep(),
+    routerStep('review'), reviewerStep(),
+    routerStep('precommit', { tier: 'unit' }),
+    routerStep('merge'),
+  ];
+}
 
-test('契约2+3：开启——事件齐全、字段正确、stats 从事件流拿 committer 有效性', (t) => {
-  const env = makeEnv(t, { config: { eventsLogEnabled: true } });
-  const id = 'task-20260708-991';
-  env.writeTask(id);
-  env.setScenario([
-    { actions: [FIX], session_id: 'sess-m1', cost: 0.1, result: 'r1' },
-    verifierStep(1),
-    { cost: 0.01, result: '这不是 JSON 提案（a1 故意 invalid）' }, // a1 malformed
-    { cost: 0.01, result: GOOD_PROPOSAL },                          // a2 valid
-  ]);
+test('契约1+2：默认关——router 事实事件照写，stage 事件不写；路由不变', (t) => {
+  const { env, id } = newRouterEnv(t, { config: { eventsLogEnabled: false } });
+  env.setScenario(fullRun(env));
   assert.equal(env.run('run').status, 0);
-  assert.equal(env.findTask(id).runtime.stage, 'AWAIT_HUMAN_MERGE', '开关不影响路由');
-  assert.equal(env.run('merge', id).status, 0);
+  assert.equal(env.findTask(id).runtime.awaiting.kind, 'merge');
+  assert.equal(env.run('approve', id).status, 0);
   assert.equal(env.findTask(id).box, 'done');
 
   const events = readEvents(env, id);
-  assert.ok(Array.isArray(events) && events.length > 0, 'events.jsonl 应存在且非空');
+  assert.ok(Array.isArray(events) && events.length > 0, 'router 纪元恒有事件流');
+  assert.equal(events.filter((e) => e.type === 'stage').length, 0, '默认关不写 stage 事件');
+  assert.ok(events.some((e) => e.type === 'router_decision'), 'router_decision 不受开关约束');
+  assert.ok(events.some((e) => e.type === 'merged'), 'merged 不受开关约束');
+});
+
+test('契约2+3+4：开启——stage 事件补齐，字段完整，路由与关闭时一致', (t) => {
+  const { env, id } = newRouterEnv(t, { config: { eventsLogEnabled: true } });
+  env.setScenario(fullRun(env));
+  assert.equal(env.run('run').status, 0);
+  assert.equal(env.findTask(id).runtime.awaiting.kind, 'merge', '开关不影响路由');
+  assert.equal(env.run('approve', id).status, 0);
+  assert.equal(env.findTask(id).box, 'done');
+
+  const events = readEvents(env, id);
   for (const ev of events) {
     assert.ok(typeof ev.ts === 'string' && typeof ev.type === 'string', '每条事件都有 ts/type');
   }
-
   const stages = events.filter((e) => e.type === 'stage').map((e) => e.stage);
-  assert.ok(stages.includes('AWAIT_HUMAN_MERGE'), 'stage 事件覆盖 verdict pass 转移');
+  assert.ok(stages.includes('AWAIT_HUMAN'), 'stage 事件覆盖开人闸');
   assert.ok(stages.includes('DONE'), 'stage 事件覆盖 merge 归档');
 
-  const verdicts = events.filter((e) => e.type === 'verifier_verdict');
-  assert.equal(verdicts.length, 1);
-  assert.equal(verdicts[0].round, 1);
-  assert.equal(verdicts[0].overall, 'pass');
+  const decisions = events.filter((e) => e.type === 'router_decision');
+  assert.deepEqual(decisions.map((d) => d.action), ['maker', 'review', 'precommit', 'merge']);
 
-  const attempts = events.filter((e) => e.type === 'committer_attempt');
-  assert.deepEqual(
-    attempts.map((a) => [a.attempt, a.outcome, a.invalid_kind ?? null]),
-    [[1, 'invalid', 'malformed'], [2, 'valid', null]],
-    'committer 事件逐 attempt 记录归因',
-  );
-  assert.equal(events.filter((e) => e.type === 'committer_degraded').length, 0);
-
-  // dossier-stats 双读：事件流在场时 committer 有效性来自事件（timeline 只是人读）
-  const rec = collectTask(env.root, 'done', id);
-  assert.equal(rec.committer_valid_attempt, 2);
-  assert.equal(rec.committer_degraded, false);
+  const gate = events.filter((e) => e.type === 'human_gate_opened');
+  assert.deepEqual(gate.map((g) => g.kind), ['merge']);
+  const decided = events.filter((e) => e.type === 'human_decision');
+  assert.deepEqual(decided.map((d) => [d.kind, d.decision]), [['merge', 'approved']]);
+  assert.equal(events.filter((e) => e.type === 'precommit_result').length, 1);
 });

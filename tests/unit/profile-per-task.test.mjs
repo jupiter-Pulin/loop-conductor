@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { setupProfileKey, setupProfilePaths, writeApprovedSetupProfile, hasApprovedSetupProfile } from '../../conductor/lib/profile.mjs';
-import { taskCfg } from '../../conductor/lib/task-cfg.mjs';
+import { taskCfg } from '../../conductor/stages/router-kernel.mjs';
 
 function tmpRoot(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'profile-per-task-'));

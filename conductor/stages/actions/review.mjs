@@ -7,13 +7,12 @@
 
 import * as state from '../../lib/state.mjs';
 import { diffAgainstBase, diffNameStatusAgainstBase, ensureWorktree } from '../../lib/git.mjs';
-import { taskCfg } from '../../lib/task-cfg.mjs';
 import { buildReviewerPrompt } from '../../lib/prompts.mjs';
 import { logPathFor } from '../../lib/agent-settings.mjs';
 import { HARNESS_ARTIFACTS, rateLimitedToBox, worktreePath } from '../shared.mjs';
 import {
   checkBudgetAndBox, readBriefText, readFrozenSpec, revParseOrNull, spawnAgentRound,
-  specGateNotes, taskBranchName,
+  specGateNotes, taskBranchName, taskCfg,
 } from '../router-kernel.mjs';
 
 /** AC 清单：有 spec 用枚举结果逐条渲染；无 spec 把 brief 原样交出去当验收线索。 */
