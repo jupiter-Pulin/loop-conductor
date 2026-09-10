@@ -13,7 +13,8 @@ function probeCache(env) {
 }
 
 test('AC-052：配置了不可用的模型 id → run 终止并列出 id，任务状态零变化', (t) => {
-  const { env, id } = newRouterEnv(t, { config: { models: { router: 'no-such-model-x' } } });
+  // seedModels 只预填默认模型：router 的那个 id 没进缓存，run 启动时必须真去探它。
+  const { env, id } = newRouterEnv(t, { config: { models: { router: 'no-such-model-x' } }, seedModels: ['claude-opus-5'] });
   const before = env.findTask(id);
   // 探测那一次调用就是剧本的第 0 步：让它以非零退出（模型不存在类错误）。
   env.setScenario([
@@ -39,7 +40,7 @@ test('AC-052：配置了不可用的模型 id → run 终止并列出 id，任�
 });
 
 test('AC-052：探测通过后写入缓存，下次 run 不再探测', (t) => {
-  const { env, id } = newRouterEnv(t, { config: { models: { router: 'probe-me-once' } } });
+  const { env, id } = newRouterEnv(t, { config: { models: { router: 'probe-me-once' } }, seedModels: ['claude-opus-5'] });
   env.setScenario([
     { cost: 0, result: 'ok' },  // 探测：一次成功的最小会话
     routerStep('human', { summary: '探测通过后照常跑一轮' }),

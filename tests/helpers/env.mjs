@@ -78,7 +78,9 @@ function copyNextAgents(root) {
 export function makeEnv(t, {
   config = {},
   trackedHarness = false,
-  seedModels = ['claude-opus-5'],
+  // 缺省把「默认模型 + 本测试配置里出现的每个模型 id」都预填成可用：否则 run 启动的探测会
+  // 多消费一个剧本步骤，把整条剧本错位。要测探测本身的测试显式传 seedModels 指定预填集合。
+  seedModels = ['claude-opus-5', ...Object.values(config.models ?? {}).filter((m) => typeof m === 'string' && m.trim() !== '')],
 } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'conductor-it-'));
   for (const d of ['state/queue', 'state/done', 'state/failed', 'specs', 'dossier', 'worktrees', 'agents', 'target-profiles']) {

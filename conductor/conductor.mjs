@@ -8,7 +8,7 @@ import * as state from './lib/state.mjs';
 import { acquireLock, releaseLock, lockDirPath, STALE_MS, startLockHeartbeat } from './lib/lock.mjs';
 import { runScheduler, initRunBudget } from './lib/scheduler.mjs';
 import { withTaskLock, TaskLockBusyError } from './lib/task-lock.mjs';
-import { currentBranch, mergeBranch, removeWorktree, deleteBranch } from './lib/git.mjs';
+import { currentBranch, mergeBranch } from './lib/git.mjs';
 import { DEFAULT_TEST_GLOBS } from './lib/test-gate.mjs';
 import { hasApprovedSetupProfile } from './lib/profile.mjs';
 import { taskCfg } from './lib/task-cfg.mjs';
@@ -23,7 +23,7 @@ import { DEFAULT_MAX_TURNS } from './lib/agent-settings.mjs';
 import routingHandler from './stages/routing.mjs';
 import awaitHumanHandler from './stages/await_human.mjs';
 import {
-  cleanupTaskArtifacts, humanRecordPath, readRouterState, revParseOrNull, specDraftPath,
+  cleanupTaskArtifacts, humanRecordPath, revParseOrNull, specDraftPath,
   taskBranchName, writeRouterState,
 } from './stages/router-kernel.mjs';
 import { archiveSpecDraft } from './stages/shared.mjs';

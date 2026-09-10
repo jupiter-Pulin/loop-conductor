@@ -63,9 +63,12 @@ export function specStep(specBody, over = {}) {
 }
 
 /** 建一个「目标仓已配好 precommit 段」的环境，并用新 CLI 建一个任务，返回 { env, id }。 */
-export function newRouterEnv(t, { config = {}, precommit = { unit: 'node --test' }, brief } = {}) {
+export function newRouterEnv(t, { config = {}, precommit = { unit: 'node --test' }, brief, seedModels } = {}) {
   // spawnBackoffMs 压到毫秒级：剧本步数写错时，代价是测试立刻红，而不是五分钟退避阶梯。
-  const env = makeEnv(t, { config: { eventsLogEnabled: true, spawnBackoffMs: [5, 5, 5], ...config } });
+  const env = makeEnv(t, {
+    config: { eventsLogEnabled: true, spawnBackoffMs: [5, 5, 5], ...config },
+    ...(seedModels ? { seedModels } : {}),
+  });
   env.writePrecommitProfile(precommit);
   const briefPath = env.writeBrief(brief ?? 'median 的偶数分支应取中间两数平均；补一条在旧代码上会失败的测试。\n');
   const created = env.run('new', '--title', 'median 偶数分支返回错误', '--brief', briefPath);
