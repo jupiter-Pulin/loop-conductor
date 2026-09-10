@@ -13,16 +13,6 @@ export const REPO_ROOT = path.resolve(HERE, '..', '..');
 export const CONDUCTOR = path.join(REPO_ROOT, 'conductor', 'conductor.mjs');
 export const FAKE_CLAUDE = path.join(REPO_ROOT, 'tests', 'fixtures', 'fake-claude.mjs');
 
-const AGENT_STUBS = {
-  'setup-agent.md': '# setup stub\n',
-  'feasibility-agent.md': '# feasibility stub\n',
-  'spec-agent.md': '# spec stub\n',
-  'spec-verifier-agent.md': '# spec verifier stub\n',
-  'maker-agent.md': '# maker stub\n',
-  'verifier-agent.md': '# verifier stub\n',
-  'committer-agent.md': '# committer stub\n',
-};
-
 function setupProfileKey(targetRepo) {
   const repo = path.resolve(targetRepo);
   const safe = String(path.basename(repo)).replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'repo';
@@ -73,11 +63,11 @@ function seedModelProbeCache(root, models) {
   );
 }
 
-/** 把仓库里真实的 agents/next（新四角色 prompt + few-shot）复制进临时根，让 prompt 拼装是真的。 */
-function copyNextAgents(root) {
-  const src = path.join(REPO_ROOT, 'agents', 'next');
+/** 把仓库里真实的 agents/（四角色 prompt + few-shot）复制进临时根，让 prompt 拼装是真的。 */
+function copyAgents(root) {
+  const src = path.join(REPO_ROOT, 'agents');
   if (!fs.existsSync(src)) return;
-  fs.cpSync(src, path.join(root, 'agents', 'next'), { recursive: true });
+  fs.cpSync(src, path.join(root, 'agents'), { recursive: true });
 }
 
 export function makeEnv(t, {
@@ -91,10 +81,7 @@ export function makeEnv(t, {
   for (const d of ['state/queue', 'state/done', 'state/failed', 'specs', 'dossier', 'worktrees', 'agents', 'target-profiles']) {
     fs.mkdirSync(path.join(root, d), { recursive: true });
   }
-  for (const [name, content] of Object.entries(AGENT_STUBS)) {
-    fs.writeFileSync(path.join(root, 'agents', name), content);
-  }
-  copyNextAgents(root);
+  copyAgents(root);
   seedModelProbeCache(root, seedModels);
   // config 默认含 baseBranch:'main'（target fixture 用 main 建仓），可由 config 覆盖。
   const fullConfig = {

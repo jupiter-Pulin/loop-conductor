@@ -1,26 +1,22 @@
 // lib/prompts.mjs — 四个角色的 prompt 拼装（router / spec / maker / reviewer）。
 // 固定上下文与 few-shot 逐字来自 spec 的「Agent 提示词与 few-shot」一节，落在磁盘上
-// （agents/next/<role>-agent.md、agents/next/fewshot/<role>.md）；本模块只负责选段、填占位、
+// （agents/<role>-agent.md、agents/fewshot/<role>.md）；本模块只负责选段、填占位、
 // 拼注入内容。判断力靠 few-shot 传，固定上下文越短越好。
 //
-// 为什么写在 agents/next/ 而不是最终路径：旧 stage（needs_spec / verify / …）仍在跑并读
-// agents/<role>-agent.md，本阶段不能动它们。P3 删旧 stage 时把目录搬回 agents/ 即可，
-// 只有 NEXT_AGENTS_SUBDIR 一个常量要改。
-//
-// 硬约束（AC-026）：任何 builder 的产物都不得残留 `{{`；每份 prompt 都含自己 log 的绝对路径
-// 与「用 Write 工具」一句（防 Read-before-Write 撞墙）。
+// 硬约束（AC-026）：`agents/` 下只有这九个文件；任何 builder 的产物都不得残留 `{{`；
+// 每份 prompt 都含自己 log 的绝对路径与「用 Write 工具」一句（防 Read-before-Write 撞墙）。
 
 import fs from 'node:fs';
 import path from 'node:path';
 
-/** P3 搬到最终路径时只改这一个常量。 */
-export const NEXT_AGENTS_SUBDIR = path.join('agents', 'next');
+/** prompt 资产的根目录（相对 cfg.root）。 */
+export const AGENTS_SUBDIR = 'agents';
 
 const SECTION_RE = /^<!--\s*section:\s*([a-z0-9-]+)\s*-->\s*$/;
 const PLACEHOLDER_RE = /\{\{([^{}]+)\}\}/g;
 
 function agentsDir(cfg) {
-  return path.join(cfg.root, NEXT_AGENTS_SUBDIR);
+  return path.join(cfg.root, AGENTS_SUBDIR);
 }
 
 function readFile(p) {
