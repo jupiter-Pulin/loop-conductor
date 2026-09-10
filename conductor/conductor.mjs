@@ -103,6 +103,7 @@ export function loadCfg(root = resolveRoot()) {
     greenGateTimeoutMs: 1800000,
     lockHeartbeatMs: 60000,
     maxStepsPerTask: 20,
+    fuseStreak: 3, // 保险丝（AC-024）：同一 (role, package) 连续 N 条记录签名相同即收箱；0=关
     runBudgetUsd: null,
     models: { setup: null, feasibility: null, spec: null, specVerifier: null, maker: null, verifier: null, committer: null, reviewer: null },
   };
