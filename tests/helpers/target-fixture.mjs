@@ -80,18 +80,3 @@ export function initSecondTargetRepo(dir) {
   git(dir, 'commit', '-m', 'second target repo: extra commit to diverge HEAD from sibling fixtures');
   return dir;
 }
-
-/**
- * 同上，但额外把一个 harness artifact（.claude_review_state.json）预先 commit 进目标仓库，
- * 让它「已被目标仓库追踪」。供 tracked_harness_artifact_conflict 测试用（契约 §8 / AC-016）。
- */
-export function initTargetRepoWithTrackedHarness(dir) {
-  initTargetRepo(dir);
-  fs.writeFileSync(
-    path.join(dir, '.claude_review_state.json'),
-    `${JSON.stringify({ note: 'pre-existing harness artifact tracked by target repo' }, null, 2)}\n`,
-  );
-  git(dir, 'add', '-A');
-  git(dir, 'commit', '-m', 'target repo: pre-tracked harness artifact (.claude_review_state.json)');
-  return dir;
-}
