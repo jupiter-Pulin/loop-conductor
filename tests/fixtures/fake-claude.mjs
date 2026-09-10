@@ -6,11 +6,17 @@
 //            [{type:'rateLimit', resets_at, rate_limit_type}]
 //                                                 发一条 rejected rate_limit_event + is_error result
 //                                                 后非零退出（五小时/周限额，真实末三行形状）
+//            [{type:'writeLog', content, path?}]  把 content 写成 JSON 到 prompt 里注入的 log 绝对
+//                                                 路径（*.log.json；path 可显式覆盖）
+//            [{type:'truncateAfterWrite'}]        发 subtype=error_max_turns 的 result 后 exit 1，
+//                                                 模拟「写完 log 就撞轮次上限」（reviewer 增量协议）
 //   exitCode: 非零则报错退出（模拟 CLI 失败 / resume 失效）
 //   exitCodeAfterResult: 先照常发 result 事件再以该码退出（模拟 error_max_turns：CLI 留下
 //                        subtype=error_max_turns 的 result 事件后 exit 1）
 //   session_id / cost / result: 拼成 --output-format stream-json 的 result 事件
 // 全部调用的 argv+cwd 追加记录到 FAKE_CLAUDE_LOG，测试据此断言（如 resume 是否带 -r）。
+// 并发计数探针：设 FAKE_CLAUDE_INFLIGHT_LOG 时每次调用在开始/结束各追加一行
+//   {call, phase:'start'|'end', ms}，供测试用 maxInFlight() 断言同时在飞的进程数。
 // 任何测试都不许调用真 claude 二进制 —— 本文件就是替身。
 import fs from 'node:fs';
 import path from 'node:path';
@@ -36,6 +42,24 @@ if (process.env.FAKE_CLAUDE_LOG) {
   );
 }
 
+/** prompt 里注入的 log 绝对路径（取最后一个 *.log.json，即交付段那一条）。 */
+function logPathFromPrompt(text) {
+  const matches = String(text ?? '').match(/\/[^\s"'`]*\.log\.json/g);
+  return matches && matches.length > 0 ? matches[matches.length - 1] : null;
+}
+
+// 并发计数探针（P2b 的并行 spawn 用；本阶段只实现 + 单测）。append 对小行是原子的，
+// start/end 两行足以精确还原任意时刻的在飞进程数。
+const inflightLog = process.env.FAKE_CLAUDE_INFLIGHT_LOG;
+if (inflightLog) {
+  fs.appendFileSync(inflightLog, `${JSON.stringify({ call: n, phase: 'start', ms: Date.now() })}\n`);
+  process.on('exit', () => {
+    try {
+      fs.appendFileSync(inflightLog, `${JSON.stringify({ call: n, phase: 'end', ms: Date.now() })}\n`);
+    } catch { /* 探针写失败不影响被测行为 */ }
+  });
+}
+
 const step = scenario[n];
 if (!step) {
   console.error(`fake-claude: scenario has no step #${n}（多余的 spawn？）`);
@@ -49,6 +73,28 @@ for (const a of step.actions ?? []) {
     fs.writeFileSync(p, a.content);
   } else if (a.type === 'deleteFile') {
     fs.rmSync(path.resolve(process.cwd(), a.path), { force: true });
+  } else if (a.type === 'writeLog') {
+    // log 的绝对路径由内核注入 prompt（契约第一条）：这里按 agent 的做法从 prompt 里取，
+    // 顺带钉住「prompt 真的带了绝对路径」——路径漏注入时测试当场红。
+    const target = a.path ? path.resolve(process.cwd(), a.path) : logPathFromPrompt(prompt);
+    if (!target) {
+      console.error('fake-claude: writeLog 找不到 log 路径（prompt 未注入 *.log.json 绝对路径？）');
+      process.exit(2);
+    }
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, typeof a.content === 'string' ? a.content : `${JSON.stringify(a.content, null, 2)}\n`);
+  } else if (a.type === 'truncateAfterWrite') {
+    // 撞 max-turns：CLI 留下 subtype=error_max_turns 的 result 事件后非零退出。
+    await writeEvent({
+      type: 'result',
+      subtype: 'error_max_turns',
+      is_error: true,
+      num_turns: step.num_turns ?? 30,
+      session_id: step.session_id ?? `fake-sess-${n}`,
+      total_cost_usd: step.cost ?? 0.01,
+      result: '',
+    });
+    process.exit(1);
   } else if (a.type === 'rateLimit') {
     // 五小时/周限额：形状照抄 dossier/task-20260829-002/maker-r1.stream.jsonl 的末三行
     // （rejected rate_limit_event → 合成 assistant 报错消息 → is_error 的 result 后非零退出）。
