@@ -3,9 +3,12 @@
 // 决定 outcome，其后 not_run，没配置的 skipped。真子进程与真 git 的部分在集成测试里。
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
-  runPrecommitSteps, stepPlan, blankSteps, summarizeSteps, composePrecommitRecord,
-  parseTestCounts, firstFailureLine, TIER_ORDER,
+  runPrecommit, runPrecommitSteps, stepPlan, blankSteps, summarizeSteps, composePrecommitRecord,
+  parseTestCounts, firstFailureLine, precommitRecordPath, TIER_ORDER,
 } from '../../conductor/lib/precommit.mjs';
 import { readPrecommitProfile } from '../../conductor/lib/profile.mjs';
 import { validateLog } from '../../conductor/lib/log-contract.mjs';
@@ -329,4 +332,64 @@ test('tail 受 tailBytes 约束', async () => {
   });
   const unit = res.steps.find((s) => s.step === 'unit');
   assert.equal(Buffer.from(unit.tail, 'utf8').length, 100);
+});
+
+// ---- 零适用步骤不是 ok：profile 解析不出 unit 时 precommit 必须 fail ----
+//
+// 建单时 `new` 校验过 precommit 段，但 profile 是人手写的文件，之后随时可能被改空。
+// 三步全 skipped 而 outcome=ok 会让 need_precommit=false —— merge 闸在零验证下打开。
+
+function tmpCfg(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'precommit-profile-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  return {
+    root,
+    cfg: {
+      root,
+      stateDir: path.join(root, 'state'),
+      dossierDir: path.join(root, 'dossier'),
+      worktreesDir: path.join(root, 'worktrees'),
+      targetProfilesDir: path.join(root, 'target-profiles'),
+      targetRepo: path.join(root, 'target'),
+      baseBranch: 'main',
+    },
+  };
+}
+
+test('profile 解析不出 unit 命令 → outcome fail、summary 以 profile_unusable 开头、三步 not_run', async (t) => {
+  const { cfg, root } = tmpCfg(t);
+  const record = await runPrecommit({
+    cfg,
+    id: 'task-20260910-001',
+    task: { id: 'task-20260910-001', targetRepo: cfg.targetRepo, baseBranch: 'main', testCommand: '' },
+    round: 3,
+    tier: 'integration',
+    profile: { build: null, service: null, unit: null, integration: null, e2e: null },
+  });
+
+  assert.equal(record.outcome, 'fail', '什么都没跑过就不可能是 ok');
+  assert.match(record.summary, /^profile_unusable/);
+  assert.deepEqual(record.steps.map((s) => s.status), ['not_run', 'not_run', 'not_run', 'not_run']);
+  assert.equal(record.tier, 'integration', 'tier 仍是 router 点的那个');
+  // 记录必须照常过契约（router 读到的是一条合法记录，不是异常路径）。
+  assert.deepEqual(validateLog(record, 'precommit'), { ok: true, errors: [] });
+  // 落盘位置照旧，且没有为它建候选 worktree。
+  const onDisk = JSON.parse(fs.readFileSync(precommitRecordPath(path.join(root, 'dossier', 'task-20260910-001'), 3), 'utf8'));
+  assert.equal(onDisk.summary, record.summary);
+  assert.equal(fs.existsSync(path.join(root, 'worktrees')), false, '连候选都不该建');
+});
+
+test('unit 回落 task.testCommand 时 profile 仍算可用（不误伤只有 testCommand 的仓库）', async (t) => {
+  const { cfg } = tmpCfg(t);
+  const record = await runPrecommit({
+    cfg,
+    id: 'task-20260910-002',
+    task: { id: 'task-20260910-002', targetRepo: cfg.targetRepo, baseBranch: 'main', testCommand: 'node --test' },
+    round: 1,
+    tier: 'unit',
+    setupProfileJson: { precommit: {} }, // 段在、unit 缺 → 回落 testCommand
+  });
+  // 越过 profile 闸后死在下一道闸（仓库都不存在），证明它没被 profile_unusable 短路。
+  assert.equal(record.outcome, 'fail');
+  assert.match(record.summary, /^分支不存在/);
 });
