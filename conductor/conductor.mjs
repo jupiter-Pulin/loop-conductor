@@ -101,6 +101,8 @@ export function loadCfg(root = resolveRoot()) {
     inactivityTimeoutMs: 600000,
     spawnWallClockMs: 14400000,
     greenGateTimeoutMs: 1800000,
+    precommitStepTimeoutMs: null, // precommit 单步墙钟上限；null = 取 greenGateTimeoutMs（spec §config）
+    precommitLockTimeoutMs: 1800000, // 等 state/.precommit.lock 的上限，超时记 lock_timeout（AC-050）
     lockHeartbeatMs: 60000,
     maxStepsPerTask: 20,
     fuseStreak: 3, // 保险丝（AC-024）：同一 (role, package) 连续 N 条记录签名相同即收箱；0=关
@@ -116,6 +118,8 @@ export function loadCfg(root = resolveRoot()) {
   delete merged.maxDrainSteps;
   return {
     ...merged,
+    // 缺省即「与绿门同一量级」：precommit 的每一步都是跑真命令，没有理由比绿门更短。
+    precommitStepTimeoutMs: merged.precommitStepTimeoutMs ?? merged.greenGateTimeoutMs,
     deprecatedMaxDrainStepsConfigured,
     root,
     targetRepo: path.resolve(root, merged.targetRepo),
