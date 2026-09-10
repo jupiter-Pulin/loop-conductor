@@ -41,7 +41,45 @@ export const DEFAULT_BUGFIX_SPEC = [
   '',
 ].join('\n');
 
-export function makeEnv(t, { config = {}, trackedHarness = false } = {}) {
+/** fake-claude 的版本字符串（模型探测缓存键的一半）。每进程只探一次。 */
+let fakeClaudeVersion = null;
+function detectFakeClaudeVersion() {
+  if (fakeClaudeVersion == null) {
+    const r = spawnSync(process.execPath, [FAKE_CLAUDE, '--version'], { encoding: 'utf8' });
+    fakeClaudeVersion = String(r.stdout ?? '').trim().split('\n')[0].trim() || 'unknown';
+  }
+  return fakeClaudeVersion;
+}
+
+/**
+ * 预填模型可用性缓存：默认模型（claude-opus-5）在测试里恒可用，`run` 不该为它多起一次
+ * 探测 spawn 而把剧本步骤全部错位。要测 AC-052 的终止路径时，配一个没预填的模型 id 即可。
+ */
+function seedModelProbeCache(root, models) {
+  const version = detectFakeClaudeVersion();
+  const entries = {};
+  for (const m of models) {
+    entries[`${m}@${version}`] = { ok: true, model: m, claude_version: version, checked_at: '2026-01-01T00:00:00.000Z' };
+  }
+  fs.mkdirSync(path.join(root, 'state'), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, 'state', '.model-probe.json'),
+    `${JSON.stringify({ schema_version: 1, entries }, null, 2)}\n`,
+  );
+}
+
+/** 把仓库里真实的 agents/next（新四角色 prompt + few-shot）复制进临时根，让 prompt 拼装是真的。 */
+function copyNextAgents(root) {
+  const src = path.join(REPO_ROOT, 'agents', 'next');
+  if (!fs.existsSync(src)) return;
+  fs.cpSync(src, path.join(root, 'agents', 'next'), { recursive: true });
+}
+
+export function makeEnv(t, {
+  config = {},
+  trackedHarness = false,
+  seedModels = ['claude-opus-5'],
+} = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'conductor-it-'));
   for (const d of ['state/queue', 'state/done', 'state/failed', 'specs', 'dossier', 'worktrees', 'agents', 'target-profiles']) {
     fs.mkdirSync(path.join(root, d), { recursive: true });
@@ -49,6 +87,8 @@ export function makeEnv(t, { config = {}, trackedHarness = false } = {}) {
   for (const [name, content] of Object.entries(AGENT_STUBS)) {
     fs.writeFileSync(path.join(root, 'agents', name), content);
   }
+  copyNextAgents(root);
+  seedModelProbeCache(root, seedModels);
   // config 默认含 baseBranch:'main'（target fixture 用 main 建仓），可由 config 覆盖。
   const fullConfig = {
     budgetUsd: 5,
@@ -94,6 +134,15 @@ export function makeEnv(t, { config = {}, trackedHarness = false } = {}) {
         fs.rmSync(`${scenarioPath}.counter`, { force: true });
         fs.rmSync(logPath, { force: true });
       }
+    },
+
+    /**
+     * 往剧本尾部追加步骤（不动调用计数）。多轮驱动的测试用它，别用 setScenario(..., {reset:false})：
+     * 后者会把已消费的前缀一起覆盖掉，导致下一次调用落在数组外、fake-claude exit 2。
+     */
+    appendScenario(steps) {
+      const cur = JSON.parse(fs.readFileSync(scenarioPath, 'utf8'));
+      fs.writeFileSync(scenarioPath, JSON.stringify([...cur, ...steps], null, 2));
     },
 
     /** 跑一次 conductor 子命令，返回 { status, stdout, stderr }。 */
@@ -175,7 +224,7 @@ export function makeEnv(t, { config = {}, trackedHarness = false } = {}) {
       return dir;
     },
 
-    writeApprovedSetupProfile(markdown = '# Setup Profile\n\n- test: node --test\n', { targetRepo = path.join(root, 'target'), gateCommands } = {}) {
+    writeApprovedSetupProfile(markdown = '# Setup Profile\n\n- test: node --test\n', { targetRepo = path.join(root, 'target'), gateCommands, precommit } = {}) {
       const key = setupProfileKey(targetRepo);
       const dir = path.join(root, 'target-profiles', key);
       fs.mkdirSync(dir, { recursive: true });
@@ -188,8 +237,75 @@ export function makeEnv(t, { config = {}, trackedHarness = false } = {}) {
         approved_at: '2026-06-11T00:00:00.000Z',
         source_task_id: 'test',
         ...(gateCommands !== undefined ? { gateCommands } : {}),
+        ...(precommit !== undefined ? { precommit } : {}),
       }, null, 2)}\n`);
       return dir;
+    },
+
+    /** 只写 setup-profile.json 的 precommit 段（新 `new` 的建单前置；不需要 approved 那一套）。 */
+    writePrecommitProfile(precommit = { unit: 'node --test' }, { targetRepo = path.join(root, 'target') } = {}) {
+      const key = setupProfileKey(targetRepo);
+      const dir = path.join(root, 'target-profiles', key);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'setup-profile.json'), `${JSON.stringify({
+        schema_version: 1, profile_key: key, targetRepo, approved: true, precommit,
+      }, null, 2)}\n`);
+      return dir;
+    },
+
+    /** 落盘一个 brief 文件，返回绝对路径（`new --brief <file>` 用）。 */
+    writeBrief(content = '把 median 的偶数分支改成取中间两数平均。\n', name = 'brief.md') {
+      const p = path.join(root, name);
+      fs.writeFileSync(p, content);
+      return p;
+    },
+
+    /**
+     * 直接落盘一个新状态机任务（stage=ROUTING），绕过 `new`。
+     * runtime 字段严格按 spec 列的那几个，便于断言「没有 miss / inval / epoch」。
+     */
+    writeRouterTask(id, {
+      title = 'median 偶数分支返回错误',
+      brief = '把 median 的偶数分支改成取中间两数平均，并补一条在旧代码上会失败的测试。\n',
+      stage = 'ROUTING',
+      baseBranch = 'main',
+      testCommand = 'node --test',
+      targetRepo = path.join(root, 'target'),
+      specApproved = false,
+      currentRound = 0,
+      awaiting = null,
+      spent = 0,
+      lastFailureType = null,
+      rateLimit = null,
+    } = {}) {
+      const dir = path.join(queueDir, id);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'task.json'), `${JSON.stringify({
+        schema_version: 1, id, title, repo: path.basename(targetRepo), targetRepo, baseBranch, testCommand,
+        created_at: '2026-09-10T00:00:00.000Z',
+      }, null, 2)}\n`);
+      fs.writeFileSync(path.join(dir, 'runtime.json'), `${JSON.stringify({
+        schema_version: 1,
+        stage,
+        current_round: currentRound,
+        awaiting,
+        spec_approved: specApproved,
+        plan_active: false,
+        plan_source: null,
+        rate_limit: rateLimit,
+        spent_usd: spent,
+        last_failure_type: lastFailureType,
+        updated_at: '2026-09-10T00:00:00.000Z',
+      }, null, 2)}\n`);
+      if (brief != null) fs.writeFileSync(path.join(dir, 'brief.md'), brief);
+      return dir;
+    },
+
+    /** dossier/<id>/events.jsonl → 事件数组（文件不存在返回 []）。 */
+    events(id) {
+      const p = path.join(root, 'dossier', id, 'events.jsonl');
+      if (!fs.existsSync(p)) return [];
+      return fs.readFileSync(p, 'utf8').split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
     },
 
     /** 编辑 queue 中某任务的 spec.md 草稿（bugfix 人类工作流：new 后填验收标准）。 */
