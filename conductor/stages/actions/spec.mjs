@@ -20,7 +20,7 @@ import { logPathFor } from '../../lib/agent-settings.mjs';
 import { rateLimitedToBox } from '../shared.mjs';
 import {
   checkBudgetAndBox, openHumanGate, packagesDraftPath, readBriefText, relRef,
-  spawnAgentRound, specDraftPath, specRejectNotes, taskCfg,
+  spawnAgentRound, spawnSkipped, specDraftPath, specRejectNotes, taskCfg,
 } from '../router-kernel.mjs';
 
 /**
@@ -72,6 +72,8 @@ export default async function specAction(ts, cfg, { round, records }) {
     held.cleanup();
   }
 
+  // run 级闸门拦下：spec-agent 根本没跑，不能拿上一版草稿去开人闸。
+  if (spawnSkipped(res)) return { changed: false };
   const limited = rateLimitedToBox(ts, cfg, 'spec', res);
   if (limited) return limited;
 

@@ -14,7 +14,7 @@ import { git, removeWorktree, deleteBranch } from '../lib/git.mjs';
 import { runClaudeWithRetry } from '../lib/claude.mjs';
 import { buildAgentSpawnSpec, writeAgentSettings } from '../lib/agent-settings.mjs';
 import { checkFuse } from '../lib/fuse.mjs';
-import { accountSpawnCost, failToBox, finishSpawnRecord, startSpawnRecord } from './shared.mjs';
+import { accountSpawnCost, canStartSpawn, failToBox, finishSpawnRecord, startSpawnRecord } from './shared.mjs';
 
 /**
  * 任务级配置解析：task.json 快照的 targetRepo 覆盖全局 cfg.targetRepo，使同一次 drain 中
@@ -109,10 +109,22 @@ export function openHumanGate(ts, cfg, { kind, requestedBy = 'kernel', summary, 
 
 // ---- spawn ----
 
+/** spawn 被 run 级闸门拦下：调用方据此原地返回，绝不把它当成一次「跑过的 spawn」。 */
+export function spawnSkipped(res) {
+  return res?.skipped === true;
+}
+
 /**
  * 派一个 agent 并留档。返回 lib/claude.mjs 的原始结果（限额/失败都原样交回调用方判断）。
  * 落盘顺序：settings → started 标记 → spawn → done 标记 + 成本入账 + runtime 落盘。
  * 内核绝不改 agent 写的 log；log 的读取一律走 lib/records.mjs。
+ *
+ * **run 级闸门在这里复查**（AC-021）：`canStartSpawn` 是本次 run 的限额 / runBudget 总闸。
+ * ROUTING 只在派 router 前查过一次，而动作侧（maker / reviewer / spec）的 spawn 发生在那之后
+ * ——`maxConcurrentTasks > 1` 时任务 A 命中限额，同一轮里任务 B 的动作 spawn 仍会发出去，
+ * 违反「本次 run 内不再发起任何新 spawn」。闸门是全体 spawn 的唯一入口，复查也就放在这里。
+ * 被拦时零副作用：不写 settings、不留 spawn 记录、不入账、不改 stage，只由 canStartSpawn
+ * 记一行 `<role> spawn skipped: …`，调用方返回 changed:false 让本任务本轮停住。
  */
 export async function spawnAgentRound(ts, cfg, {
   role,
@@ -127,9 +139,10 @@ export async function spawnAgentRound(ts, cfg, {
 }) {
   const id = ts.id;
   const opts = { mode, pkg, planActive, packagesEnabled };
-  const spec = buildAgentSpawnSpec(cfg, id, role, round, opts);
-  writeAgentSettings(cfg, id, role, round, opts);
+  const spec = buildAgentSpawnSpec(cfg, id, role, round, opts); // 纯函数：拿 log 名给闸门用
   const base = path.basename(spec.logPath).replace(/-r\d+\.log\.json$/, '');
+  if (!canStartSpawn(ts, cfg, base)) return { ok: false, skipped: true, costUsd: 0, error: 'spawn_blocked' };
+  writeAgentSettings(cfg, id, role, round, opts);
   const streamFile = state.dossierPath(cfg, id, `${base}-r${round}.stream.jsonl`);
   const rec = startSpawnRecord(cfg, id, base, round, {
     role,

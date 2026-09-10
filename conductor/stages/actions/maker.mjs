@@ -10,8 +10,8 @@ import { buildMakerPrompt } from '../../lib/prompts.mjs';
 import { logPathFor } from '../../lib/agent-settings.mjs';
 import { HARNESS_ARTIFACTS, rateLimitedToBox, worktreePath } from '../shared.mjs';
 import {
-  checkBudgetAndBox, readBriefText, readFrozenSpec, spawnAgentRound, specGateNotes, taskBranchName,
-  taskCfg,
+  checkBudgetAndBox, readBriefText, readFrozenSpec, spawnAgentRound, spawnSkipped, specGateNotes,
+  taskBranchName, taskCfg,
 } from '../router-kernel.mjs';
 
 /**
@@ -58,6 +58,8 @@ export default async function makerAction(ts, cfg, { round, records }) {
   });
 
   const res = await spawnAgentRound(ts, cfg, { role: 'maker', round, prompt, cwd: wt });
+  // run 级闸门拦下（本次 run 已命中限额 / runBudget）：这一轮什么都没发生，不提交、不留记录。
+  if (spawnSkipped(res)) return { changed: false };
   const limited = rateLimitedToBox(ts, cfg, 'maker', res);
   if (limited) return limited;
 
