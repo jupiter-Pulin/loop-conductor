@@ -5,8 +5,9 @@ import path from 'node:path';
 
 export const STALE_MS = 30 * 60 * 1000;
 
-export function lockDirPath(stateDir) {
-  return path.join(stateDir, '.lock');
+/** 锁名可选：run 的全局锁用默认 `.lock`，precommit 的串行锁用 `.precommit.lock`（同一协议，两把锁）。 */
+export function lockDirPath(stateDir, name = '.lock') {
+  return path.join(stateDir, name);
 }
 
 export function isStaleLock(lockDir, now = Date.now(), staleMs = STALE_MS) {
@@ -40,8 +41,8 @@ export function isPidAlive(pid) {
 }
 
 /** 返回 { acquired, stale?, info?, selfHealed? }。失败不抛错，由调用方决定退出。 */
-export function acquireLock(stateDir, { onSelfHeal = null } = {}) {
-  const lockDir = lockDirPath(stateDir);
+export function acquireLock(stateDir, { onSelfHeal = null, name = '.lock' } = {}) {
+  const lockDir = lockDirPath(stateDir, name);
   fs.mkdirSync(stateDir, { recursive: true });
   try {
     fs.mkdirSync(lockDir); // 原子：已存在则 EEXIST
@@ -73,8 +74,8 @@ export function acquireLock(stateDir, { onSelfHeal = null } = {}) {
   return { acquired: true };
 }
 
-export function releaseLock(stateDir) {
-  fs.rmSync(lockDirPath(stateDir), { recursive: true, force: true });
+export function releaseLock(stateDir, name = '.lock') {
+  fs.rmSync(lockDirPath(stateDir, name), { recursive: true, force: true });
 }
 
 export function startLockHeartbeat(stateDir, intervalMs) {
