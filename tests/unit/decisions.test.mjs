@@ -8,7 +8,13 @@ import {
   needsFeasibilityAction, feasibilityApprovalNext, feasibilityContractInvalidNext,
   specScaleGateViolation, validateSpecVerifierVerdict, validateVerifierVerdict, MAX_MISS, STAGES,
   sameSignatureStreak, normalizeGateCommands, resolveGateCommands, checkEvidenceAnchors, validateReviewReport,
+  ROUTER_STAGES, HUMAN_GATE_KINDS, legacyMaxTurns,
 } from '../../conductor/stages/decisions.mjs';
+import * as fsSync from 'node:fs';
+import * as pathSync from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const REPO_ROOT_FOR_DECISIONS = pathSync.resolve(pathSync.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 test('markerStatus：双标记四态', () => {
   assert.equal(markerStatus(null), 'none');
@@ -618,4 +624,72 @@ test('validateReviewReport：finding 七字段 / acCoverage 覆盖纪律 / tests
   assert.ok(badTests.errors.some((e) => e.includes('tests.run[1].status')));
 
   assert.equal(validateReviewReport(null, REVIEW_ACS).ok, false);
+});
+
+// ---- AC-005：内核自行发起的 stage 转移只有六条 ----
+//
+// 这条 AC 的执法方式是「枚举全部 transitionState 调用点，与六条对照」。做法是静态扫新状态机
+// 的文件（stages/routing.mjs、await_human.mjs、actions/*、conductor.mjs 的人闸与 retry 面），
+// 把每个调用点的目标 stage 与它所在的函数记下来——多出一个调用点，这个测试就该红。
+
+test('AC-005：新状态机里 transitionState 的调用点与六条自发转移一一对应', () => {
+  const files = [
+    'conductor/stages/routing.mjs',
+    'conductor/stages/await_human.mjs',
+    'conductor/stages/actions/spec.mjs',
+    'conductor/stages/actions/maker.mjs',
+    'conductor/stages/actions/review.mjs',
+    'conductor/stages/actions/precommit.mjs',
+    'conductor/stages/router-kernel.mjs',
+  ];
+  const sites = [];
+  for (const rel of files) {
+    const body = fsSync.readFileSync(pathSync.join(REPO_ROOT_FOR_DECISIONS, rel), 'utf8');
+    for (const m of body.matchAll(/state\.transitionState\(\s*ts,\s*cfg,\s*'([A-Z_]+)'/g)) {
+      sites.push({ file: rel, stage: m[1] });
+    }
+    // failToBox 是 FAILED_BOX 的唯一封装口，一并计入。
+    for (const m of body.matchAll(/failToBox\(\s*\n?\s*ts,\s*cfg,/g)) {
+      sites.push({ file: rel, stage: 'FAILED_BOX', via: 'failToBox' });
+    }
+  }
+
+  // router-kernel.mjs：openHumanGate（spec / merge / help 三种闸共用）与 checkFuse/checkBudget 的收箱。
+  assert.deepEqual(
+    sites.filter((s) => s.file === 'conductor/stages/router-kernel.mjs').map((s) => s.stage).sort(),
+    ['AWAIT_HUMAN', 'FAILED_BOX', 'FAILED_BOX'],
+    'router-kernel 只有：开人闸 1 处 + 保险丝收箱 + 预算收箱',
+  );
+  // routing.mjs：abandon 一处收箱（限额收箱在 shared.mjs::rateLimitedToBox，属既有 P0 面）。
+  assert.deepEqual(
+    sites.filter((s) => s.file === 'conductor/stages/routing.mjs').map((s) => s.stage),
+    ['FAILED_BOX'],
+    'routing 自己只在 abandon 处收箱，其余转移都走 router-kernel 的封装',
+  );
+  // 四个动作文件本身不转移 stage：它们只产生记录，去向由 routing / router-kernel 决定。
+  for (const rel of ['conductor/stages/actions/maker.mjs', 'conductor/stages/actions/review.mjs', 'conductor/stages/actions/precommit.mjs']) {
+    assert.deepEqual(sites.filter((s) => s.file === rel), [], `${rel} 不该自己转移 stage`);
+  }
+  // spec 动作唯一的转移是「通过校验 → AWAIT_HUMAN(spec)」，且走 openHumanGate。
+  assert.deepEqual(sites.filter((s) => s.file === 'conductor/stages/actions/spec.mjs'), []);
+  assert.match(
+    fsSync.readFileSync(pathSync.join(REPO_ROOT_FOR_DECISIONS, 'conductor/stages/actions/spec.mjs'), 'utf8'),
+    /openHumanGate\(ts, cfg, \{\s*\n\s*kind: 'spec'/,
+  );
+  // await_human 是停车位：一次转移都没有。
+  assert.deepEqual(sites.filter((s) => s.file === 'conductor/stages/await_human.mjs'), []);
+});
+
+test('AC-001：STAGES 含新状态机四个 stage；ROUTER_STAGES 就是那四个', () => {
+  for (const s of ['ROUTING', 'AWAIT_HUMAN', 'FAILED_BOX', 'DONE']) {
+    assert.ok(STAGES.includes(s), `STAGES 应含 ${s}`);
+  }
+  assert.deepEqual([...ROUTER_STAGES], ['ROUTING', 'AWAIT_HUMAN', 'FAILED_BOX', 'DONE']);
+  assert.deepEqual([...HUMAN_GATE_KINDS], ['spec', 'merge', 'help']);
+});
+
+test('AC-027：legacyMaxTurns 缺省 30，配置值优先', () => {
+  assert.equal(legacyMaxTurns({}), 30);
+  assert.equal(legacyMaxTurns({ legacyMaxTurns: 12 }), 12);
+  assert.equal(legacyMaxTurns(null), 30);
 });

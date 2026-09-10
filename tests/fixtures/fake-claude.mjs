@@ -23,6 +23,14 @@ import path from 'node:path';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// `claude --version`：模型探测的缓存键有一半是二进制版本（lib/model-probe.mjs）。
+// 必须在读 stdin / 剧本之前短路——它不是一次「调用」，不该消费剧本步骤、不该进调用日志。
+const FAKE_CLAUDE_VERSION = '0.0.0-fake (fake-claude)';
+if (process.argv.includes('--version')) {
+  process.stdout.write(`${FAKE_CLAUDE_VERSION}\n`);
+  process.exit(0);
+}
+
 const scriptPath = process.env.FAKE_CLAUDE_SCRIPT;
 if (!scriptPath) {
   console.error('fake-claude: FAKE_CLAUDE_SCRIPT not set');
