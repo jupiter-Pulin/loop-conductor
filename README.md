@@ -1,169 +1,183 @@
-# will-workflow / Loop Conductor
+# Loop Conductor
 
-面向 agent 的项目索引。本文件只做路由，不做长说明；当前事实源是代码和测试。没有被这里链接的文档视为历史材料，不作为实现依据。
+A minimal kernel that runs an agent loop end to end: a **router agent** picks the next action from a closed set, the kernel executes it, records the facts, and stops at the two gates where a human has to decide — approving the spec, and approving the merge. Everything else — retries, budget, worktrees, the pre-commit regression, branch cleanup — is machine-owned.
 
-English readers: see [`README.en.md`](README.en.md) for a human-facing overview of this project.
+> Agents working inside this repo start from [`AGENTS.md`](AGENTS.md), a Chinese routing index. This page is the human-facing tour.
 
-内核只产事实、守上限、记案卷；**router agent** 在闭集动作里选下一步；**人**只在两道闸出现——spec 审批与 merge 审批。角色是 router / spec / maker / reviewer 四个。
+> **Work packages (parallel makers) and the `plan` action are not implemented yet.** `packagesEnabled` defaults to `false`: the `plan` action is rejected, the spec prompt carries no work-package section, `specs/<id>.packages.json` is not writable, and a `packages` field in a router log is invalid. Everything below describes the single-maker path, which is the whole system today.
 
-> **P2b（工作包 / `plan` 动作）尚未落地，`packagesEnabled` 默认 false。**
-> 关着的时候：`plan` 动作被 `action_rejected`、spec prompt 不含工作包段、写白名单不放行 `specs/<id>.packages.json`、router log 里出现 `packages` 字段即判 invalid、`approve --no-packages` 被忽略。
-> 因此 `conductor/lib/packages.mjs`、`conductor/lib/integration.mjs`、`conductor/stages/actions/plan.mjs` 目前**不存在**——`agents/` 里的工作包段与条件段已写好但注入不到，等 P2b 接线。
+## What this is
 
-## 入口
+Loop Conductor is a single-machine orchestrator for Claude CLI agents. A task enters as one line of intent and leaves as a merged branch, or as an archived failure with a full paper trail. It is deliberately small:
 
-| 你要找 | 打开 |
-| --- | --- |
-| CLI、配置默认值、人闸动词、遗留任务闸 | `conductor/conductor.mjs` |
-| ROUTING 每轮：拼 prompt → spawn router → 校前置 → 执行 | `conductor/stages/routing.mjs` |
-| AWAIT_HUMAN（停车位，只等 CLI 裁决） | `conductor/stages/await_human.mjs` |
-| 内核面：spawn 留档、开人闸、保险丝/预算收箱、产物清理、taskCfg | `conductor/stages/router-kernel.mjs` |
-| 四个动作（spec / maker / review / precommit） | `conductor/stages/actions/*.mjs` |
-| 成本入账、限额收箱、failToBox | `conductor/stages/shared.mjs` |
-| stage 集合与几个零 IO 判据 | `conductor/stages/decisions.mjs` |
-| 执行 log 契约（`validateLog`、动作闭集、角色/字段规则） | `conductor/lib/log-contract.mjs` |
-| 记录合成 + router 事实段渲染 | `conductor/lib/records.mjs` |
-| 版本规则（`needReview` / `needPrecommit` / `mergeAllowed`） | `conductor/lib/version-gate.mjs` |
-| precommit 三步（候选 worktree / build / service / 分层测试 / 全局锁） | `conductor/lib/precommit.mjs` |
-| 保险丝（同签名连击） | `conductor/lib/fuse.mjs` |
-| 模型可用性探测 + 版本键缓存 | `conductor/lib/model-probe.mjs` |
-| 四角色 prompt 拼装 | `conductor/lib/prompts.mjs` |
-| 每轮 spawn 参数、写白名单、Stop hook、maxTurns | `conductor/lib/agent-settings.mjs` |
-| agent hook 脚本（写白名单 / log 契约预检 / spec 契约预检 / maker git 护栏） | `conductor/hooks/` |
-| Claude CLI 封装、瞬态重试、限额事件解析 | `conductor/lib/claude.mjs` |
-| worktree、diff、commit、merge | `conductor/lib/git.mjs` |
-| spec 交付契约（spec-doc/v1，AC 枚举/校验） | `conductor/lib/spec-contract.mjs` |
-| target profile（含 `precommit` 段读取与校验） | `conductor/lib/profile.mjs` |
-| 状态布局、dossier helper、事件流 | `conductor/lib/state.mjs` |
-| 四角色 prompt 与 few-shot | `agents/*.md`、`agents/fewshot/*.md` |
-| 看板与人闸 UI | `conductor/dashboard/` |
-| 本地配置样例 | `conductor.config.json` |
-| commit / 分支规范 | `.claude/skills/git-conventions/SKILL.md` |
-| 冷 session 发起任务的入口 skill | `.claude/skills/loop-task/SKILL.md` |
-| 行为 case | `tests/integration/*.test.mjs` |
-| 单元级不变量 | `tests/unit/*.test.mjs` |
-| 跨任务失败分布/成本/轮次聚合 CLI | `tools/dossier-stats.mjs`（`node tools/dossier-stats.mjs [--json] [--task <id>]`） |
-| 当前设计与验收标准 | `docs/features/router-conductor/2-tech-spec.md` |
+- **Zero third-party dependencies.** `package.json` has no `dependencies` and no `devDependencies`, and there is no lockfile. The runtime is Node plus the Claude CLI.
+- **The kernel produces facts; the router decides; the human judges twice.** The kernel never infers intent and never re-dispatches an agent on its own. It spawns, commits, merges, records, and enforces ceilings. The router only picks one action from `spec | plan | maker | review | precommit | human | merge | abandon`.
+- **Roles are separated by construction, not by prompting.** Four agent prompts (`agents/*.md`), each spawned in its own session with its own tool allowlist. The reviewer is hard-limited to `Read` / `Grep` / `Glob` / `Bash(git diff|log|show:*)` / `Write` (`conductor/lib/agent-settings.mjs`), so it physically cannot run the code it is judging. The router gets `Write` and nothing else — it cannot run git, cannot read the spec text or the diff, and cannot approve anything.
+- **One file is the whole delivery channel.** Every agent ends by writing `dossier/<id>/<role>-r<n>.log.json`; the kernel reads that file and nothing else — not the final chat message. A missing or malformed log is not an exception path, it is one field on the record (`product: missing | invalid`) handed to the router as-is.
+- **The version rule is the only ground for merging.** With `H` = task-branch HEAD and `B` = base-branch HEAD: a review is needed unless a reviewer record exists with `outcome=ok ∧ head_sha=H`; a pre-commit run is needed unless a record exists with `outcome=ok ∧ head_sha=H ∧ base_sha=B`. Human notes cannot waive either one, and both are recomputed at the moment of approval.
+- **The paper trail is the product.** Every round writes into `dossier/<id>/` — spawn records, execution logs, raw streams, per-round hook settings, pre-commit step results, human gate requests, timeline, and a structured `events.jsonl`. Cost and round counts are recoverable per task after the fact.
 
-## 当前角色
+There is also a local web dashboard (`npm run dashboard`) for watching the loop and making the human decisions in a browser instead of on the command line. Its interface strings are Chinese; see [Screenshots](#screenshots).
 
-| 角色 | Prompt | cwd | `--tools` | 写白名单 | maxTurns | 职责 |
-| --- | --- | --- | --- | --- | --- | --- |
-| router | `agents/router-agent.md` | conductor root | `Write` | 只有自己的 log | 4 | 读 brief + 记录 + 内核事实，从闭集选一个动作。永不读 spec 正文、diff、代码。 |
-| spec | `agents/spec-agent.md` | `worktrees/<id>.spec-ro`（一次性 detached @ base） | 只读三件 + `git log/blame/show` + `Write,Edit` | spec 路径 + log | 40 | 把 brief 写成 spec，覆盖全部需求；范围疑问进「待决问题」，不自行裁剪。 |
-| maker | `agents/maker-agent.md` | `worktrees/<id>`（分支 `task/<id>`） | 全部（`Bash` 免审批） | 走 maker-git-guard，不走白名单 | 70 | 实现 AC，让 `testCommand` 全绿；不删不跳既有测试。 |
-| reviewer | `agents/reviewer-agent.md` | `worktrees/<id>` | 只读三件 + `git diff/log/show` + `Write` | 只有自己的 log | 40 | 冷读 spec/brief 与整份 diff，逐条 AC 判 pass/fail，声明 tier。 |
+## State machine
 
-判断力靠 `agents/fewshot/*.md` 传，固定上下文越短越好。每个 agent 的唯一交付信号是 `dossier/<id>/<role>-r<n>.log.json`——内核读文件、不推断、不自动重派。
-
-## 状态流
+Four stages, and the stage name is the literal value in `state/<box>/<id>/runtime.json`.
 
 ```text
-new ──► ROUTING ──(router 选动作，内核执行，记录)──► ROUTING …
-ROUTING ──spec 文件通过 validateSpecDoc──► AWAIT_HUMAN(spec) ──approve / reject --notes──► ROUTING
-ROUTING ──router: merge 且版本规则满足──► AWAIT_HUMAN(merge) ──approve──► DONE
-                                                              └──reject --notes──► ROUTING
+new ──► ROUTING ──(router picks an action, kernel executes it, records it)──► ROUTING …
+
+ROUTING ──spec file passes validateSpecDoc──► AWAIT_HUMAN(spec) ──approve / reject --notes──► ROUTING
+ROUTING ──router: merge, version rule satisfied──► AWAIT_HUMAN(merge) ──approve──► DONE
+                                                                     └──reject --notes──► ROUTING
 ROUTING ──router: human──► AWAIT_HUMAN(help) ──resume [--notes]──► ROUTING
-ROUTING ──限额 rejected──► FAILED_BOX(rate_limited) ──retry（≥ resets_at）──► ROUTING
-ROUTING ──保险丝同签名连击──► FAILED_BOX(fuse_no_progress) ──retry──► ROUTING
-ROUTING ──预算耗尽──► FAILED_BOX(budget_exhausted) ──retry──► ROUTING
+ROUTING ──rate limit rejected──► FAILED_BOX(rate_limited) ──retry (≥ resets_at)──► ROUTING
+ROUTING ──fuse: same signature N times──► FAILED_BOX(fuse_no_progress) ──retry──► ROUTING
+ROUTING ──budget exhausted──► FAILED_BOX(budget_exhausted) ──retry──► ROUTING
 ROUTING ──router: abandon──► FAILED_BOX(abandoned) ──retry──► ROUTING
-ROUTING ──router 连续 2 次失效──► AWAIT_HUMAN(help, requested_by=kernel)
+ROUTING ──router fails twice in a row──► AWAIT_HUMAN(help, requested_by=kernel)
 ```
 
-内核自行发起的转移只有上面这几条（`tests/unit/decisions.test.mjs` 静态枚举 `transitionState` 的全部调用点执法），其余一切转移都由 router 的动作触发。
+Three things worth naming explicitly:
 
-**动作闭集**：`spec | plan | maker | review | precommit | human | merge | abandon`。前置违反 → 记 `action_rejected` 事实、零副作用、下一轮把原因喂回 router。
+- **Those are the only transitions the kernel starts by itself.** A unit test (`tests/unit/decisions.test.mjs`) statically enumerates every `transitionState` call site in the state machine and in the CLI and fails if a new one appears. Everything else is a router action.
+- **A rejected action costs nothing.** If the router picks an action whose preconditions do not hold — `merge` while a review is still needed, `precommit` at a tier below what the reviewer declared, `review` with no diff, `maker` before an existing spec has been approved — the kernel records `action_rejected{reason}`, produces no side effect, and feeds the reason back into the next round's fact section. Two consecutive router failures (an invalid log, or a rejected action) open a help gate: the router is the only judge, and when the judge is absent nobody else can decide.
+- **`FAILED_BOX` is a real terminal state, not a crash.** Everything is preserved — worktrees, branches, the whole dossier — so `retry` puts the task back into `ROUTING` exactly where it was. Nothing moves a task out of `FAILED_BOX` without a human: no cron, no scheduler sweep, and the dashboard's auto-run does not apply to it.
 
-**版本规则是 merge 的唯一依据**：记 `H` = 任务分支 HEAD，`B` = base 分支 HEAD。需要 review ⇔ 不存在 `outcome=ok ∧ head_sha=H` 的 reviewer 记录；需要 precommit ⇔ 不存在 `outcome=ok ∧ head_sha=H ∧ base_sha=B` 的 precommit 记录。人的 notes 不豁免任何一条，`approve` 在批准时刻重算一次。
+## Roles
 
-**P3 之前建的遗留任务只保留可读性**：queue 里出现遗留 stage 名 → scheduler 打印「未知 stage，跳过」；任何动词对它们都返回 `legacy task, not operable by this conductor` 并保持状态不变；dashboard 与 `dossier-stats` 照常渲染它们的案卷。
+Four agent prompts. Judgement is carried by few-shot examples drawn from real dossiers (`agents/fewshot/*.md`), not by long instructions — the fixed context of each prompt is a few hundred characters.
 
-## 常用命令
+| Role | Prompt | cwd | Tools | Max turns | What it does |
+| --- | --- | --- | --- | --- | --- |
+| router | `agents/router-agent.md` | conductor root | `Write` | 4 | Reads the brief, the record list, and the kernel's facts, then picks one action from the closed set. It never sees the spec text, the diff, or the code. |
+| spec | `agents/spec-agent.md` | `worktrees/<id>.spec-ro` (throwaway detached worktree at base) | `Read` `Grep` `Glob` + `git log/blame/show` + `Write` `Edit` | 40 | Turns the brief into a spec that covers **all** of it. Scope questions go into an `## 待决问题` ("open questions") table with a safe default — it may not quietly trim requirements. |
+| maker | `agents/maker-agent.md` | `worktrees/<id>` (branch `task/<id>`) | all (`Bash` pre-approved) | 70 | Implements the acceptance criteria until the test command is green. Destructive git operations are blocked by a per-round hook. |
+| reviewer | `agents/reviewer-agent.md` | `worktrees/<id>` | `Read` `Grep` `Glob` + `git diff/log/show` + `Write` | 40 | Reads the frozen spec and the whole branch diff cold — no execution — rules on every criterion individually, and declares the test tier the diff reaches. |
+
+Deleted along the way, and not coming back: setup, feasibility, spec-verifier, verifier, committer, the test-gate probe, the per-criterion evidence mapping, the maker miss ladder, and the session-resume leg. They were designed for weaker models and for a state machine that tried to substitute mechanical ladders for judgement; they burned $149 across seven failed tasks and produced zero lines of code.
+
+## Human gates
+
+Exactly **two mandatory stops**, plus one the router can open on demand:
+
+| Gate | The question | CLI |
+| --- | --- | --- |
+| `AWAIT_HUMAN(spec)` | Is this spec the thing we want, and are its acceptance criteria the ones we want to be held to? Approving freezes it into `dossier/<id>/spec.md`; every later agent is judged against that text. | `approve <id> [--notes "…"]` / `reject <id> --notes "…"` |
+| `AWAIT_HUMAN(merge)` | Ship it. The version rule is recomputed at this moment; if `H` or `B` moved, the approval is refused and the task goes back to `ROUTING`. The merge is local. **The conductor never pushes.** | `approve <id> [--message "…"]` / `reject <id> --notes "…"` |
+| `AWAIT_HUMAN(help)` | Opened by the router (or by the kernel after two router failures) when a decision is genuinely outside the machine's authority. | `resume <id> [--notes "…"]` |
+
+Notes have exactly two destinations, and they are not interchangeable. Notes given when **approving** a spec are injected verbatim into every later maker and reviewer prompt as an extra constraint. Notes given when **rejecting** a spec are rewriting instructions for the spec agent, and the rejected draft is archived on the spot so the kernel can never re-open the gate with a version a human already refused.
+
+A task with no spec is legitimate: for a bug fix with a reproduction and an expected behaviour, the router can go straight to `maker` and the brief is the contract. In that case the spec gate never opens, and the merge gate is the only stop.
+
+**There is no machine rubber-stamping.** `autoApproveSpec*` and `autoMerge*` are gone from the codebase, not merely defaulted to `false`.
+
+## Gates that are not human gates
+
+Two mechanical gates run without anyone's attention, and neither can be waived by a human note:
+
+- **`precommit`** proves, on the actual **merge candidate** (`base` checked out detached, task branch merged `--no-ff` into it), that the integrated system still builds, still starts, and still passes the tests at the declared tier — in that order: `build → service → unit [+ integration [+ e2e]]`. Steps that are not configured are recorded as `skipped`; the first applicable step that fails makes the whole run `fail` and the rest `not_run`. The service is started in its own process group and terminated in a `finally` block, so a stuck server cannot poison the next task. The candidate worktree is always removed. Only one pre-commit runs at a time machine-wide (`state/.precommit.lock`), because ports and databases are shared. The three commands are written by a human in `target-profiles/<repo>/setup-profile.json`; the kernel never guesses them, and a repo without at least a unit command cannot create a task at all.
+- **The fuse** counts *lack of progress*, not steps. The kernel computes a signature for each reviewer, maker, and pre-commit record; `fuseStreak` (default 3) identical signatures in a row for the same role sends the task to `FAILED_BOX(fuse_no_progress)`. Real work changes the facts every round; a loop does not.
+
+Rate limits get their own treatment, learned the expensive way: a five-hour or weekly limit is **not** a transient error. The retry wrapper stops at zero attempts, the task goes to `FAILED_BOX(rate_limited)` carrying `resets_at`, no further spawn goes out for the rest of that run, and only a human `retry` — at or after the reset moment — brings it back. The dashboard card shows the reset time and keeps the button disabled until then.
+
+## What it actually cost
+
+Snapshot: **2026-09-09**, taken from the author's own dossiers, before this rewrite landed. Refresh with:
 
 ```bash
-npm test                                     # 必须用 node 24；不要在仓库根裸跑 node --test
-npm run dashboard                            # 看板 + 人闸 UI（默认 4400）
-
-npm run conductor -- new --title "…" --brief <file> [--repo <path>] [--base-branch <b>]
-npm run conductor -- run                     # drain 一轮（启动先探一次 models 可用性）
-npm run conductor -- status                  # 三箱任务表
-npm run conductor -- spy                     # 只读查看 queue 里正在跑的角色与最近活动
-
-npm run conductor -- approve <id> [--notes "…"] [--message "…"]   # spec 闸冻结 / merge 闸本地合并
-npm run conductor -- reject  <id> --notes "…"                     # spec / merge 闸打回 → ROUTING
-npm run conductor -- resume  <id> [--notes "…"]                   # help 闸恢复 → ROUTING
-npm run conductor -- abandon <id>                                 # → FAILED_BOX(abandoned)
-npm run conductor -- retry   <id> [--force]                       # FAILED_BOX → ROUTING
-npm run conductor -- retry --rate-limited [--force]               # 批量恢复限额收箱的任务
+node tools/dossier-stats.mjs
 ```
 
-建单唯一前置是目标仓的 `precommit` 段（`target-profiles/<repo>/setup-profile.json`）：三步命令由人手写，内核不猜；缺了 `new` 直接拒绝并打印含全部键的样例。任何代码路径都不执行 `git push`（`tests/integration/no-push-grep.test.mjs` 静态执法）。
-
-## 数据位置
-
-| 文件 | 写入者 | 含义 |
-| --- | --- | --- |
-| `state/queue|failed|done/<id>/task.json` / `runtime.json` | 内核 | 不可变快照 / 可变状态 |
-| `state/queue/<id>/brief.md` | `new` | 需求原文 |
-| `state/.precommit.lock`、`state/.model-probe.json` | 内核 | precommit 全局串行锁；模型可用性缓存（键 = 模型 id + claude 二进制版本） |
-| `specs/<id>.md`、`dossier/<id>/spec.md` | spec-agent / 内核冻结 | 草稿 / 已批准冻结稿（草稿批准后移入 `specs/archive/`） |
-| `dossier/<id>/<role>-r<n>.log.json` | agent | 执行 log（唯一交付信号，契约见 `conductor/lib/log-contract.mjs`） |
-| `dossier/<id>/<role>-r<n>.log.hook.json` | Stop hook | 会话内校验报告 |
-| `dossier/<id>/<role>-r<n>.json`、`.stream.jsonl`、`.settings.json` | 内核 | spawn 记录（cost / killed / head_sha / base_sha）、原始流、逐轮 hook 设置 |
-| `dossier/<id>/precommit-r<n>.json`、`precommit-r<n>.service.log` | 内核 | 三步回归结果；服务进程输出 |
-| `dossier/<id>/human-r<n>.json` | 内核 | 人闸请求与裁决（kind / summary / refs / decision / notes） |
-| `dossier/<id>/router-state.json` | 内核 | ROUTING 的私有状态（失效连击、最近 action_rejected、保险丝复位轮次） |
-| `dossier/<id>/timeline.md`、`events.jsonl` | 内核 | 只增日志；事件：`router_decision`、`action_rejected`、`spec_invalid`、`human_gate_opened`、`human_decision`、`human_intervened`、`precommit_result`、`stale_review`、`main_moved`、`rate_limited`、`fuse_tripped`、`budget_exhausted`、`merged`、`stage`（`stage` 归 `eventsLogEnabled` 开关，其余恒写） |
-| `worktrees/<id>/`、`worktrees/<id>.spec-ro/`、`worktrees/<id>.precommit/` | 内核 | 任务 worktree（分支 `task/<id>`）/ spec 只读 worktree / 合并候选（用毕即删） |
-| `target-profiles/<repo>/setup-profile.json` | 人 | 目标仓的 `precommit: {build?, service?, unit, integration?, e2e?}` 段 |
-| `target/` | — | demo target repo |
-
-## Case 索引
-
-| Case | 测试 |
+| Metric | Value |
 | --- | --- |
-| 主链：brief → maker → review → precommit → merge 闸 → approve → DONE；spec 闸冻结后 maker 用冻结稿 | `tests/integration/router-flow.test.mjs` |
-| 动作前置：review 无 diff / merge 版本规则未满足 / precommit tier 过低 / maker 未批 spec / plan 阶段闸；router 失效连击开 help 闸 | `tests/integration/router-preconditions.test.mjs` |
-| 人闸：`new` 的 precommit profile 闸、spec reject → ROUTING、resume 适用范围、merge reject | `tests/integration/human-gates.test.mjs` |
-| 版本规则：人改过 HEAD / base 前进后 merge 被拒并回 ROUTING | `tests/integration/version-gate.test.mjs` |
-| 一次裁决一次有效：同一句 help summary 第二次被 `duplicate_help` 拒 | `tests/integration/one-decision.test.mjs` |
-| reviewer fail → 修复轮 prompt 带 reviewer summary，need_review 重新为真 | `tests/integration/reviewer-fail.test.mjs` |
-| reviewer 增量写 + 撞 max-turns：记录 product=ok / truncated=true | `tests/integration/reviewer-truncation.test.mjs` |
-| reviewer prompt 的 diff 字节上限降级 | `tests/integration/reviewer-diff-cap.test.mjs` |
-| spec 直写交付 + 契约门（hook 护栏 / spec_invalid / 只看文件不看自评） | `tests/integration/spec-contract-gate.test.mjs` |
-| approve 时 spec 契约终审（人工修订入口守门） | `tests/integration/approve-spec-contract-guard.test.mjs` |
-| merge 闸的 git 护栏：分支不符 / merge 失败现场还原 / 成功归档 | `tests/integration/merge-branch-guard.test.mjs` |
-| precommit 三步：候选建法、build 失败、层级累加、冲突、base 前进 | `tests/integration/precommit.test.mjs` |
-| precommit service 步：就绪 / 超时 / 崩溃 / 进程组清理 | `tests/integration/precommit-service.test.mjs` |
-| precommit 全局串行锁：等锁 / 超时 / 残锁接管 | `tests/integration/precommit-lock.test.mjs` |
-| precommit 单步墙钟上限（装死命令被杀） | `tests/integration/precommit-timeout.test.mjs` |
-| 限额收箱：进箱、本次 run 短路、retry 必须在重置时刻之后、无人操作不复活 | `tests/integration/rate-limit-box.test.mjs` |
-| 保险丝：同签名连击收箱、签名变了断连击、`fuseStreak: 0` 关闭 | `tests/integration/fuse.test.mjs` |
-| 预算耗尽 → FAILED_BOX(budget_exhausted) | `tests/integration/budget-box.test.mjs` |
-| 模型可用性探测：不可用即终止 run、缓存命中不再探 | `tests/integration/model-probe-run.test.mjs` |
-| spawn 基建失败：product=missing、内核不重派 | `tests/integration/spawn-infra-failure.test.mjs` |
-| spawn 确定性失败（EACCES 类）不吃退避阶梯、不估计入账 | `tests/integration/spawn-deterministic-failure.test.mjs` |
-| killed spawn 的成本估计入账（默认关 / 开启） | `tests/integration/unknown-spawn-cost.test.mjs` |
-| 活性护栏：inactivity / wall-clock kill 与慢而活着 | `tests/integration/liveness-kill.test.mjs` |
-| 产物清理：DONE / abandon 清干净，FAILED_BOX 保留一切 | `tests/integration/cleanup.test.mjs` |
-| 全仓无 `git push`；router 无 Bash；maker git 护栏仍拦 | `tests/integration/no-push-grep.test.mjs` |
-| maker git 护栏的 `--settings` 注入形态 | `tests/integration/maker-git-guard.test.mjs` |
-| worktree harness exclude | `tests/integration/worktree-harness.test.mjs` |
-| worktree 建自 `task.baseBranch`，不吃活体仓瞬时 HEAD | `tests/integration/worktree-base-branch.test.mjs` |
-| 任务级 targetRepo：worktree / merge / 多仓共存 / 缺字段回退 | `tests/integration/task-scoped-target-repo.test.mjs` |
-| 全局锁：双开退出、stale 告警、死 pid 残锁自愈 | `tests/integration/lock.test.mjs` |
-| 调度并发与串行 | `tests/integration/parallel-scheduling.test.mjs` |
-| per-task 锁 + spy | `tests/integration/cli-task-lock-spy.test.mjs` |
-| `maxStepsPerTask` 耗尽记日志、下次 run 续推 | `tests/integration/drain-cap.test.mjs` |
-| box/stage 崩溃巡检 | `tests/integration/crash-patrol.test.mjs` |
-| 事件流：router 事实事件恒写、`stage` 事件归观测开关 | `tests/integration/events-log.test.mjs` |
-| 遗留任务：配置键警告、未知 stage 跳过、动词一律拒绝、status/spy 并存 | `tests/integration/legacy-compat.test.mjs` |
-| node 版本警告 | `tests/integration/node-version-warning.test.mjs` |
-| web dashboard（看板聚合 + 详情 review + 同步/异步动作 + SSE） | `tests/integration/dashboard-server.test.mjs` |
+| Tasks | 17 (done 10 / failed 7) |
+| Total spend | $248.67 |
+| Spend on the seven failed tasks | $148.60, for zero lines of shipped code |
+| maker r1 one-shot pass | 16/17 |
+| maker r1 max-turns cutoff | 0/14 |
+| test-gate vacuous blocks (in its entire lifetime) | 0/17 |
 
-## 索引规则
+Read that as: the model side rarely failed. Every one of the seven failures came from the machinery around it — three tasks ($87) burned in a spec ↔ spec-verifier ping-pong that shrank findings 11 → 9 → 7 → 7 → 5 → 4 and still hit a hard ceiling, and two ($61) died because a five-hour rate limit was retried as if it were a transient 429, on specs a human had already approved. That is what the current architecture is a response to: fewer ladders, fewer roles, two human gates, and limits treated as limits.
 
-- 不在 README 写长设计说明，只加能帮下一个 agent 快速定位的链接。
-- 被代码/测试取代的设计文档直接删除，不保留互相竞争的事实源。
-- 新增稳定 workflow 时，先补最小相关测试，再把 case 链到这里。
+**Where these numbers come from, and what you can reproduce.**
+
+They are runtime dossiers, read out of two directories: `state/` (task snapshots and state-machine records) and `dossier/` (per-task spawn records, execution logs, gate results, timelines). **Both directories are in `.gitignore` and are not distributed with the public repository** — only empty skeletons are checked in.
+
+That has a direct consequence: `node tools/dossier-stats.mjs` **only produces non-zero output for someone who has actually run the loop on their own machine**. Run it in a fresh clone of this repository and the output is `0` tasks and `$0`, because there are no dossiers to read. That is a data boundary, not a bug.
+
+So treat this snapshot as **self-reported numbers plus a methodology you can re-run against your own loop**. What is reproducible is the *methodology*: every metric is one line of output from `renderMarkdown` in `tools/dossier-stats.mjs`, which reads both eras of dossier — router rounds, actions, pre-commit steps and tiers, human gates and their decisions, per-role cost — alongside the older counters. Nothing here is estimated and nothing is hand-aggregated; read the function and you can see exactly what each number counts.
+
+The snapshot also goes stale by design — it moves with every task that runs. **Take the output of the refresh command over the table above.**
+
+## Run your first task
+
+Prerequisites:
+
+- **Node 24 or newer.** The conductor warns on older majors but does not block; the test suite expects 24.
+- **No `npm install`.** There are zero third-party dependencies and no lockfile — clone and run.
+- **A working Claude CLI on your machine**, logged in and callable as `claude`. The conductor spawns it for every agent role; without it nothing runs. At the start of every `run` it probes each configured model once and aborts the run — changing no task state — if a model is unavailable.
+- **A pre-commit profile for your target repository.** `target-profiles/<repo>/setup-profile.json` must carry a `precommit` section. `new` refuses to create a task without it and prints a fully-keyed example, annotated with which keys you may delete.
+
+Then, from the repository root:
+
+```bash
+# 0. sanity check
+npm test
+
+# 1. create a task — one title, one brief file. No kind, no gates to pre-select.
+npm run conductor -- new --title "add a --json flag to the stats CLI" --brief brief.md
+# another repository, or a different base branch:
+npm run conductor -- new --title "…" --brief brief.md --repo ../other-repo --base-branch develop
+
+# 2. drive the loop; it runs until it needs you or finishes
+npm run conductor -- run
+
+# 3. see where everything is
+npm run conductor -- status
+npm run conductor -- spy          # read-only: which role is running right now
+
+# 4a. the spec gate
+npm run conductor -- approve <id> --notes "ship the safe default for open question 2"
+npm run conductor -- reject  <id> --notes "AC-002 is not observable; rewrite it as a behaviour"
+
+# 4b. the help gate
+npm run conductor -- resume  <id> --notes "rebased the conflict by hand and ran the unit tests"
+
+# 5. the terminal gate: merge locally and archive. Never pushes.
+npm run conductor -- approve <id> --message "optional override of the machine commit message"
+
+# when something is in the failed box
+npm run conductor -- retry <id> [--force]
+npm run conductor -- retry --rate-limited        # every rate-limited task at once
+npm run conductor -- abandon <id>
+```
+
+`run` is re-entrant. Interrupt it, run it again, and it picks up from the persisted stage — state lives on disk, not in the process.
+
+To watch it in a browser instead:
+
+```bash
+npm run dashboard   # http://127.0.0.1:4400
+```
+
+The dashboard shows the four-column board (`ROUTING` / `AWAIT_HUMAN` / `FAILED_BOX` / `DONE`), a read-only monitoring drawer per task, a full-screen review page carrying the same buttons as the CLI, and a metrics view. Its interface is in Chinese.
+
+## Screenshots
+
+The dashboard is the most legible part of this system and the hardest to publish safely — it renders absolute host paths, private repository names, and branch names. [`docs/showcase/screenshot-checklist.md`](docs/showcase/screenshot-checklist.md) lists every screen worth capturing, how to reach it, and exactly which fields have to be redacted before a screenshot leaves your machine.
+
+## Repository layout
+
+| Path | What lives there |
+| --- | --- |
+| `conductor/conductor.mjs` | Command-line interface, configuration defaults, the human-gate verbs. |
+| `conductor/stages/` | `routing.mjs` (the loop), `await_human.mjs` (a parking space), `router-kernel.mjs` (spawn, gates, cleanup), `actions/` (one file per action). |
+| `conductor/lib/` | The execution-log contract, record synthesis, the version rule, pre-commit, the fuse, prompt assembly, git and worktree operations, state layout. |
+| `conductor/hooks/` | Per-round agent hooks: write allowlist, log-contract pre-check, spec-contract pre-check, maker git guard. |
+| `conductor/dashboard/` | The local web dashboard (a thin `node:http` layer plus a static front end). |
+| `agents/` | Four role prompts plus `fewshot/` — the judgement transfer surface. |
+| `tests/` | `integration/` for behavioural cases, `unit/` for invariants. |
+| `tools/dossier-stats.mjs` | Cross-task aggregation of cost, rounds, gates, and failure distribution. |
+| `docs/features/router-conductor/2-tech-spec.md` | The current design and its acceptance criteria. |
+| `state/`, `dossier/` | Runtime data. Git-ignored; not distributed. |

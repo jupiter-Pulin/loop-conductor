@@ -5,7 +5,7 @@ description: 把对话里聊清楚的需求/bug 蒸馏成 brief，交给 Loop Co
 
 # loop-task：把讨论变成 Loop Conductor 任务
 
-Loop Conductor 是本机的 agent 开发状态机，仓库在 `$HOME/ai-experiment/will-workflow`（下称 `$CONDUCTOR_ROOT`）。角色分离（spec→审→实现→冷验收→合并文案）、状态流、命令、数据位置的**唯一事实源是 `$CONDUCTOR_ROOT/README.md`**，本 skill 不复述。你只需要记住闸门：人审共三处——setup profile、spec（或 feasibility option）、merge——全部在 dashboard 里点，不在你手里。
+Loop Conductor 是本机的 agent 开发状态机，仓库在 `$HOME/ai-experiment/will-workflow`（下称 `$CONDUCTOR_ROOT`）。角色分离（spec→审→实现→冷验收→合并文案）、状态流、命令、数据位置的**唯一事实源是 `$CONDUCTOR_ROOT/AGENTS.md`**，本 skill 不复述。你只需要记住闸门：人审共三处——setup profile、spec（或 feasibility option）、merge——全部在 dashboard 里点，不在你手里。
 
 ## 你的角色（铁律）
 
