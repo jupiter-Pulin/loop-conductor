@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { makeEnv } from '../helpers/env.mjs';
-import { makerStep, newRouterEnv, reviewerStep, routerStep, specStep } from '../helpers/router-env.mjs';
+import { makerCalls, makerStep, newRouterEnv, reviewerStep, routerStep, specStep } from '../helpers/router-env.mjs';
 
 const SPEC_BODY = '# t\n\n## 验收标准\n\n- AC-001: median([1,2,3,4]) 返回 2.5\n- AC-002: node --test 全绿\n';
 
@@ -80,11 +80,22 @@ test('AC-012/013：spec 闸 reject → ROUTING，notes 进记录并回喂 spec-a
 
   // --no-packages 在 packagesEnabled=false 时只是被忽略，不影响批准本身。
   const gateRound = env.findTask(id).runtime.awaiting.round;
-  const approve = env.run('approve', id, '--no-packages', '--notes', '就这样');
+  const approve = env.run('approve', id, '--no-packages', '--notes', '就这样，别动 median 之外的东西');
   assert.equal(approve.status, 0, approve.stderr);
   assert.match(approve.stdout, /--no-packages 本阶段无意义/);
   assert.equal(env.findTask(id).runtime.spec_approved, true);
   assert.equal(env.readJson(env.dossier(id, `human-r${gateRound}.json`)).no_packages, false);
+
+  // 「人审补充约束」只取批准时的 notes：打回时那句是给 spec-agent 的改写指令，已经通过
+  // 「人审打回意见」进过 spec prompt，再灌给 maker 等于让它照着一份作废的意见干活。
+  env.appendScenario([
+    routerStep('maker'), makerStep(),
+    routerStep('human', { summary: '本用例到此为止：开一道 help 闸让 drain 停下' }),
+  ]);
+  assert.equal(env.run('run').status, 0);
+  const makerPrompt = makerCalls(env).at(-1).prompt;
+  assert.match(makerPrompt, /\[人审补充约束\] 就这样，别动 median 之外的东西/);
+  assert.equal(makerPrompt.includes('AC-002 是套话'), false, '被打回的 notes 不进 maker 的约束段');
 });
 
 test('AC-015：resume 只在 help 闸可用，其他 stage 报错退出', (t) => {

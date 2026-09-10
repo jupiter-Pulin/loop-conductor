@@ -240,19 +240,31 @@ export function archiveSpecDraft(cfg, id, label = 'archived') {
   return archived;
 }
 
-/** 本任务是否曾产出过 spec（草稿或冻结稿）——`maker` 前置「曾产出 spec 则必须已批准」的判据。 */
+/**
+ * 本任务是否曾产出过 spec（草稿、冻结稿或归档稿）——`maker` 前置「曾产出 spec 则必须已批准」
+ * 的判据。归档稿也算：spec 闸打回会把草稿移进 `specs/archive/`，但「这个任务是有 spec 的」
+ * 这件事没有变，否则打回一次就能让 router 绕开 spec 人闸直接派 maker。
+ */
 export function everProducedSpec(cfg, id) {
-  return fs.existsSync(specDraftPath(cfg, id)) || fs.existsSync(frozenSpecPath(cfg, id));
+  if (fs.existsSync(specDraftPath(cfg, id)) || fs.existsSync(frozenSpecPath(cfg, id))) return true;
+  try {
+    return fs.readdirSync(path.join(cfg.specsDir, 'archive')).some((n) => n.startsWith(`${id}-`));
+  } catch { return false; } // archive 目录还不存在
 }
 
 export function readFrozenSpec(cfg, id) {
   try { return fs.readFileSync(frozenSpecPath(cfg, id), 'utf8'); } catch { return ''; }
 }
 
-/** spec 闸 human 记录的 notes 原文 → 「人审补充约束」段（逐字注入 maker / reviewer / plan）。 */
+/**
+ * spec 闸**批准**时的 notes 原文 → 「人审补充约束」段（逐字注入 maker / reviewer / plan）。
+ * 只取 `decision=approved`：打回时的 notes 是给 spec-agent 的改写指令（已由 specRejectNotes
+ * 注入 spec prompt），对 maker / reviewer 不是约束，混进去只会让它们照着一份已经作废的意见干活。
+ */
 export function specGateNotes(records) {
   return (records ?? [])
-    .filter((r) => r.role === 'human' && r.kind === 'spec' && typeof r.notes === 'string' && r.notes.trim() !== '')
+    .filter((r) => r.role === 'human' && r.kind === 'spec' && r.decision === 'approved'
+      && typeof r.notes === 'string' && r.notes.trim() !== '')
     .map((r) => r.notes.trim())
     .join('\n');
 }

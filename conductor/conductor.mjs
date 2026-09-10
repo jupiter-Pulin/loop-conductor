@@ -645,6 +645,10 @@ async function cmdReject(cfg, id, notes) {
       return;
     }
     recordHumanDecision(cfg, ts, { decision: 'rejected', notes: text });
+    // 打回即销草稿（归档进 specs/archive/，不删）。留着它，下一轮 spec 动作只要 agent 崩溃或
+    // 没写文件，内核就会拿这份**已被人否掉**的旧稿再过一次 validateSpecDoc 并重开 spec 闸；
+    // 草稿不在原位时，那种情形自然落到 spec_invalid，留在 ROUTING 交 router 处置。
+    if (kind === 'spec') archiveSpecDraft(cfg, id, 'rejected');
     backToRouting(cfg, ts, `${kind} 闸打回：${text}`);
     console.log(`${id} ${kind} 闸已打回 → ROUTING（notes 进「已裁决事项」，router 自行决定下一步）`);
   });
