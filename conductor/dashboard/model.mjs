@@ -1,11 +1,10 @@
 // dashboard/model.mjs — 纯逻辑层：泳道映射、三箱聚合、任务详情组装、CLI 结果转换。
-// 只读磁盘（复用 lib/state.mjs、lib/profile.mjs、lib/feasibility-contract.mjs、lib/git.mjs
+// 只读磁盘（复用 lib/state.mjs、lib/profile.mjs、lib/git.mjs
 // 既有解析函数），不持久化、不缓存、不自写 option/markdown 解析。
 import fs from 'node:fs';
 import path from 'node:path';
 import * as state from '../lib/state.mjs';
 import { setupProfilePaths } from '../lib/profile.mjs';
-import { validateFeasibilityDoc } from '../lib/feasibility-contract.mjs';
 import { git, branchExists } from '../lib/git.mjs';
 import { composeRecords, renderFacts, renderRecordsForRouter } from '../lib/records.mjs';
 import { needPrecommit, needReview } from '../lib/version-gate.mjs';
@@ -195,15 +194,18 @@ function buildSetupReview(cfg) {
   }
 }
 
+/**
+ * feasibility memo 只读渲染（AC-029）：feasibility 角色已随旧状态机删除，这里只保证
+ * 旧任务的 memo 还看得见。`options` 恒为空数组——没有 O-X 选项闸了，也就没有可点的按钮。
+ */
 function buildFeasibilityReview(ts) {
   const draft = path.join(ts.dir, 'feasibility-study.md');
   let md = null;
   try { md = fs.readFileSync(draft, 'utf8'); } catch { /* 缺失也是一种状态 */ }
   if (md == null) {
-    return { kind: 'feasibility', missing: true, message: `feasibility 草稿缺失：${draft}`, options: [] };
+    return { kind: 'feasibility', legacy: true, missing: true, message: `feasibility 草稿缺失：${draft}`, options: [] };
   }
-  // 不自写 O-X 解析：options 原样透传 validateFeasibilityDoc 的枚举结果。
-  return { kind: 'feasibility', markdown: md, options: validateFeasibilityDoc(md).options };
+  return { kind: 'feasibility', legacy: true, markdown: md, options: [] };
 }
 
 // ---- verify / spec-verify 最新轮 verdict 面板（AC-005/006/007/008/009）：
@@ -803,15 +805,11 @@ export function buildStreamTail(cfg, id) {
  * 新状态机的人闸按钮就是 `approve` / `reject` / `resume`，语义等同 CLI，一个不多一个不少；
  * `abandon` 供 ROUTING 中的任务人工收箱。
  */
-export const SYNC_ACTIONS = [
-  'approve', 'approve-setup', 'approve-feasibility', 'reject', 'reject-feasibility', 'approve-scope', 'reject-scope',
-  'resume', 'abandon',
-];
+export const SYNC_ACTIONS = ['approve', 'reject', 'resume', 'abandon'];
 
-/** body.option / body.notes / body.message → argv 数组（不经 shell）。未知子命令自身会忽略多余 flag。 */
+/** body.notes / body.message → argv 数组（不经 shell）。未知子命令自身会忽略多余 flag。 */
 export function buildSyncActionArgv(action, id, body = {}) {
   const argv = [action, id];
-  if (typeof body?.option === 'string' && body.option !== '') argv.push('--option', body.option);
   if (typeof body?.notes === 'string' && body.notes !== '') argv.push('--notes', body.notes);
   // merge 闸批准可覆盖机器 merge 文案（CLI `approve <id> --message "…"`）。
   if (typeof body?.message === 'string' && body.message !== '') argv.push('--message', body.message);

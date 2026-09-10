@@ -1,20 +1,33 @@
-// 集成：新旧共存（AC-001 的遗留 stage 跳过、AC-027 的遗留配置键警告、旧任务仍走旧路径）。
-// P2 的承诺是「新任务走新机器，旧任务照常跑完」；P3 才删旧的那一半。
+// 集成：新旧共存的最后一层——P3 删掉旧状态机之后，遗留任务只保留**可读性**。
+//   AC-027：配置文件里显式给的遗留键各警告一次并被忽略（不进 cfg）；
+//   AC-001：queue 里出现遗留 stage 名 → scheduler 打印「未知 stage，跳过」，不抛错、不推进；
+//   遗留任务对任何动词都给出清晰错误（legacy task, not operable by this conductor），状态零变化；
+//   status / spy 同时容纳新旧任务，不因缺字段而崩。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { DEFAULT_BUGFIX_SPEC, makeEnv, verifierStep } from '../helpers/env.mjs';
-import { FIXED_STATS } from '../helpers/target-fixture.mjs';
+import { makeEnv } from '../helpers/env.mjs';
 import { newRouterEnv, routerStep } from '../helpers/router-env.mjs';
 
-const FIX = { type: 'writeFile', path: 'lib/stats.mjs', content: FIXED_STATS };
-const GOOD_PROPOSAL = JSON.stringify({
-  subject: 'fix(stats): average the two middle values for even-length median',
-  body: 'Legacy compat fixture proposal.\n\nVerified: node --test all green.',
-});
+/** 直接落盘一个旧状态机形态的任务（旧 stage 名 + 旧计数字段）。 */
+function writeLegacyTask(env, id, { stage = 'READY', box = 'queue', lastFailureType = null } = {}) {
+  const dir = path.join(env.root, 'state', box, id);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'task.json'), `${JSON.stringify({
+    schema_version: 1, id, kind: 'bugfix', title: '旧任务', repo: 'target',
+    targetRepo: env.targetDir, baseBranch: 'main', testCommand: 'node --test',
+    created_at: '2026-06-11T00:00:00.000Z',
+  }, null, 2)}\n`);
+  fs.writeFileSync(path.join(dir, 'runtime.json'), `${JSON.stringify({
+    schema_version: 1, stage, maker_miss_count: 3, verifier_invalid_count: 0,
+    spent_usd: 1.5, approval: null, current_round: 2, last_failure_type: lastFailureType,
+    updated_at: '2026-06-11T00:00:00.000Z',
+  }, null, 2)}\n`);
+  return dir;
+}
 
-test('AC-027：配置文件里显式给的遗留键各打印一次警告；默认值不警告', (t) => {
+test('AC-027：配置文件里显式给的遗留键各打印一次警告并被忽略；默认值不警告', (t) => {
   const env = makeEnv(t, {
     config: {
       specMaxAcs: 8,
@@ -40,83 +53,93 @@ test('AC-027：配置文件里显式给的遗留键各打印一次警告；默�
   assert.doesNotMatch(r.stderr, /legacy config key ignored: autoMergeEnabled/);
 });
 
-test('AC-027：legacy 标量 maxTurns 警告一次并落到 maker；旧 stage 仍拿得到那个数字', (t) => {
+test('AC-027：遗留键被忽略而不是被读进 cfg；models 的遗留角色键不进模型探测清单', async (t) => {
+  const env = makeEnv(t, {
+    config: { testGateEnabled: true, specMaxAcs: 99, models: { verifier: 'ghost-model', maker: 'claude-opus-5' } },
+  });
+  const { loadCfg } = await import('../../conductor/conductor.mjs');
+  const cfg = loadCfg(env.root);
+  assert.equal('testGateEnabled' in cfg, false);
+  assert.equal('specMaxAcs' in cfg, false);
+  assert.deepEqual(Object.keys(cfg.models).sort(), ['maker', 'reviewer', 'router', 'spec']);
+  assert.equal(Object.values(cfg.models).includes('ghost-model'), false);
+});
+
+test('AC-027：legacy 标量 maxTurns 警告一次并只落到 maker，其余角色仍用默认值', async (t) => {
   const env = makeEnv(t, { config: { maxTurns: 12 } });
   const r = env.run('status');
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stderr, /legacy config key ignored: maxTurns（标量 12 视为 maker 上限/);
 
-  const legacyTask = 'task-20260910-800';
-  env.writeTask(legacyTask, { stage: 'READY' });
-  env.setScenario([
-    { actions: [FIX], session_id: 'sess-m1', cost: 0.1, result: 'r1' },
-    verifierStep(1),
-    { cost: 0.01, result: GOOD_PROPOSAL },
-  ]);
-  assert.equal(env.run('run').status, 0);
-  const makerArgv = env.calls()[0].argv;
-  assert.equal(makerArgv[makerArgv.indexOf('--max-turns') + 1], '12', '旧 stage 用 legacy 标量');
-  assert.equal(env.findTask(legacyTask).runtime.stage, 'AWAIT_HUMAN_MERGE');
+  const { loadCfg } = await import('../../conductor/conductor.mjs');
+  const cfg = loadCfg(env.root);
+  assert.equal(cfg.maxTurns.maker, 12);
+  assert.equal(cfg.maxTurns.router, 4, 'router 不被标量压低');
+  assert.equal(cfg.maxTurns.reviewer, 40);
 });
 
-test('AC-001：queue 里的遗留 stage 名照常跑，不抛错；新旧任务在同一次 run 里各走各的', (t) => {
+test('AC-001：queue 里的遗留 stage 名被跳过并打印警告，不抛错；同一次 run 里新任务照跑', (t) => {
   const { env, id } = newRouterEnv(t);
   const legacyTask = 'task-20260910-900';
-  env.writeTask(legacyTask, { stage: 'READY', specDraft: DEFAULT_BUGFIX_SPEC });
+  writeLegacyTask(env, legacyTask, { stage: 'READY' });
 
-  // 剧本按 id 排序驱动：新任务（001）先跑，遗留任务（900）随后。
-  env.setScenario([
-    routerStep('human', { summary: '新任务只跑一轮就停在 help 闸' }),
-    { actions: [FIX], session_id: 'sess-m1', cost: 0.1, result: 'r1' },
-    verifierStep(1),
-    { cost: 0.01, result: GOOD_PROPOSAL },
-  ]);
+  env.setScenario([routerStep('human', { summary: '新任务只跑一轮就停在 help 闸' })]);
   const run = env.run('run');
   assert.equal(run.status, 0, run.stderr);
-  assert.doesNotMatch(run.stderr, /未知 stage/, '遗留 stage 仍有 handler，不该报未知');
+  assert.match(run.stderr, new RegExp(`\\[${legacyTask}\\] 未知 stage "READY"，跳过`));
 
-  assert.equal(env.findTask(id).runtime.awaiting.kind, 'help');
-  assert.equal(env.findTask(legacyTask).runtime.stage, 'AWAIT_HUMAN_MERGE');
-
-  // 旧任务的人闸动词照旧（merge），新任务的 approve 不会误伤它。
-  assert.equal(env.run('merge', legacyTask).status, 0);
-  assert.equal(env.findTask(legacyTask).box, 'done');
+  assert.equal(env.findTask(id).runtime.awaiting.kind, 'help', '新任务照常推进');
+  const legacy = env.findTask(legacyTask);
+  assert.equal(legacy.box, 'queue', '遗留任务不被搬箱');
+  assert.equal(legacy.runtime.stage, 'READY', '遗留任务状态零变化');
+  assert.equal(env.calls().length, 1, '遗留任务不消耗任何 spawn');
 });
 
-test('旧任务的 retry 仍走旧路径（回 READY、重置 miss），不被新的 retry 分支截胡', (t) => {
+test('遗留任务对每个动词都给出清晰错误，状态零变化', (t) => {
   const env = makeEnv(t);
-  const legacyTask = 'task-20260910-901';
-  env.writeTask(legacyTask, { stage: 'READY', miss: 3 });
-
-  // 造一个旧形态的收箱任务：stage=FAILED_BOX + 旧的 last_failure_type，目录搬进 failed 箱。
-  const dir = path.join(env.root, 'state', 'queue', legacyTask);
-  const runtime = JSON.parse(fs.readFileSync(path.join(dir, 'runtime.json'), 'utf8'));
-  Object.assign(runtime, { stage: 'FAILED_BOX', last_failure_type: 'maker_misses_exhausted' });
-  fs.writeFileSync(path.join(dir, 'runtime.json'), `${JSON.stringify(runtime, null, 2)}\n`);
+  const queued = 'task-20260910-901';
+  const failed = 'task-20260910-902';
+  writeLegacyTask(env, queued, { stage: 'AWAIT_SPEC_APPROVAL' });
   fs.mkdirSync(path.join(env.root, 'state', 'failed'), { recursive: true });
-  fs.renameSync(dir, path.join(env.root, 'state', 'failed', legacyTask));
+  writeLegacyTask(env, failed, { stage: 'FAILED_BOX', box: 'failed', lastFailureType: 'maker_misses_exhausted' });
 
-  const r = env.run('retry', legacyTask);
-  assert.equal(r.status, 0, r.stderr);
-  const ts = env.findTask(legacyTask);
-  assert.equal(ts.box, 'queue');
-  assert.equal(ts.runtime.stage, 'READY', '旧任务回 READY，不是 ROUTING');
-  assert.equal(ts.runtime.maker_miss_count, 0);
+  for (const [id, argv] of [
+    [queued, ['approve', queued]],
+    [queued, ['reject', queued, '--notes', 'x']],
+    [queued, ['resume', queued]],
+    [queued, ['abandon', queued]],
+    [failed, ['retry', failed]],
+  ]) {
+    const before = JSON.stringify(env.findTask(id).runtime);
+    const r = env.run(...argv);
+    assert.notEqual(r.status, 0, `${argv[0]} 应以非零退出`);
+    assert.match(r.stderr, /legacy task, not operable by this conductor/, `${argv[0]} 的错误要点名遗留任务`);
+    assert.equal(JSON.stringify(env.findTask(id).runtime), before, `${argv[0]} 不得改动遗留任务状态`);
+  }
+
+  // 已删除的旧动词直接落到 usage（未知子命令），同样不碰任务。
+  for (const verb of ['approve-setup', 'approve-feasibility', 'reject-feasibility', 'approve-scope', 'reject-scope', 'merge', 'close']) {
+    const r = env.run(verb, queued);
+    assert.notEqual(r.status, 0, `${verb} 应已删除`);
+    assert.match(r.stderr, /用法：conductor <command>/);
+  }
+  assert.equal(env.findTask(queued).runtime.stage, 'AWAIT_SPEC_APPROVAL');
 });
 
-test('status / spy 同时容纳新旧任务，不因缺 kind / miss 字段而崩', (t) => {
+test('status / spy 同时容纳新旧任务，不因缺 awaiting / 多余计数字段而崩', (t) => {
   const { env, id } = newRouterEnv(t);
-  const legacyTask = 'task-20260910-902';
-  env.writeTask(legacyTask, { stage: 'READY' });
+  const legacyTask = 'task-20260910-903';
+  writeLegacyTask(env, legacyTask, { stage: 'READY' });
 
   const status = env.run('status');
   assert.equal(status.status, 0, status.stderr);
-  assert.match(status.stdout, new RegExp(`${id}\\s+.*ROUTING`));
-  assert.match(status.stdout, new RegExp(`${legacyTask}\\s+bugfix\\s+READY`));
+  assert.match(status.stdout, new RegExp(`${id}\\s+ROUTING`));
+  assert.match(status.stdout, new RegExp(`${legacyTask}\\s+READY`), '遗留任务照样列出来');
 
   // spy 认得新角色的 spawn 记录（router / spec / maker / reviewer）。
   env.setScenario([{ hang: true }]);
   const spy = env.run('spy');
   assert.equal(spy.status, 0, spy.stderr);
   assert.match(spy.stdout, new RegExp(id));
+  assert.match(spy.stdout, new RegExp(legacyTask));
 });

@@ -230,6 +230,14 @@ main { padding: 0 28px 8px; }
 .task-page-body { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 0 32px; }
 .task-main { min-width: 0; padding: 16px 0 24px; }
 .task-main pre.readonly-tall { max-height: 60vh; }
+/* 遗留任务（P3 之前的旧状态机产物）：只读横幅，页面下方一个决策按钮都不给。 */
+.legacy-note {
+  padding: 8px 12px;
+  border-left: 3px solid var(--warn, #b58900);
+  background: var(--surface-2, rgba(181, 137, 0, 0.08));
+  color: var(--fg-muted, inherit);
+  font-size: 13px;
+}
 .task-aside { border-left: 1px solid var(--line); padding: 16px 0 24px 20px; }
 .task-aside-inner { position: sticky; top: 16px; max-height: calc(100vh - 32px); overflow-y: auto; }
 .task-aside h3 { margin-top: 0; }

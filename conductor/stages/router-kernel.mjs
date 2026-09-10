@@ -11,11 +11,20 @@ import fs from 'node:fs';
 import path from 'node:path';
 import * as state from '../lib/state.mjs';
 import { git, removeWorktree, deleteBranch } from '../lib/git.mjs';
-import { taskCfg } from '../lib/task-cfg.mjs';
 import { runClaudeWithRetry } from '../lib/claude.mjs';
 import { buildAgentSpawnSpec, writeAgentSettings } from '../lib/agent-settings.mjs';
 import { checkFuse } from '../lib/fuse.mjs';
 import { accountSpawnCost, failToBox, finishSpawnRecord, startSpawnRecord } from './shared.mjs';
+
+/**
+ * 任务级配置解析：task.json 快照的 targetRepo 覆盖全局 cfg.targetRepo，使同一次 drain 中
+ * 面向不同仓库的任务各自命中自己的 target repo。不改 cfg 本体；task.json 无该字段时
+ * 原样返回 cfg（旧任务的回退行为）。
+ */
+export function taskCfg(ts, cfg) {
+  const targetRepo = ts?.task?.targetRepo ?? cfg.targetRepo;
+  return targetRepo === cfg.targetRepo ? cfg : { ...cfg, targetRepo };
+}
 
 /** 任务分支名（唯一构造点）。 */
 export function taskBranchName(id) {
@@ -206,6 +215,16 @@ export function frozenSpecPath(cfg, id) {
 
 export function packagesDraftPath(cfg, id) {
   return path.join(cfg.specsDir, `${id}.packages.json`);
+}
+
+/** spec 草稿归档（批准冻结后、或人审打回后腾出草稿位）：移进 specs/archive/，绝不删。 */
+export function archiveSpecDraft(cfg, id, label = 'archived') {
+  const draft = specDraftPath(cfg, id);
+  if (!fs.existsSync(draft)) return null;
+  const archived = path.join(cfg.specsDir, 'archive', `${id}-${label}-${Date.now()}.md`);
+  fs.mkdirSync(path.dirname(archived), { recursive: true });
+  fs.renameSync(draft, archived);
+  return archived;
 }
 
 /** 本任务是否曾产出过 spec（草稿或冻结稿）——`maker` 前置「曾产出 spec 则必须已批准」的判据。 */

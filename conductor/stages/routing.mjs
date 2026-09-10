@@ -14,7 +14,6 @@
 // router 是唯一的裁判，裁判缺席时没有别人可以判断。任一次成功决策清零。
 
 import * as state from '../lib/state.mjs';
-import { taskCfg } from '../lib/task-cfg.mjs';
 import { ACTIONS } from '../lib/log-contract.mjs';
 import { composeRecords, renderFacts, renderRecordsForRouter } from '../lib/records.mjs';
 import { mergeAllowed, needPrecommit, needReview, reviewerTierAt } from '../lib/version-gate.mjs';
@@ -24,7 +23,7 @@ import { canStartSpawn, failToBox, rateLimitedToBox } from './shared.mjs';
 import {
   checkBudgetAndBox, checkFuseAndBox, cleanupTaskArtifacts, everProducedSpec, helpSummaries,
   openHumanGate, readBriefText, readRouterState, relRef, revParseOrNull, spawnAgentRound,
-  taskBranchName, taskHasDiff, writeRouterState,
+  taskBranchName, taskCfg, taskHasDiff, writeRouterState,
 } from './router-kernel.mjs';
 import specAction from './actions/spec.mjs';
 import makerAction from './actions/maker.mjs';

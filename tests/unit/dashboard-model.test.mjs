@@ -1,5 +1,5 @@
 // dashboard/model.mjs 单测：泳道映射、needsHuman/working 判据、broken 降级、
-// feasibility options 透传、CLI 结果→提示转换的纯函数支撑，以及 AC-003/AC-004 静态守卫。
+// 遗留任务的只读渲染（AC-029）、CLI 结果→提示转换的纯函数支撑，以及 AC-003/AC-004 静态守卫。
 // 风格与 tests/unit/state.test.mjs 一致：fs.mkdtempSync 临时目录自建 fixture。
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -8,7 +8,6 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { writeNewTask } from '../../conductor/lib/state.mjs';
-import { validateFeasibilityDoc } from '../../conductor/lib/feasibility-contract.mjs';
 import {
   LANE_ORDER, laneForStage, isValidTaskId,
   COLUMN_ORDER, columnForStage, isRouterTask, extractPendingQuestions, readEvents,
@@ -210,7 +209,7 @@ test('buildBoard：坏任务目录不抛错，降级进 broken；queue 中 lane 
   assert.ok(!board.lanes.some((l) => l.tasks.some((e) => e.id === 'task-20260705-020')));
 });
 
-// ---- AC-011：feasibility review options 透传 ----
+// ---- AC-029：遗留任务的 review 只读渲染（feasibility 角色已删，memo 仍要看得见） ----
 
 const FEASIBILITY_MD = [
   '# Feasibility Study: dashboard',
@@ -232,7 +231,7 @@ const FEASIBILITY_MD = [
   '',
 ].join('\n');
 
-test('buildTaskDetail：AWAIT_FEASIBILITY_APPROVAL 的 review.options 与 validateFeasibilityDoc(md).options 深等（AC-011）', (t) => {
+test('buildTaskDetail：遗留 AWAIT_FEASIBILITY_APPROVAL 的 memo 原文照渲，options 恒空（无选项闸可点）', (t) => {
   const root = mkroot();
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const cfg = baseCfg(root);
@@ -243,9 +242,9 @@ test('buildTaskDetail：AWAIT_FEASIBILITY_APPROVAL 的 review.options 与 valida
 
   const detail = buildTaskDetail(cfg, id);
   assert.equal(detail.review.kind, 'feasibility');
+  assert.equal(detail.review.legacy, true);
   assert.equal(detail.review.markdown, FEASIBILITY_MD);
-  assert.deepEqual(detail.review.options, validateFeasibilityDoc(FEASIBILITY_MD).options);
-  assert.deepEqual(detail.review.options.map((o) => o.option_id), ['O-A', 'O-B']);
+  assert.deepEqual(detail.review.options, []);
 });
 
 test('buildTaskDetail：feasibility-study.md 缺失时 review 给出缺失提示，不抛错（AC-010 同型缺失处理）', (t) => {
@@ -356,27 +355,29 @@ test('isValidTaskId：仅接受 task-YYYYMMDD-NNN，拒绝路径穿越等非法�
 // ---- CLI 结果 → 用户提示转换（AC-013/AC-017 纯函数支撑） ----
 
 test('SYNC_ACTIONS：同步动作与 CLI 子命令名逐字一致，retry 已 job 化不再属同步动作集合（P4-AC-014④）', () => {
-  assert.deepEqual(SYNC_ACTIONS, [
-    'approve', 'approve-setup', 'approve-feasibility', 'reject', 'reject-feasibility', 'approve-scope', 'reject-scope',
-    'resume', 'abandon',
-  ]);
+  // 新状态机的人闸动词就这四个，一个不多一个不少；旧动词随旧状态机一起删了。
+  assert.deepEqual(SYNC_ACTIONS, ['approve', 'reject', 'resume', 'abandon']);
   assert.equal(SYNC_ACTIONS.includes('retry'), false);
-  // 新状态机的三个人闸按钮就是这三个 CLI 动词，一个不多一个不少。
-  for (const verb of ['approve', 'reject', 'resume']) assert.ok(SYNC_ACTIONS.includes(verb), verb);
+  for (const gone of ['approve-setup', 'approve-feasibility', 'reject-feasibility', 'approve-scope', 'reject-scope', 'merge', 'close']) {
+    assert.equal(SYNC_ACTIONS.includes(gone), false, `${gone} 应已删除`);
+  }
 });
 
-test('buildSyncActionArgv：body.option/notes → argv 数组，缺省不带多余 flag', () => {
+test('buildSyncActionArgv：body.notes/message → argv 数组，缺省不带多余 flag', () => {
   assert.deepEqual(buildSyncActionArgv('approve', 'task-20260705-001', {}), ['approve', 'task-20260705-001']);
   assert.deepEqual(
-    buildSyncActionArgv('approve-feasibility', 'task-20260705-001', { option: 'O-B', notes: '备注' }),
-    ['approve-feasibility', 'task-20260705-001', '--option', 'O-B', '--notes', '备注'],
+    buildSyncActionArgv('reject', 'task-20260705-001', { notes: '打回理由' }),
+    ['reject', 'task-20260705-001', '--notes', '打回理由'],
   );
   assert.deepEqual(buildSyncActionArgv('reject', 'task-20260705-001', { notes: '' }), ['reject', 'task-20260705-001']);
-  // 规模人闸：approve-scope 无参，reject-scope 携拆分意图 notes（镜像 reject）。
-  assert.deepEqual(buildSyncActionArgv('approve-scope', 'task-20260705-001', {}), ['approve-scope', 'task-20260705-001']);
   assert.deepEqual(
-    buildSyncActionArgv('reject-scope', 'task-20260705-001', { notes: '拆成 A/B 两批' }),
-    ['reject-scope', 'task-20260705-001', '--notes', '拆成 A/B 两批'],
+    buildSyncActionArgv('approve', 'task-20260705-001', { message: 'task x: 标题' }),
+    ['approve', 'task-20260705-001', '--message', 'task x: 标题'],
+  );
+  // option 已随 approve-feasibility 一起删除：给了也不再拼进 argv。
+  assert.deepEqual(
+    buildSyncActionArgv('approve', 'task-20260705-001', { option: 'O-B' }),
+    ['approve', 'task-20260705-001'],
   );
 });
 

@@ -1,10 +1,12 @@
+// 集成：per-task 锁与 spy。run 推进某任务时，该任务持锁；此刻 CLI 的写操作（retry）
+// 短重试后失败并说明原因，而只读的 spy 照常看得见「谁在跑第几轮」。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { makeEnv, CONDUCTOR, FAKE_CLAUDE, verifierStep } from '../helpers/env.mjs';
-import { FIXED_STATS } from '../helpers/target-fixture.mjs';
+import { CONDUCTOR, FAKE_CLAUDE } from '../helpers/env.mjs';
+import { makerStep, newRouterEnv, routerStep } from '../helpers/router-env.mjs';
 
 function conductorEnv(env) {
   const childEnv = {
@@ -33,7 +35,7 @@ function spawnConductor(env, ...args) {
   return { child, done };
 }
 
-async function waitFor(fn, timeoutMs = 1500) {
+async function waitFor(fn, timeoutMs = 3000) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     if (fn()) return;
@@ -43,25 +45,13 @@ async function waitFor(fn, timeoutMs = 1500) {
 }
 
 test('运行中 step 持 per-task 锁：CLI retry 短重试后失败；spy 可只读查看 active role', async (t) => {
-  const env = makeEnv(t, {
-    config: {
-      inactivityTimeoutMs: 500,
-      spawnWallClockMs: 5000,
-    },
+  const { env, id } = newRouterEnv(t, {
+    config: { inactivityTimeoutMs: 2000, spawnWallClockMs: 20000 },
   });
-  const id = 'task-20260611-660';
-  env.writeTask(id);
   env.setScenario([
-    {
-      slowAlive: true,
-      intervalMs: 80,
-      count: 8,
-      actions: [{ type: 'writeFile', path: 'lib/stats.mjs', content: FIXED_STATS }],
-      session_id: 'slow-maker',
-      cost: 0.1,
-      result: 'fixed',
-    },
-    verifierStep(1, { 'AC-001': 'pass', 'AC-002': 'pass' }),
+    routerStep('maker'),
+    makerStep({ slowAlive: true, intervalMs: 80, count: 12 }),
+    routerStep('human', { summary: '停在 help 闸' }),
   ]);
 
   const run = spawnConductor(env, 'run');
@@ -73,6 +63,7 @@ test('运行中 step 持 per-task 锁：CLI retry 短重试后失败；spy 可�
   assert.equal(spy.status, 0, spy.stderr);
   assert.match(spy.stdout, new RegExp(id));
   assert.match(spy.stdout, /maker r1/);
+  assert.match(spy.stdout, /ROUTING/);
 
   const retry = env.run('retry', id);
   assert.equal(retry.status, 1);
@@ -80,5 +71,5 @@ test('运行中 step 持 per-task 锁：CLI retry 短重试后失败；spy 可�
 
   const done = await run.done;
   assert.equal(done.status, 0, done.stderr);
-  assert.equal(env.findTask(id).runtime.stage, 'AWAIT_HUMAN_MERGE');
+  assert.equal(env.findTask(id).runtime.stage, 'AWAIT_HUMAN');
 });

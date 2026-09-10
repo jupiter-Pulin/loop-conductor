@@ -78,6 +78,32 @@ export function newRouterEnv(t, { config = {}, precommit = { unit: 'node --test'
   return { env, id };
 }
 
+/** 只建环境（不建任务），给「直接落盘 router 任务」的用例用。 */
+export function routerEnv(t, { config = {}, precommit = { unit: 'node --test' }, seedModels } = {}) {
+  const env = makeEnv(t, {
+    config: { eventsLogEnabled: true, spawnBackoffMs: [5, 5, 5], ...config },
+    ...(seedModels ? { seedModels } : {}),
+  });
+  env.writePrecommitProfile(precommit);
+  return env;
+}
+
+/**
+ * 最短的「有产出且停得住」剧本：r1 派 maker 干活，r2 开 help 闸让 drain 停在人闸上。
+ * 需要一个确定终点又不关心 review / precommit 的用例（锁、并发、worktree、护栏…）用它。
+ */
+export function makerThenHelp(makerOver = {}) {
+  return [
+    routerStep('maker'),
+    makerStep(makerOver),
+    routerStep('human', { summary: '本用例到此为止：开一道 help 闸让 drain 停下' }),
+  ];
+}
+
+/** fake-claude 调用日志里属于 maker 的那些（cwd 在 worktrees/ 下、带 --permission-mode）。 */
+export function makerCalls(env) {
+  return env.calls().filter((c) => c.cwd.includes('/worktrees/') && c.argv.includes('--permission-mode'));
+}
 
 // ---- 造「人在 worktree 里动过手」与「base 往前走了一步」的场景 ----
 

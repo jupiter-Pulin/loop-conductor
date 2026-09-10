@@ -1,5 +1,5 @@
 // 单元：agent hook 脚本按 Claude Code hook 协议独立驱动（stdin JSON + 退出码）。
-// spec-write-guard：PreToolUse 写路径白名单（exit 2 = 拦截，stderr 喂回模型）。
+// write-guard：PreToolUse 写路径白名单（exit 2 = 拦截，stderr 喂回模型）。
 // check-spec：Stop 契约预检（不合格 exit 2 只拦一次；stop_hook_active=true 放行给 conductor 终审）。
 // maker-git-guard：PreToolUse(Bash) git 破坏性操作护栏（拦 push/不可逆，放行 commit）。
 import test from 'node:test';
@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const GUARD = path.resolve(HERE, '..', '..', 'conductor', 'hooks', 'spec-write-guard.mjs');
+const GUARD = path.resolve(HERE, '..', '..', 'conductor', 'hooks', 'write-guard.mjs');
 const CHECK = path.resolve(HERE, '..', '..', 'conductor', 'hooks', 'check-spec.mjs');
 const GIT_GUARD = path.resolve(HERE, '..', '..', 'conductor', 'hooks', 'maker-git-guard.mjs');
 
@@ -31,7 +31,7 @@ function tmpdir(t) {
 const GOOD_SPEC = '# spec\n\n## 验收标准\n\n- AC-001: `node --test` 全绿\n';
 const BAD_SPEC = '# spec\n\n## Acceptance Criteria\n\n- AC-001: whatever\n';
 
-// ---- spec-write-guard ----
+// ---- write-guard ----
 
 test('guard：写白名单路径放行（exit 0）', (t) => {
   const dir = tmpdir(t);
@@ -49,7 +49,7 @@ test('guard：写其他路径拦截（exit 2 + 指引），Edit 同样受限', (
       tool_input: { file_path: path.join(dir, 'lib', 'stats.mjs') },
     });
     assert.equal(r.status, 2, `${tool} 应被拦截`);
-    assert.match(r.stderr, /只允许写入唯一交付文件/);
+    assert.match(r.stderr, /本角色只允许写这些文件/);
     assert.match(r.stderr, /被拒绝的写入目标/);
   }
 });
