@@ -249,5 +249,52 @@ test('buildRoundsView：dossier 目录不存在时不抛错，退化为空数组
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const cfg = baseCfg(root);
   assert.doesNotThrow(() => buildRoundsView(cfg, 'task-20260713-999'));
-  assert.deepEqual(buildRoundsView(cfg, 'task-20260713-999'), { rounds: [], specRounds: [], attempts: [] });
+  assert.deepEqual(buildRoundsView(cfg, 'task-20260713-999'), { rounds: [], specRounds: [], attempts: [], records: [], routerRounds: [] });
+});
+
+// ---- 新状态机：router 轮次视图（records + routerRounds），与旧四门轮次并存 ----
+
+test('buildRoundsView：有 router 轮次的任务给出 records 与按轮分组的 routerRounds', (t) => {
+  const root = mkroot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cfg = baseCfg(root);
+  const id = 'task-20260910-200';
+  const dir = path.join(cfg.dossierDir, id);
+  fs.mkdirSync(dir, { recursive: true });
+  const w = (name, obj) => fs.writeFileSync(path.join(dir, name), JSON.stringify(obj));
+  w('router-r1.json', { role: 'router', round: 1, cost_usd: 0.02 });
+  w('router-r1.log.json', { role: 'router', outcome: 'ok', action: 'maker', summary: '直接实现' });
+  w('maker-r1.json', { role: 'maker', round: 1, cost_usd: 1.1 });
+  w('maker-r1.log.json', { role: 'maker', outcome: 'ok', summary: 'AC-001 done' });
+  w('router-r2.json', { role: 'router', round: 2, cost_usd: 0.02 });
+  w('router-r2.log.json', { role: 'router', outcome: 'ok', action: 'review', summary: '整体冷审' });
+  w('reviewer-r2.json', { role: 'reviewer', round: 2, cost_usd: 0.4, head_sha: 'a'.repeat(40) });
+  w('reviewer-r2.log.json', { role: 'reviewer', outcome: 'fail', tier: 'unit', summary: 'AC-001 fail lib/x.mjs:1' });
+
+  const view = buildRoundsView(cfg, id);
+  assert.equal(view.records.length, 4);
+  assert.deepEqual(view.routerRounds.map((r) => r.round), [1, 2]);
+  assert.equal(view.routerRounds[0].router.action, 'maker');
+  assert.deepEqual(view.routerRounds[0].agents.map((a) => a.role), ['maker']);
+  assert.equal(view.routerRounds[1].agents[0].outcome, 'fail');
+  assert.equal(view.routerRounds[1].agents[0].tier, 'unit');
+});
+
+test('buildRoundsView：旧任务不合成 records（同名 maker-r<n>.json 不当新契约看），四门口径不变（AC-029）', (t) => {
+  const root = mkroot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cfg = baseCfg(root);
+  const id = 'task-20260713-201';
+  const dir = path.join(cfg.dossierDir, id);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'maker-r1.json'), JSON.stringify({ role: 'maker', round: 1, ok: true, cost_usd: 2 }));
+  fs.writeFileSync(path.join(dir, 'verify-r1.verdict.json'), JSON.stringify({
+    overall: 'pass', criteria_results: [{ ac_id: 'AC-001', status: 'pass' }],
+  }));
+
+  const view = buildRoundsView(cfg, id);
+  assert.deepEqual(view.records, []);
+  assert.deepEqual(view.routerRounds, []);
+  assert.equal(view.rounds[0].maker.status, 'ok');
+  assert.equal(view.rounds[0].verifier.overall, 'pass');
 });

@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { writeNewTask } from '../../conductor/lib/state.mjs';
-import { LANE_ORDER } from '../../conductor/dashboard/model.mjs';
+import { LANE_ORDER, COLUMN_ORDER } from '../../conductor/dashboard/model.mjs';
 import { buildMetrics } from '../../conductor/dashboard/metrics.mjs';
 
 function mkroot(prefix = 'dashboard-metrics-test-') {
@@ -358,7 +358,20 @@ test('buildMetrics：done/failed 皆空时返回良构空结构，isEmpty:true�
       testGateRejectRate: { value: null, n: 0 },
       greenGateFailRate: { value: null, n: 0 },
     },
-    durations: { lanes: LANE_ORDER.map((lane) => ({ lane, p50: null, p90: null, n: 0 })) },
+    routerYield: {
+      taskCount: { done: 0, failed: 0 },
+      avgRounds: { value: null, n: 0 },
+      reviewerFailRate: { value: null, n: 0 },
+      precommitFailRate: { value: null, n: 0 },
+      makerProductMissRate: { value: null, n: 0 },
+      humanGates: { spec: 0, merge: 0, help: 0 },
+      costByRole: {},
+      tierDistribution: { unit: 0, integration: 0, e2e: 0 },
+    },
+    durations: {
+      lanes: LANE_ORDER.map((lane) => ({ lane, p50: null, p90: null, n: 0 })),
+      columns: COLUMN_ORDER.map((column) => ({ column, p50: null, p90: null, n: 0 })),
+    },
     table: [],
     isEmpty: true,
   });
@@ -370,4 +383,111 @@ test('buildMetrics：state/dossier 目录完全不存在时不抛错，退化为
   const cfg = baseCfg(root); // 未 ensureDirs：目录压根不存在
   assert.doesNotThrow(() => buildMetrics(cfg));
   assert.equal(buildMetrics(cfg).isEmpty, true);
+});
+
+// ---- 新旧混装：router 任务用新记录源统计，旧任务口径不变，两者互不污染 ----
+
+function writeRouterTaskFixture(cfg, boxDir, id, { spent, records, timeline }) {
+  writeNewTask(boxDir, {
+    schema_version: 1, id, title: `标题 ${id}`, repo: 'target', targetRepo: '/abs/target',
+    baseBranch: 'main', testCommand: 'node --test', created_at: '2026-09-10T00:00:00.000Z',
+  }, {
+    schema_version: 1, stage: boxDir === cfg.doneDir ? 'DONE' : 'FAILED_BOX', current_round: 3,
+    awaiting: null, spec_approved: true, plan_active: false, plan_source: null, rate_limit: null,
+    spent_usd: spent, last_failure_type: null, updated_at: '2026-09-10T00:00:00.000Z',
+  });
+  const dir = dossierDirFor(cfg, id);
+  for (const [name, obj] of Object.entries(records)) writeJson(dir, name, obj);
+  if (timeline) writeTimeline(dir, timeline);
+  return dir;
+}
+
+const ROUTER_RECORDS = {
+  'router-r1.json': { role: 'router', round: 1, cost_usd: 0.02 },
+  'router-r1.log.json': { role: 'router', outcome: 'ok', action: 'maker', summary: '直接实现' },
+  'maker-r1.json': { role: 'maker', round: 1, cost_usd: 1.5 },
+  'maker-r1.log.json': { role: 'maker', outcome: 'ok', summary: 'AC-001 done' },
+  'router-r2.json': { role: 'router', round: 2, cost_usd: 0.02 },
+  'router-r2.log.json': { role: 'router', outcome: 'ok', action: 'review', summary: '整体冷审' },
+  'reviewer-r2.json': { role: 'reviewer', round: 2, cost_usd: 0.4, head_sha: 'a'.repeat(40) },
+  'reviewer-r2.log.json': { role: 'reviewer', outcome: 'fail', tier: 'unit', summary: 'AC-001 fail lib/x.mjs:1' },
+  'router-r3.json': { role: 'router', round: 3, cost_usd: 0.02 },
+  'router-r3.log.json': { role: 'router', outcome: 'ok', action: 'precommit', tier: 'unit', summary: '跑 unit' },
+  'precommit-r3.json': {
+    role: 'precommit', outcome: 'fail', tier: 'unit', summary: 'unit 2 fail', cost_usd: 0,
+    head_sha: 'a'.repeat(40), base_sha: 'b'.repeat(40), candidate_sha: 'c'.repeat(40),
+    steps: [{ step: 'unit', command: 'node --test', status: 'fail', exit_code: 1, timed_out: false, duration_ms: 900, tail: 'fail 2' }],
+    skipped_tiers: ['integration', 'e2e'], conflict_files: [],
+  },
+  'human-r3.json': {
+    schema_version: 1, kind: 'help', requested_by: 'router', summary: '请裁决', refs: [],
+    requested_at: '2026-09-10T00:00:00.000Z', decision: 'resumed', notes: '按 A 做',
+    decided_at: '2026-09-10T00:10:00.000Z',
+  },
+};
+
+test('buildMetrics：新任务走 routerYield（router 轮次 / reviewer / precommit / 人闸 / 角色成本），旧任务口径不受影响', (t) => {
+  const root = mkroot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cfg = baseCfg(root);
+  ensureDirs(cfg);
+  buildFixture(cfg); // 五个旧任务
+  const before = buildMetrics(cfg);
+
+  writeRouterTaskFixture(cfg, cfg.failedDir, 'task-20260910-300', {
+    spent: 1.96,
+    records: ROUTER_RECORDS,
+    timeline: [
+      '- 2026-09-10T00:00:00.000Z stage → ROUTING (created)',
+      '- 2026-09-10T00:05:00.000Z stage → AWAIT_HUMAN (help 闸（router）)',
+      '- 2026-09-10T00:15:00.000Z stage → FAILED_BOX (abandoned)',
+    ],
+  });
+  const after = buildMetrics(cfg);
+
+  // 旧口径逐项不变：新任务既不进 yield 也不改 durations.lanes
+  assert.deepEqual(after.yield, before.yield);
+  assert.deepEqual(after.durations.lanes, before.durations.lanes);
+
+  const ry = after.routerYield;
+  assert.deepEqual(ry.taskCount, { done: 0, failed: 1 });
+  assert.equal(ry.avgRounds.value, 3);
+  assert.equal(ry.avgRounds.n, 1);
+  assert.deepEqual(ry.reviewerFailRate, { value: 1, n: 1 });
+  assert.deepEqual(ry.precommitFailRate, { value: 1, n: 1 });
+  assert.deepEqual(ry.makerProductMissRate, { value: 0, n: 1 });
+  assert.deepEqual(ry.humanGates, { spec: 0, merge: 0, help: 1 });
+  assert.deepEqual(ry.tierDistribution, { unit: 1, integration: 0, e2e: 0 });
+  assert.equal(ry.costByRole.router, 0.06);
+  assert.equal(ry.costByRole.maker, 1.5);
+  assert.equal(ry.costByRole.reviewer, 0.4);
+
+  // stage 列耗时按新四列统计（ROUTING 300s、AWAIT_HUMAN 600s）
+  const cols = Object.fromEntries(after.durations.columns.map((c) => [c.column, c]));
+  assert.deepEqual(cols.ROUTING, { column: 'ROUTING', p50: 300, p90: 300, n: 1 });
+  assert.deepEqual(cols.AWAIT_HUMAN, { column: 'AWAIT_HUMAN', p50: 600, p90: 600, n: 1 });
+
+  // 明细表：新任务的 rounds 取 router 轮次，打回门取新记录源
+  const row = after.table.find((r) => r.id === 'task-20260910-300');
+  assert.equal(row.rounds, 3);
+  assert.equal(row.primaryRejectDoor, 'precommit');
+  assert.equal(row.spentUsd, 1.96);
+  // 总花费仍以任务级 spent_usd 为唯一口径
+  assert.equal(after.totals.totalSpentUsd, before.totals.totalSpentUsd + 1.96);
+});
+
+test('buildMetrics：只有新任务的仓库不抛错，旧四门盘全空、routerYield 有值', (t) => {
+  const root = mkroot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cfg = baseCfg(root);
+  ensureDirs(cfg);
+  writeRouterTaskFixture(cfg, cfg.doneDir, 'task-20260910-301', { spent: 3.5, records: ROUTER_RECORDS });
+
+  const metrics = buildMetrics(cfg);
+  assert.equal(metrics.isEmpty, false);
+  assert.deepEqual(metrics.yield.firstPassRate, { value: null, n: 0 });
+  assert.deepEqual(metrics.yield.verifierRejectRate, { value: null, n: 0 });
+  assert.equal(metrics.routerYield.taskCount.done, 1);
+  assert.equal(metrics.routerYield.avgRounds.value, 3);
+  assert.equal(metrics.table[0].rounds, 3);
 });
