@@ -689,6 +689,17 @@ export async function runPrecommit({
     ...extra,
   }));
 
+  // profile 可用性闸：测试步「总是适用（至少有 unit）」是 spec §precommit 步骤表的承诺。
+  // profile 在建单后被改到 unit 解析为空（且 task.testCommand 也空）时，三步会全部 skipped 而
+  // outcome=ok —— 于是 need_precommit=false，merge 闸在**零验证**下打开。这是语义洞，不是配置警告：
+  // 什么都没跑过就不可能是 ok，只能是 fail，由 router 看见 profile_unusable 再决定求助还是重试。
+  if (!resolvedProfile?.unit) {
+    return failRecord(
+      'profile_unusable：precommit.unit 与任务 testCommand 皆缺，没有任何可执行的测试命令'
+      + '（target-profiles/<repo>/setup-profile.json 的 precommit 段需要人手写）',
+    );
+  }
+
   if (headSha == null || baseSha == null) {
     const missing = headSha == null ? branch : base;
     return failRecord(`分支不存在：${missing}`);
