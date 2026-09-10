@@ -54,41 +54,69 @@ test('AC-001：STAGES 恰好是新状态机的四个 stage；人闸种类封闭�
 
 // ---- AC-005：内核自行发起的 stage 转移只有六条 ----
 //
-// 这条 AC 的执法方式是「枚举全部 transitionState 调用点，与六条对照」。做法是静态扫新状态机
-// 的文件（stages/routing.mjs、await_human.mjs、actions/*、conductor.mjs 的人闸与 retry 面），
-// 把每个调用点的目标 stage 与它所在的函数记下来——多出一个调用点，这个测试就该红。
+// 这条 AC 的执法方式是「枚举全部 transitionState 调用点，与六条对照」。做法是静态扫两组文件：
+// 内核侧（stages/*，含 shared.mjs 的限额收箱）与人闸侧（conductor.mjs 的 approve / reject /
+// resume / retry / abandon）。多出一个调用点，这个测试就该红。
+//
+// 分类口径：**人触发的转移单独归类，不计入六条**——人闸回 ROUTING、human abandon、两处 retry
+// 都是人点出来的，内核只是执行。六条里唯一落在 conductor.mjs 的是「merge 批准 → DONE」：
+// 人点的是「同意合并」，转移本身由内核在版本规则复算通过后自行落。
+// 绕过 transitionState 直接 `Object.assign(runtime,{stage})` 的写法一律不许再出现——那样
+// timeline 与 stage 事件都不会写，本测试也扫不到，等于在枚举面上开了个洞。
 
-test('AC-005：新状态机里 transitionState 的调用点与六条自发转移一一对应', () => {
-  const files = [
-    'conductor/stages/routing.mjs',
-    'conductor/stages/await_human.mjs',
-    'conductor/stages/actions/spec.mjs',
-    'conductor/stages/actions/maker.mjs',
-    'conductor/stages/actions/review.mjs',
-    'conductor/stages/actions/precommit.mjs',
-    'conductor/stages/router-kernel.mjs',
-  ];
+/** 内核侧文件：这里出现的每一个转移点都必须能对上六条之一，或对上 router 的动作。 */
+const KERNEL_FILES = [
+  'conductor/stages/routing.mjs',
+  'conductor/stages/await_human.mjs',
+  'conductor/stages/actions/spec.mjs',
+  'conductor/stages/actions/maker.mjs',
+  'conductor/stages/actions/review.mjs',
+  'conductor/stages/actions/precommit.mjs',
+  'conductor/stages/router-kernel.mjs',
+  'conductor/stages/shared.mjs',
+];
+
+/** 人闸侧文件：CLI 的五个动词各自的转移点。 */
+const HUMAN_FILES = ['conductor/conductor.mjs'];
+
+/**
+ * 扫一个文件里的全部转移点。目标 stage 是字面量就记字面量，是变量就记 `<变量名>`
+ * （限额 retry 回的是 `runtime.rate_limit.resume_stage` 记下的那个 stage，不是硬编码）。
+ * `failToBox` 是 FAILED_BOX 的唯一封装口，调用点一并计入；它自己的函数声明不算转移。
+ */
+function scanTransitions(rel) {
+  const body = fsSync.readFileSync(pathSync.join(REPO_ROOT_FOR_DECISIONS, rel), 'utf8');
   const sites = [];
-  for (const rel of files) {
-    const body = fsSync.readFileSync(pathSync.join(REPO_ROOT_FOR_DECISIONS, rel), 'utf8');
-    for (const m of body.matchAll(/state\.transitionState\(\s*ts,\s*cfg,\s*'([A-Z_]+)'/g)) {
-      sites.push({ file: rel, stage: m[1] });
-    }
-    // failToBox 是 FAILED_BOX 的唯一封装口，一并计入。
-    for (const m of body.matchAll(/failToBox\(\s*\n?\s*ts,\s*cfg,/g)) {
-      sites.push({ file: rel, stage: 'FAILED_BOX', via: 'failToBox' });
-    }
+  for (const m of body.matchAll(/state\.transitionState\(\s*ts,\s*cfg,\s*(?:'([A-Z_]+)'|([A-Za-z_$][\w$]*))/g)) {
+    sites.push({ file: rel, stage: m[1] ?? `<${m[2]}>`, via: 'transitionState' });
   }
+  for (const m of body.matchAll(/(?<!function\s)failToBox\(\s*ts,\s*cfg,/g)) {
+    void m;
+    sites.push({ file: rel, stage: 'FAILED_BOX', via: 'failToBox' });
+  }
+  return sites;
+}
 
-  // router-kernel.mjs：openHumanGate（spec / merge / help 三种闸共用）与 checkFuse/checkBudget 的收箱。
+const stagesOf = (sites, rel) => sites.filter((s) => s.file === rel).map((s) => s.stage);
+
+test('AC-005：内核侧 transitionState 的调用点与六条自发转移一一对应', () => {
+  const sites = KERNEL_FILES.flatMap(scanTransitions);
+
+  // router-kernel.mjs：openHumanGate（spec / merge / help 三种闸共用一处）与保险丝 / 预算收箱。
   assert.deepEqual(
-    sites.filter((s) => s.file === 'conductor/stages/router-kernel.mjs').map((s) => s.stage).sort(),
+    stagesOf(sites, 'conductor/stages/router-kernel.mjs').sort(),
     ['AWAIT_HUMAN', 'FAILED_BOX', 'FAILED_BOX'],
     'router-kernel 只有：开人闸 1 处 + 保险丝收箱 + 预算收箱',
   );
-  // routing.mjs：abandon 一处收箱（限额收箱在 shared.mjs::rateLimitedToBox，属既有 P0 面）。
+  // shared.mjs：failToBox 的实现本体 1 处 + 限额收箱 1 处（rateLimitedToBox）。
   assert.deepEqual(
-    sites.filter((s) => s.file === 'conductor/stages/routing.mjs').map((s) => s.stage),
+    stagesOf(sites, 'conductor/stages/shared.mjs'),
+    ['FAILED_BOX', 'FAILED_BOX'],
+    'shared 只有：failToBox 的实现本体 + 限额收箱',
+  );
+  // routing.mjs：abandon 一处收箱（router 动作触发，不算内核自发）。
+  assert.deepEqual(
+    stagesOf(sites, 'conductor/stages/routing.mjs'),
     ['FAILED_BOX'],
     'routing 自己只在 abandon 处收箱，其余转移都走 router-kernel 的封装',
   );
@@ -104,5 +132,28 @@ test('AC-005：新状态机里 transitionState 的调用点与六条自发转移
   );
   // await_human 是停车位：一次转移都没有。
   assert.deepEqual(sites.filter((s) => s.file === 'conductor/stages/await_human.mjs'), []);
+  assert.equal(sites.length, 6, '内核侧总共只有这 6 个转移点');
 });
 
+test('AC-005：人闸侧（approve / reject / resume / retry / abandon）的转移点单独归类', () => {
+  const sites = HUMAN_FILES.flatMap(scanTransitions);
+
+  assert.deepEqual(
+    sites.map((s) => `${s.stage}:${s.via}`),
+    [
+      'ROUTING:transitionState', // backToRouting：spec 批准 / spec|merge 打回 / help resume 共用
+      'DONE:transitionState', // merge 批准 —— 六条里唯一落在 CLI 侧的一条
+      'FAILED_BOX:transitionState', // human abandon
+      '<stage>:transitionState', // 限额 retry：回 rate_limit.resume_stage 记下的 stage
+      'ROUTING:transitionState', // 保险丝 / 预算 / abandoned 的 retry
+    ],
+    '人闸侧的转移点恰好这五处，且全部走 transitionState（不许 Object.assign 绕行）',
+  );
+  // 绕行写法的静态执法：runtime 上的 stage 只许由 transitionState 写。
+  const body = fsSync.readFileSync(pathSync.join(REPO_ROOT_FOR_DECISIONS, HUMAN_FILES[0]), 'utf8');
+  assert.equal(
+    /Object\.assign\(\s*ts\.runtime\s*,\s*\{[^}]*stage/.test(body),
+    false,
+    'stage 不许绕过 transitionState 直接写进 runtime',
+  );
+});
