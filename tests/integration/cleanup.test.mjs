@@ -91,3 +91,24 @@ test('AC-045：router 选 abandon 时也清干净', (t) => {
   assert.deepEqual(worktreeDirs(env), []);
   assert.deepEqual(branches(env), ['main']);
 });
+
+test('AC-045：删不掉的分支不算已清理，timeline 如实记 branch delete failed', (t) => {
+  const { env, id } = newRouterEnv(t);
+  env.setScenario([routerStep('maker'), makerStep(), routerStep('human', { summary: '先停一下' })]);
+  assert.equal(env.run('run').status, 0);
+
+  // 造一个删不掉的包分支：在 worktrees/ 之外把它 checkout 出去（清理不会碰那个目录），
+  // `git branch -D` 于是必然失败。
+  const pinned = path.join(env.root, 'pinned-worktree');
+  execFileSync('git', ['-C', env.targetDir, 'branch', `task/${id}--P-009`, 'main'], { stdio: 'pipe' });
+  execFileSync('git', ['-C', env.targetDir, 'worktree', 'add', pinned, `task/${id}--P-009`], { stdio: 'pipe' });
+
+  assert.equal(env.run('abandon', id).status, 0);
+
+  const timeline = env.readFile(env.dossier(id, 'timeline.md'));
+  assert.match(timeline, new RegExp(`branch delete failed: task/${id}--P-009`));
+  const listed = /清理：worktree .*；分支 (.*)/.exec(timeline)?.[1] ?? '';
+  assert.equal(listed.includes('--P-009'), false, '删不掉的分支不得出现在「已清理」清单里');
+  assert.ok(listed.includes(`task/${id}`), '真删掉的任务分支照常列出');
+  assert.ok(branches(env).includes(`task/${id}--P-009`), '它确实还在仓库里');
+});
