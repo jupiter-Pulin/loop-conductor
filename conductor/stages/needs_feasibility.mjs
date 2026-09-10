@@ -14,6 +14,7 @@ import {
   accountSpawnCost, archiveFeasibilityDraft, budgetExceeded, buildFeasibilityPrompt, failToBox,
   feasibilityDraftPath, FEASIBILITY_AGENT_TOOLS, nextRoleRound, runFeasibilityContractGate,
   startSpawnRecord, finishSpawnRecord, writeFeasibilityAgentSettings, canStartSpawn, acquireSpecChainCwd,
+  rateLimitedToBox,
 } from './shared.mjs';
 
 export default async function needsFeasibilityHandler(ts, cfg) {
@@ -68,6 +69,8 @@ export default async function needsFeasibilityHandler(ts, cfg) {
     }
     finishSpawnRecord(rec, res);
     accountSpawnCost(ts, cfg, 'feasibility-agent', round, res);
+    const limited = rateLimitedToBox(ts, cfg, 'feasibility-agent', res);
+    if (limited) return limited; // 限额：进箱等人在 resets_at 后 retry
     if (!res.ok) {
       state.saveRuntime(ts);
       state.appendTimeline(cfg, id, `feasibility-agent spawn failed: ${res.error ?? 'unknown'}`);

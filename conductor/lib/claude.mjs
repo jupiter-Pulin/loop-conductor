@@ -89,6 +89,33 @@ export function buildClaudeArgs({
   return args;
 }
 
+/**
+ * 五小时 / 周限额事件（stream 中 `type:"rate_limit_event"` 且 `rate_limit_info.status==="rejected"`）
+ * → `{ type, resets_at, status }`（`resets_at` 为 Unix 秒）。非 rejected 或形状不符返回 null。
+ * 真实 CLI 字段是 camelCase（`rateLimitType` / `resetsAt`，见 dossier/task-20260829-002/maker-r1.stream.jsonl），
+ * snake_case 变体一并接受，防 CLI 字段漂移时静默漏判。
+ */
+export function parseRateLimitEvent(event) {
+  if (event?.type !== 'rate_limit_event') return null;
+  const info = event.rate_limit_info;
+  if (!info || info.status !== 'rejected') return null;
+  const resetsAtRaw = info.resetsAt ?? info.resets_at ?? null;
+  const resetsAt = Number.isFinite(Number(resetsAtRaw)) ? Number(resetsAtRaw) : null;
+  return {
+    type: info.rateLimitType ?? info.rate_limit_type ?? null,
+    resets_at: resetsAt,
+    status: 'rejected',
+  };
+}
+
+/**
+ * spawn 结果是否命中限额：runClaudeWithRetry 短路时盖的 `rate_limited`，或裸 runClaudeStream
+ * 结果上的 rejected `rate_limit`。内核全部 spawn 点共用此判定，防两处漂移。
+ */
+export function isRateLimited(res) {
+  return res?.rate_limited === true || res?.rate_limit?.status === 'rejected';
+}
+
 /** 解析 `--output-format json` 的 stdout；解析不出返回 null。 */
 export function parseClaudeJson(stdout) {
   const t = String(stdout ?? '').trim();
@@ -123,7 +150,7 @@ export function runClaudeStream(opts) {
     } catch (err) {
       resolve({
         ok: false, exitCode: -1, sessionId: null, costUsd: 0, result: null, raw: null,
-        error: String(err), spawnError: true, killed: null, costUnknown: true,
+        error: String(err), spawnError: true, killed: null, costUnknown: true, rate_limit: null,
       });
       return;
     }
@@ -138,6 +165,7 @@ export function runClaudeStream(opts) {
     let resultEvent = null;
     let lastEvent = null;
     let parseError = null;
+    let rateLimit = null;
     let killed = null;
     let closed = false;
     let forceTimer = null;
@@ -181,6 +209,8 @@ export function runClaudeStream(opts) {
       }
       parsedAny = true;
       lastEvent = parsed;
+      const rl = parseRateLimitEvent(parsed);
+      if (rl) rateLimit = rl; // 取最后一条 rejected 事件
       if (parsed.type === 'result' || parsed.subtype === 'success' || typeof parsed.result === 'string') {
         resultEvent = parsed;
       }
@@ -207,7 +237,7 @@ export function runClaudeStream(opts) {
       if (forceTimer) clearTimeout(forceTimer);
       resolve({
         ok: false, exitCode: -1, sessionId: null, costUsd: 0, result: null, raw: null,
-        error: String(err), spawnError: true, killed: null, costUnknown: true,
+        error: String(err), spawnError: true, killed: null, costUnknown: true, rate_limit: null,
       });
     });
 
@@ -238,12 +268,16 @@ export function runClaudeStream(opts) {
           error: baseError,
           killed,
           costUnknown,
+          rate_limit: rateLimit,
           stdout,
           stderr,
         });
         return;
       }
-      resolve({ ok: true, exitCode: 0, sessionId, costUsd, result: result ?? '', raw, killed: null, costUnknown: false });
+      resolve({
+        ok: true, exitCode: 0, sessionId, costUsd, result: result ?? '', raw,
+        killed: null, costUnknown: false, rate_limit: rateLimit,
+      });
     });
   });
 }
@@ -252,10 +286,11 @@ export const runClaude = runClaudeStream;
 
 // ---- 瞬态故障重试（API 不稳定：403/408/429/5xx 或 spawn 本身失败时退避重试，能续会话就续）。
 
-// 尾部 300s/600s：dossier 证据（task-20260706-001）显示 4 连 429 在 3.75min 阶梯内穿不过
-// 限流窗口，收箱后人工 retry 一次即过——长尾退避把这类失败变成自愈。
+// 阶梯只留 15s/30s/60s 三档：长尾 5min/10min 原本是为「穿过限流窗口」设计的，而五小时/周限额
+// 现在由 rejected rate_limit_event 零重试短路 → FAILED_BOX（人手动 retry），退避再长也穿不过；
+// 剩下的真瞬态（403/408/5xx、无 rate_limit 的 429）在一分钟内不恢复就该让人看见。
 const DEFAULT_RETRIES = 6;
-const DEFAULT_BACKOFF_MS = [15000, 30000, 60000, 120000, 300000, 600000];
+const DEFAULT_BACKOFF_MS = [15000, 30000, 60000];
 const TRANSIENT_STATUSES = new Set([403, 408, 429, 500, 502, 503, 529]);
 // spawn 层确定性 errno：二进制不可执行/不存在/权限问题，重试必然同样失败——
 // 退避阶梯加长后误判为瞬态的代价升至 ~18.75min（task-20260612-001 EACCES 即此类）。
@@ -299,7 +334,8 @@ export function isTransientFailure(res) {
 }
 
 /**
- * runClaude 外包一层瞬态重试。非瞬态或成功 → 原样返回；瞬态 → 退避后重试。
+ * runClaude 外包一层瞬态重试。非瞬态或成功 → 原样返回；瞬态 → 退避后重试；
+ * 命中五小时/周限额（rejected rate_limit_event）→ 零重试立即返回 `rate_limited: true`。
  * 续接优先：上次失败带 session_id 且 num_turns>1 时改为 -r 续会话（保留原 maxTurns / output-format）；
  * num_turns<=1 原样重发。resume 再瞬态失败可继续 resume（始终以最近一次失败的 session 为准）。
  * 返回值附加 attempts: [{attempt, transient, api_error_status, session_id, cost_usd}]，
@@ -319,7 +355,10 @@ export async function runClaudeWithRetry(callOpts, {
     res = await runClaude(current);
     totalCost += res.costUsd ?? 0;
     if (res.costUnknown) anyCostUnknown = true;
-    const transient = isTransientFailure(res);
+    // 限额（rejected rate_limit_event）绝不是瞬态：重试只会烧掉整条退避阶梯而必然再撞同一堵墙。
+    // 零重试短路，盖 rate_limited:true 交内核收箱（人在 resets_at 之后 retry）。
+    const rateLimited = res.rate_limit?.status === 'rejected';
+    const transient = !rateLimited && isTransientFailure(res);
     const status = res.raw?.api_error_status ?? null;
     attempts.push({
       attempt,
@@ -329,7 +368,12 @@ export async function runClaudeWithRetry(callOpts, {
       cost_usd: res.costUsd ?? 0,
       killed: res.killed ?? null,
       cost_unknown: res.costUnknown === true,
+      ...(rateLimited ? { rate_limited: true } : {}),
     });
+    if (rateLimited) {
+      res = { ...res, ok: false, rate_limited: true };
+      break;
+    }
     if (!transient) break; // 成功或非瞬态失败 → 原样返回
     if (attempt > retries) {
       res = {

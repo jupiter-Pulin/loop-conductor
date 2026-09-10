@@ -9,8 +9,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import * as state from '../lib/state.mjs';
-import { runClaude, runClaudeWithRetry } from '../lib/claude.mjs';
+import { runClaude, runClaudeWithRetry, isRateLimited } from '../lib/claude.mjs';
 import { runCodexExec } from '../lib/codex.mjs';
+import { markRunRateLimited } from '../lib/scheduler.mjs';
 import { mergeBaseWith, diffNameStatusAgainstBase, parseNameStatusPaths, showFileAtRef, diffNumstatAgainstBase } from '../lib/git.mjs';
 import {
   parseStrictJson, validateVerifierVerdict, verdictNext, verifierInvalidNext, makerMissNext, makerRound,
@@ -19,7 +20,7 @@ import {
 import {
   worktreePath, buildVerifierPrompt, buildReviewerPrompt, buildRepairContext, writeRepairContext, renderVerifyReport,
   budgetExceeded, failToBox, startSpawnRecord, finishSpawnRecord, VERIFIER_TOOLS, canStartSpawn,
-  computeTestChangeGuard, accountSpawnCost, performMerge,
+  computeTestChangeGuard, accountSpawnCost, performMerge, rateLimitedToBox,
 } from './shared.mjs';
 
 export default async function verifyHandler(ts, cfg) {
@@ -79,6 +80,8 @@ export default async function verifyHandler(ts, cfg) {
   accountSpawnCost(ts, cfg, 'verifier', round, res);
   state.saveRuntime(ts); // 成本先落盘
 
+  const limited = rateLimitedToBox(ts, cfg, 'verifier', res);
+  if (limited) return limited; // 限额：进箱等人在 resets_at 后 retry，不计 invalid、不重 spawn
   if (!res.ok) {
     // 基建失败（spawn 错误 / killed / 非零退出 / 无 result 事件，瞬态重试已耗尽）：
     // 不是 verifier 的协议失败，不计 invalid、不动 verifier_invalid_count，留在 VERIFY 下次 run 重 spawn。
@@ -221,6 +224,9 @@ async function runReviewerShadow(ts, cfg, round, mainVerdict, { acList, expected
   state.saveRuntime(ts);
 
   let review = { valid: false, gate: null, metrics: null, invalid_kind: null };
+  // shadow 命中限额：只把本次 run 标记为「不再发起新 spawn」，绝不把主链任务收箱
+  // （shadow 是观测面，永不影响状态机）。
+  if (isRateLimited(res)) markRunRateLimited(cfg, res.rate_limit?.resets_at ?? null);
   if (!res.ok) {
     review.invalid_kind = 'infra';
     state.writeJson(state.dossierPath(cfg, id, `review-r${round}.invalid.json`), {

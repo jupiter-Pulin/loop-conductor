@@ -98,7 +98,29 @@ export function addRunCost(cfg, costUsd) {
   cfg.__runBudget.spent = Math.round((cfg.__runBudget.spent + cost) * 1e6) / 1e6;
 }
 
+/**
+ * 本次 run 已命中限额（cfg.__rateLimited = resets_at，Unix 秒；null 表示 CLI 没给重置时刻）。
+ * 命中后本次 run 内不再发起任何新 spawn：未开跑的任务留在原 stage，各记一条 timeline，
+ * 绝不因此改动它们的状态——只有命中的那一个任务进 FAILED_BOX。
+ */
+export function markRunRateLimited(cfg, resetsAt) {
+  if (!cfg) return;
+  cfg.__rateLimited = typeof resetsAt === 'number' ? resetsAt : null;
+  cfg.__rateLimitedSet = true;
+}
+
+export function runRateLimited(cfg) {
+  return cfg?.__rateLimitedSet === true;
+}
+
 export function canStartSpawn(ts, cfg, role) {
+  if (runRateLimited(cfg)) {
+    const until = typeof cfg.__rateLimited === 'number'
+      ? new Date(cfg.__rateLimited * 1000).toISOString()
+      : 'unknown';
+    state.appendTimeline(cfg, ts.id, `${role} spawn skipped: rate limited until ${until}`);
+    return false;
+  }
   const budget = cfg.__runBudget;
   if (!budget || budget.limit == null) return true;
   if (budget.spent < budget.limit) return true;

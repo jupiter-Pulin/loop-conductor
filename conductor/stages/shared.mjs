@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { runClaude, runClaudeWithRetry, isDeterministicSpawnFailure } from '../lib/claude.mjs';
+import { runClaude, runClaudeWithRetry, isDeterministicSpawnFailure, isRateLimited } from '../lib/claude.mjs';
 import {
   ensureWorktree, commitAll, diffAgainstBase, diffNameStatusAgainstBase, diffStatAgainstBase,
   mergeBaseWith, addDetachedWorktree, removeWorktree, currentBranch, mergeBranch, deleteBranch,
@@ -13,7 +13,7 @@ import { DEFAULT_TEST_GLOBS, classifyTestFileChanges, listExistingTestFileChange
 import { readApprovedSetupProfile, setupProfilePaths } from '../lib/profile.mjs';
 import { taskCfg } from '../lib/task-cfg.mjs';
 import * as state from '../lib/state.mjs';
-import { addRunCost, canStartSpawn } from '../lib/scheduler.mjs';
+import { addRunCost, canStartSpawn, markRunRateLimited } from '../lib/scheduler.mjs';
 import { SPEC_DOC_CONTRACT, validateSpecDoc } from '../lib/spec-contract.mjs';
 import { FEASIBILITY_DOC_CONTRACT, validateFeasibilityDoc } from '../lib/feasibility-contract.mjs';
 import { buildSignature } from '../lib/failure-signature.mjs';
@@ -1146,6 +1146,44 @@ export function budgetExceeded(ts, cfg) {
   return overBudget(ts.runtime.spent_usd ?? 0, cfg.budgetUsd);
 }
 
+// ---- 五小时 / 周限额：进箱，人手动恢复，永不自动续跑 ----
+
+/** rate_limit 的 ISO 文案（resets_at 缺失时给 'unknown'，绝不造时刻）。 */
+export function rateLimitResetIso(resetsAt) {
+  return typeof resetsAt === 'number' && Number.isFinite(resetsAt)
+    ? new Date(resetsAt * 1000).toISOString()
+    : 'unknown';
+}
+
+/**
+ * 全部 spawn 点共用的限额收口：命中 → 本次 run 内不再发起任何新 spawn（markRunRateLimited），
+ * 该任务 FAILED_BOX(rate_limited) 并记 `runtime.rate_limit = {type, resets_at, hit_at, resume_stage}`；
+ * resume_stage 取命中时所在 stage，`retry` 据此原地回位（不归档轮次产物、不重置任何计数）。
+ * 未命中返回 null，调用方继续走原路径。
+ */
+export function rateLimitedToBox(ts, cfg, role, res) {
+  if (!isRateLimited(res)) return null;
+  const rl = res.rate_limit ?? {};
+  const resetsAt = typeof rl.resets_at === 'number' ? rl.resets_at : null;
+  const type = rl.type ?? null;
+  const iso = rateLimitResetIso(resetsAt);
+  const resumeStage = ts.runtime.stage;
+  markRunRateLimited(cfg, resetsAt);
+  state.appendTimeline(cfg, ts.id, `${role} spawn 命中限额（${type ?? 'unknown'}），重置于 ${iso}`);
+  // 字段名不能叫 `type`：appendEvent 以 `{ts, type, ...fields}` 展开，会把事件类型顶掉。
+  state.appendEvent(cfg, ts.id, 'rate_limited', {
+    role, limit_type: type, resets_at: resetsAt, resume_stage: resumeStage,
+  });
+  return failToBox(ts, cfg, `rate limited (${type ?? 'unknown'})，重置于 ${iso}`, 'rate_limited', {
+    rate_limit: {
+      type,
+      resets_at: resetsAt,
+      hit_at: Math.floor(Date.now() / 1000),
+      resume_stage: resumeStage,
+    },
+  });
+}
+
 /**
  * 收箱：transitionState→FAILED_BOX，设 last_failure_type，console.error。
  * extra 合并进 runtime（阶梯耗尽时要把递增后的 maker_miss_count 一并落盘，否则 timeline 与
@@ -1552,6 +1590,14 @@ export async function runCommitterProposal(ts, cfg) {
     finishSpawnRecord(rec, res);
     addCost(ts, res.costUsd);
     state.saveRuntime(ts);
+    if (isRateLimited(res)) {
+      // 限额命中：本次 run 内不再发起新 spawn，但绝不把正在合并的任务收箱——committer 是
+      // fail-open 的文案层（人已批准 merge），降级机器文案继续交付，不重试第二次。
+      markRunRateLimited(cfg, res.rate_limit?.resets_at ?? null);
+      state.appendTimeline(cfg, id, `committer 提案 a${attempt} 命中限额（重置于 ${rateLimitResetIso(res.rate_limit?.resets_at)}），merge 降级机器文案`);
+      state.appendEvent(cfg, id, 'committer_attempt', { attempt, outcome: 'invalid', invalid_kind: 'rate_limited' });
+      break;
+    }
     const check = validateCommitMessage(parseStrictJson(res.result), cfg.commitLanguage);
     if (check.ok) {
       state.appendTimeline(cfg, id, `committer 提案 a${attempt} 有效：${check.subject}`);
@@ -1662,7 +1708,8 @@ export async function runMakerRound(ts, cfg, round, { mode, prompt, coldPrompt, 
   if (mode === 'resume') {
     res = await runClaudeWithRetry({ ...common, resume: ts.runtime.maker_session_id, prompt }, retryOpts);
     res = await continueOnMaxTurns(res);
-    if (!res.ok && !isMaxTurnsCutoff(res)) {
+    // 限额不是 resume 失败：降级冷启动只会再撞同一堵墙（而且是本次 run 明令禁止的新 spawn）。
+    if (!res.ok && !isRateLimited(res) && !isMaxTurnsCutoff(res)) {
       // resume 无论是立即判非瞬态失败，还是瞬态重试耗尽，都必须落到冷启动兜底一次——
       // resume 失败绝不能让本轮直接以 retriesExhausted 收场（那会被上层判 spawn_transient_exhausted 收箱，
       // 跳过冷启动逃生口）。max-turns 截断不算 resume 失败：续跑额度耗尽后照常进 green gate。

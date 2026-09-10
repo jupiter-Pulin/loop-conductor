@@ -6,7 +6,7 @@
 // 只存在于全屏审查页；页由 hash 路由驱动，可刷新、可回退。
 import {
   GAUGE_LANES, summarizeBoard, gaugeSegments, escapeHtml, verdictChip,
-  groupTimelineByRound, roundGaugeTicks, resolveDrawerFocusTarget, parseRouteHash,
+  groupTimelineByRound, roundGaugeTicks, resolveDrawerFocusTarget, parseRouteHash, rateLimitPanel,
 } from './view.mjs';
 import {
   barWidths, sortTableRows, formatUsd, formatPercent, formatDurationSeconds, isMetricsEmpty,
@@ -1244,12 +1244,23 @@ function buildReviewMain(id, detail) {
   } else if (review.kind === 'failed') {
     content.push(el('h3', { text: '失败信息' }));
     content.push(el('div', { text: review.lastFailureType || '(未知失败类型)' }));
+    const rl = rateLimitPanel(review.rateLimit);
+    if (rl) {
+      // 限额收箱：只有人能恢复，且必须在重置时刻之后（与 CLI retry 同一条规则）。
+      content.push(el('div', { class: 'rate-limit-note', text: rl.label }));
+      actions.push(el('button', {
+        class: 'btn btn-danger', text: '↻ 恢复', disabled: rl.canResume ? null : 'disabled',
+        title: rl.canResume ? null : `限额重置于 ${rl.resetText} 之后才能恢复`,
+        onclick: rl.canResume ? () => confirmAndSubmitJob(id, 'retry', '确定恢复该任务？') : null,
+      }));
+    } else {
+      actions.push(el('button', {
+        class: 'btn btn-danger', text: '↻ 重试',
+        onclick: () => confirmAndSubmitJob(id, 'retry', '确定重试该任务？'),
+      }));
+    }
     content.push(buildVerdictPanelNode(review.verdict, { title: '最终 verifier 裁决' }));
     content.push(buildDiffSectionNode(lastDiff, { taskId: id }));
-    actions.push(el('button', {
-      class: 'btn btn-danger', text: '↻ 重试',
-      onclick: () => confirmAndSubmitJob(id, 'retry', '确定重试该任务？'),
-    }));
   } else if (review.kind === 'done') {
     content.push(el('h3', { text: '任务已完成' }));
     content.push(buildVerdictPanelNode(review.verdict, { title: '最终 verifier 裁决' }));

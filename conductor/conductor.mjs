@@ -90,7 +90,7 @@ export function loadCfg(root = resolveRoot()) {
     autoApproveSpecEnabled: false, // spec 审批门机器放行：默认关；开=AWAIT_SPEC_APPROVAL 且 evaluateAutoApproveSpec 谓词全绿即冻结进 READY（merge 闸门不动）。new --auto-approve-spec 可逐任务覆盖
     autoApproveSpecMaxAcs: 8, // 机器放行的 AC 数上限：超上限（或 verdict 带 blocker/major/advisory finding）一律留人审
     spawnRetries: 6, // Claude 瞬态重试次数（H7：长尾覆盖限流窗口）
-    spawnBackoffMs: [15000, 30000, 60000, 120000, 300000, 600000], // 瞬态重试退避（H7：尾部 5min/10min 穿越 429 窗口）
+    spawnBackoffMs: [15000, 30000, 60000], // 瞬态重试退避三档；五小时/周限额走零重试收箱路径，不靠长尾退避硬穿
     verifierShadowEnabled: false, // verifier shadow 观测实验（R4-E11）：默认关；开启也绝不影响状态机
     verifierShadowBackend: 'codex-exec', // 当前唯一支持的 shadow 后端（codex CLI 非交互形态）
     verifierShadowModel: null, // 传给 codex exec -m；null 用 codex 本地默认
@@ -789,7 +789,56 @@ function applyNarrowRetry(cfg, ts, kind) {
   console.log(`${id} 已重回 queue（stage=${ts.runtime.stage}），协议失败已恢复，${isVerifier ? 'maker' : 'spec 草稿'}产出保留`);
 }
 
-async function cmdRetry(cfg, id) {
+/** Unix 秒 → 本地时间文案（带 UTC 偏移，便于人对表；不依赖 locale 顺序）。 */
+export function formatLocalTime(unixSec) {
+  const d = new Date(unixSec * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  const offMin = -d.getTimezoneOffset();
+  const sign = offMin >= 0 ? '+' : '-';
+  const oh = pad(Math.floor(Math.abs(offMin) / 60));
+  const om = pad(Math.abs(offMin) % 60);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} `
+    + `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())} (UTC${sign}${oh}:${om})`;
+}
+
+function isRateLimitedTask(ts) {
+  return ts.box === 'failed' && ts.runtime?.last_failure_type === 'rate_limited';
+}
+
+/**
+ * 限额恢复（契约 §限额）：`now < resets_at` 拒绝（打印本地重置时刻，exit 非 0，--force 越过）；
+ * 到点则回到命中时所在 stage（runtime.rate_limit.resume_stage），**不归档任何轮次产物、
+ * 不重置任何计数**——限额不是任务的失败，产物与进度原样接着用。
+ */
+function applyRateLimitRetry(cfg, ts, { force = false } = {}) {
+  const id = ts.id;
+  const rl = ts.runtime.rate_limit ?? {};
+  const resetsAt = typeof rl.resets_at === 'number' ? rl.resets_at : null;
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (!force && resetsAt != null && nowSec < resetsAt) {
+    console.log(
+      `${id} 限额（${rl.type ?? 'unknown'}）尚未重置：重置时刻 ${formatLocalTime(resetsAt)}。`
+      + `到点后再 \`conductor retry ${id}\`，或加 --force 越过（会再次撞限额）。`,
+    );
+    process.exitCode = 1;
+    return false;
+  }
+  const stage = rl.resume_stage ?? 'READY';
+  Object.assign(ts.runtime, { stage, last_failure_type: null, rate_limit: null });
+  state.saveRuntime(ts);
+  const dest = state.taskDir(cfg.queueDir, id);
+  fs.mkdirSync(cfg.queueDir, { recursive: true });
+  fs.renameSync(ts.dir, dest);
+  ts.dir = dest;
+  ts.box = 'queue';
+  const forced = force && resetsAt != null && nowSec < resetsAt ? '（--force 越过重置时刻）' : '';
+  state.appendTimeline(cfg, id, `human retry：限额恢复 → ${stage}${forced}，无产物归档、计数不变`);
+  console.log(`${id} 已重回 queue（stage=${stage}），限额已恢复${forced}；执行 \`conductor run\` 继续`);
+  return true;
+}
+
+async function cmdRetry(cfg, id, opts = {}) {
+  if (opts['rate-limited']) return cmdRetryRateLimited(cfg, opts);
   return withCliTaskMutation(cfg, id, async () => {
   const ts = findTask(cfg, id);
   if (!ts) { console.error(`找不到任务 ${id}`); process.exitCode = 1; return; }
@@ -799,6 +848,7 @@ async function cmdRetry(cfg, id) {
     process.exitCode = 1;
     return;
   }
+  if (isRateLimitedTask(ts)) { applyRateLimitRetry(cfg, ts, { force: opts.force === true }); return; }
   if (ts.box === 'failed') {
     const narrow = narrowRetryKind(cfg, ts);
     if (narrow) { applyNarrowRetry(cfg, ts, narrow); return; }
@@ -850,6 +900,24 @@ async function cmdRetry(cfg, id) {
   });
 }
 
+/** `retry --rate-limited`：对 failed 箱里全部 rate_limited 任务执行同一恢复逻辑。 */
+async function cmdRetryRateLimited(cfg, opts = {}) {
+  const ids = state.listTaskStates(cfg.failedDir, 'failed')
+    .filter((ts) => !ts.error && ts.runtime?.last_failure_type === 'rate_limited')
+    .map((ts) => ts.id);
+  if (ids.length === 0) {
+    console.log('failed 箱里没有 rate_limited 任务');
+    return;
+  }
+  for (const id of ids) {
+    await withCliTaskMutation(cfg, id, async () => {
+      const ts = findTask(cfg, id);
+      if (!ts || ts.error || !isRateLimitedTask(ts)) return;
+      applyRateLimitRetry(cfg, ts, { force: opts.force === true });
+    });
+  }
+}
+
 // ---- CLI 分发 ----
 
 function parseArgs(argv) {
@@ -887,7 +955,10 @@ const USAGE = `用法：conductor <command>
   spy                                  只读查看 queue 任务的运行中角色与最近活动
   merge <id>                           人工终点闸门：合入分支、归档、清 worktree
   close <id>                           probe 终点闸门：调查报告固化进 dossier 后归档（无 merge）
-  retry <id>                           FAILED_BOX → READY（重置 miss，保留案卷）/ 清理崩溃标记`;
+  retry <id> [--force]                 FAILED_BOX → READY（重置 miss，保留案卷）/ 清理崩溃标记；
+                                       限额收箱（rate_limited）的任务回到命中时的 stage，且必须在
+                                       重置时刻之后（--force 可越过，会再次撞限额）
+  retry --rate-limited [--force]       批量恢复 failed 箱里全部限额收箱的任务`;
 
 const REQUIRED_NODE_MAJOR = 24;
 
@@ -918,7 +989,7 @@ export async function main(argv = process.argv.slice(2)) {
     case 'spy': cmdSpy(cfg); break;
     case 'merge': await cmdMerge(cfg, opts._[0]); break;
     case 'close': await cmdClose(cfg, opts._[0]); break;
-    case 'retry': await cmdRetry(cfg, opts._[0]); break;
+    case 'retry': await cmdRetry(cfg, opts._[0], opts); break;
     default:
       console.error(USAGE);
       process.exitCode = cmd ? 1 : 0;

@@ -5,8 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   buildClaudeArgs, parseClaudeJson, claudeBin, probeManagedClaudeBin, runClaudeStream,
-  isTransientFailure, runClaudeWithRetry, setSleepFn,
+  isTransientFailure, runClaudeWithRetry, setSleepFn, parseRateLimitEvent, isRateLimited,
 } from '../../conductor/lib/claude.mjs';
+import { loadCfg } from '../../conductor/conductor.mjs';
 import { FAKE_CLAUDE } from '../helpers/env.mjs';
 
 /** 起一个临时目录 + fake-claude 剧本，注入 CLAUDE_BIN，返回 { dir, scenarioPath }；t.after 自动还原环境与清理。 */
@@ -299,4 +300,92 @@ test('H11: 真实 spawn EACCES（二进制无执行位）→ 一次即返回，�
   assert.match(String(res.error), /EACCES/);
   assert.equal(res.attempts.length, 1, '确定性 spawn 错误一次即返回');
   assert.ok(!res.retriesExhausted, '非瞬态路径不得标记 retriesExhausted');
+});
+
+// ---- AC-020：五小时 / 周限额（rejected rate_limit_event）→ 零重试短路 ----
+
+test('AC-020: parseRateLimitEvent — 只认 rejected；camelCase 与 snake_case 都解析', () => {
+  const real = {
+    type: 'rate_limit_event',
+    rate_limit_info: { status: 'rejected', resetsAt: 1788068400, rateLimitType: 'five_hour' },
+  };
+  assert.deepEqual(parseRateLimitEvent(real), { type: 'five_hour', resets_at: 1788068400, status: 'rejected' });
+  assert.deepEqual(
+    parseRateLimitEvent({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected', resets_at: 42, rate_limit_type: 'weekly' } }),
+    { type: 'weekly', resets_at: 42, status: 'rejected' },
+  );
+  // allowed / 缺 info / 其他事件类型一律 null（allowed 是正常配额播报，绝不能当限额）
+  assert.equal(parseRateLimitEvent({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed', resetsAt: 1 } }), null);
+  assert.equal(parseRateLimitEvent({ type: 'rate_limit_event' }), null);
+  assert.equal(parseRateLimitEvent({ type: 'assistant' }), null);
+  assert.equal(parseRateLimitEvent(null), null);
+});
+
+test('AC-020: runClaudeStream 从 stream 取出 rate_limit（type/resets_at/status）；无事件为 null', async (t) => {
+  const dir = makeFakeClaudeDir(t, [
+    { actions: [{ type: 'rateLimit', resets_at: 1788068400, rate_limit_type: 'five_hour' }] },
+    { session_id: 's-ok', cost: 0.01, result: 'ok' },
+  ]);
+
+  const limited = await runClaudeStream({ prompt: 'x', cwd: dir, maxTurns: 5 });
+  assert.equal(limited.ok, false);
+  assert.deepEqual(limited.rate_limit, { type: 'five_hour', resets_at: 1788068400, status: 'rejected' });
+
+  const normal = await runClaudeStream({ prompt: 'x', cwd: dir, maxTurns: 5 });
+  assert.equal(normal.ok, true, normal.error);
+  assert.equal(normal.rate_limit, null, '无 rate_limit_event 时字段为 null');
+});
+
+test('AC-020: runClaudeWithRetry 遇 rejected rate_limit → 零重试、rate_limited:true、不吃退避', async (t) => {
+  const dir = makeFakeClaudeDir(t, [
+    { actions: [{ type: 'rateLimit', resets_at: 1788068400, rate_limit_type: 'five_hour' }] },
+    { session_id: 's-ok', cost: 0.01, result: '不应被调用到' },
+  ]);
+  const retryLog = [];
+  setSleepFn(() => { throw new Error('限额不得触发退避 sleep'); });
+  t.after(() => setSleepFn(null));
+
+  const res = await runClaudeWithRetry({ prompt: 'x', cwd: dir, maxTurns: 5 }, {
+    retries: 6,
+    backoffMs: [0],
+    onRetry: (info) => retryLog.push(info),
+  });
+
+  assert.equal(res.ok, false);
+  assert.equal(res.rate_limited, true);
+  assert.equal(res.retriesExhausted, undefined, '限额不是瞬态耗尽');
+  assert.deepEqual(res.rate_limit, { type: 'five_hour', resets_at: 1788068400, status: 'rejected' });
+  assert.equal(res.attempts.length, 1, '限额一次即返回');
+  assert.equal(res.attempts[0].transient, false, '限额不得被记成瞬态');
+  assert.equal(res.attempts[0].rate_limited, true);
+  assert.equal(retryLog.length, 0, '不得触发 onRetry');
+});
+
+test('AC-020: isRateLimited 覆盖 rate_limited 标记与裸 rate_limit 两种形态', () => {
+  assert.equal(isRateLimited({ rate_limited: true }), true);
+  assert.equal(isRateLimited({ rate_limit: { status: 'rejected', resets_at: 1, type: 'five_hour' } }), true);
+  assert.equal(isRateLimited({ rate_limit: null }), false);
+  assert.equal(isRateLimited({ rate_limit: { status: 'allowed' } }), false);
+  assert.equal(isRateLimited({ ok: true }), false);
+  assert.equal(isRateLimited(null), false);
+});
+
+test('AC-020: 其余瞬态退避阶梯为 15s / 30s / 60s 三档（末档重复，不再有 2min/5min/10min 长尾）', async (t) => {
+  const dir = makeFakeClaudeDir(t, [
+    { exitCode: 1 }, { exitCode: 1 }, { exitCode: 1 }, { exitCode: 1 }, { exitCode: 1 },
+  ]);
+  const slept = [];
+  setSleepFn((ms) => { slept.push(ms); });
+  t.after(() => setSleepFn(null));
+
+  // 不传 backoffMs → 走 DEFAULT_BACKOFF_MS
+  const res = await runClaudeWithRetry({ prompt: 'x', cwd: dir, maxTurns: 5 }, { retries: 4 });
+  assert.equal(res.retriesExhausted, true);
+  assert.deepEqual(slept, [15000, 30000, 60000, 60000], '三档阶梯，超出后停在末档');
+});
+
+test('AC-020: loadCfg 默认 spawnBackoffMs 为三档 15/30/60', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-cfg-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  assert.deepEqual(loadCfg(root).spawnBackoffMs, [15000, 30000, 60000]);
 });
