@@ -4,9 +4,27 @@
 /** 本地定义的 lane 顺序常量，值与 model.mjs::LANE_ORDER 深等（靠单测钉住两侧一致）。 */
 export const GAUGE_LANES = ['setup', 'feasibility', 'spec', 'maker', 'verify', 'merge'];
 
-/** board → 页头汇总：queue/done/failed 计数、done 总花费。 */
+/** 新看板的四列常量，值与 model.mjs::COLUMN_ORDER 深等（靠单测钉住两侧一致）。 */
+export const BOARD_COLUMNS = ['ROUTING', 'AWAIT_HUMAN', 'FAILED_BOX', 'DONE'];
+
+/** AWAIT_HUMAN 的闸别 → 卡片徽标文案（Invariant 5：三种，封闭）。 */
+const AWAITING_LABELS = { spec: 'spec 闸', merge: 'merge 闸', help: 'help 闸' };
+
+export function awaitingLabel(kind) {
+  return AWAITING_LABELS[kind] ?? '人闸';
+}
+
+/**
+ * board → 页头汇总：queue/done/failed 计数、done 总花费。
+ * queue 口径 = 还活着的任务：新状态机的 ROUTING + AWAIT_HUMAN 两列，加上仍按旧泳道显示的
+ * 遗留任务（board.legacy）。旧载荷（只有 lanes）回落为泳道之和。
+ */
 export function summarizeBoard(board) {
-  const queue = board.lanes.reduce((sum, lane) => sum + lane.tasks.length, 0);
+  const queue = board.columns
+    ? board.columns
+      .filter((c) => c.column === 'ROUTING' || c.column === 'AWAIT_HUMAN')
+      .reduce((sum, c) => sum + c.tasks.length, 0) + (board.legacy?.length ?? 0)
+    : board.lanes.reduce((sum, lane) => sum + lane.tasks.length, 0);
   const done = board.done.length;
   const failed = board.failed.length;
   const doneSpentUsd = board.done.reduce((sum, entry) => sum + (entry.spentUsd || 0), 0);

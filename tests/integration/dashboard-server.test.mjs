@@ -10,6 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { makeEnv, REPO_ROOT, FAKE_CLAUDE, verifierStep } from '../helpers/env.mjs';
+import { makerStep, newRouterEnv, reviewerStep, routerStep, specStep } from '../helpers/router-env.mjs';
 import { FIXED_STATS } from '../helpers/target-fixture.mjs';
 import { loadCfg } from '../../conductor/conductor.mjs';
 import { setupProfilePaths } from '../../conductor/lib/profile.mjs';
@@ -277,7 +278,8 @@ test('AC-005: GET /api/board 泳道固定顺序、契约字段齐全，每次请
 
   const first = await getJson(srv.baseUrl, '/api/board');
   assert.equal(first.status, 200);
-  for (const key of ['lanes', 'done', 'failed', 'broken']) assert.ok(key in first.body, key);
+  for (const key of ['columns', 'legacy', 'lanes', 'done', 'failed', 'broken']) assert.ok(key in first.body, key);
+  assert.deepEqual(first.body.columns.map((c) => c.column), ['ROUTING', 'AWAIT_HUMAN', 'FAILED_BOX', 'DONE']);
   assert.deepEqual(first.body.lanes.map((l) => l.lane), ['setup', 'feasibility', 'spec', 'maker', 'verify', 'merge']);
   assert.deepEqual(first.body.done, []);
   assert.deepEqual(first.body.failed, []);
@@ -291,8 +293,11 @@ test('AC-005: GET /api/board 泳道固定顺序、契约字段齐全，每次请
   assert.ok(entry, '新写入的任务应在下一次请求中现读到（无跨请求缓存）');
   assert.deepEqual(
     Object.keys(entry).sort(),
-    ['box', 'id', 'kind', 'lane', 'needsHuman', 'spentUsd', 'stage', 'title', 'working'].sort(),
+    ['awaitingKind', 'box', 'column', 'id', 'kind', 'lane', 'lastFailureType', 'legacy', 'needsHuman', 'spentUsd', 'stage', 'title', 'working'].sort(),
   );
+  // 遗留 stage 名的任务不占任何新列，归 legacy 分组（AC-029）
+  assert.equal(second.body.columns.every((c) => c.tasks.length === 0), true);
+  assert.deepEqual(second.body.legacy.map((tk) => tk.id), [id]);
   assert.equal(entry.box, 'queue');
   assert.equal(entry.stage, 'READY');
   assert.equal(entry.needsHuman, false);
@@ -932,41 +937,55 @@ test('P4-AC-011: 同任务同动作已有 running job 时再次 POST 返回 409�
 
 // ---- AC-017：new-task 透传 CLI + brief 临时文件生命周期 + id 解析 + feasibility 显式布尔 ----
 
-test('AC-017: POST /api/new-task 透传 CLI，brief 临时文件用后即删，id 解析，feasibility 显式布尔', async (t) => {
+test('AC-017/AC-019: POST /api/new-task 字段为 title/brief/repo/base-branch，任务落 ROUTING；profile 缺 precommit 段时把样例原样带回前端', async (t) => {
   const env = makeEnv(t);
-  env.writeApprovedSetupProfile();
+  env.writePrecommitProfile({ unit: 'node --test' });
   const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
   const briefPrefix = `dashboard-brief-${srv.child.pid}-`;
 
-  const bugfixRes = await postJson(srv.baseUrl, '/api/new-task', {
-    kind: 'bugfix', title: 'dashboard 新建 bugfix 用例', brief: 'AC-017 brief 原文 marker',
+  const res = await postJson(srv.baseUrl, '/api/new-task', {
+    title: 'dashboard 新建任务用例',
+    brief: '把 median 的偶数分支改成取中间两数平均。marker-AC-017',
   });
-  assert.equal(bugfixRes.status, 200);
-  assert.equal(bugfixRes.body.ok, true);
-  assert.match(bugfixRes.body.id, /^task-\d{8}-\d{3}$/);
-  assert.match(bugfixRes.body.message, /编辑该目录的 spec\.md/);
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+  assert.match(res.body.id, /^task-\d{8}-\d{3}$/);
 
   await waitFor(() => !fs.readdirSync(os.tmpdir()).some((n) => n.startsWith(briefPrefix)), 1000);
 
-  const bugfixTask = env.findTask(bugfixRes.body.id);
-  assert.equal(bugfixTask.task.kind, 'bugfix');
-  assert.equal('feasibility' in bugfixTask.task, false, 'bugfix 不应带 feasibility 字段');
+  const created = env.findTask(res.body.id);
+  assert.equal(created.runtime.stage, 'ROUTING');
+  assert.equal('kind' in created.task, false, '新建单不再有 kind');
+  assert.equal('feasibility' in created.task, false, '新建单不再有 feasibility');
+  assert.equal(created.runtime.spec_approved, false);
+  assert.equal(created.runtime.awaiting, null);
+  assert.match(fs.readFileSync(path.join(created.dir, 'brief.md'), 'utf8'), /marker-AC-017/);
 
-  const featureRes = await postJson(srv.baseUrl, '/api/new-task', {
-    kind: 'feature', title: 'dashboard 新建 feature 用例', brief: '', feasibility: true,
+  // repo / base branch 透传到 CLI
+  const withRepo = await postJson(srv.baseUrl, '/api/new-task', {
+    title: '显式 repo 与 base 分支', brief: 'brief 正文', repo: env.targetDir, baseBranch: 'main',
   });
-  assert.equal(featureRes.body.ok, true);
-  const featureTask = env.findTask(featureRes.body.id);
-  assert.equal(featureTask.task.feasibility, true);
-  assert.equal(featureTask.runtime.stage, 'NEEDS_FEASIBILITY');
+  assert.equal(withRepo.body.ok, true);
+  const withRepoTask = env.findTask(withRepo.body.id);
+  assert.equal(withRepoTask.task.targetRepo, env.targetDir);
+  assert.equal(withRepoTask.task.baseBranch, 'main');
 
-  const featureNoFeasRes = await postJson(srv.baseUrl, '/api/new-task', {
-    kind: 'feature', title: 'dashboard 新建 feature（不走 feasibility）',
-  });
-  assert.equal(featureNoFeasRes.body.ok, true);
-  const featureNoFeasTask = env.findTask(featureNoFeasRes.body.id);
-  assert.equal(featureNoFeasTask.task.feasibility, false);
-  assert.equal(featureNoFeasTask.runtime.stage, 'NEEDS_SPEC');
+  // 必填字段：title / brief 缺一即 400，且不落任何任务
+  assert.equal((await postJson(srv.baseUrl, '/api/new-task', { brief: 'x' })).status, 400);
+  assert.equal((await postJson(srv.baseUrl, '/api/new-task', { title: 't' })).status, 400);
+  assert.equal((await postJson(srv.baseUrl, '/api/new-task', { title: 't', brief: '   ' })).status, 400);
+});
+
+test('AC-019: profile 缺 precommit 段时 /api/new-task 返回 ok:false，message 含含 build/service/unit/integration/e2e 全键的样例', async (t) => {
+  const env = makeEnv(t); // 没有 writePrecommitProfile：目标仓完全没有 setup-profile.json
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+  const res = await postJson(srv.baseUrl, '/api/new-task', { title: '缺 profile', brief: 'brief 正文' });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, false);
+  for (const key of ['build', 'service', 'unit', 'integration', 'e2e']) {
+    assert.ok(res.body.message.includes(key), `样例应含 ${key} 键：${res.body.message}`);
+  }
+  assert.equal(res.body.id, null);
 });
 
 // ==== P5：GET /api/metrics（AC-009） ============================
@@ -1088,4 +1107,250 @@ test('P6: DASHBOARD_EDITOR_CMD 指向不存在的命令时 200 ok:false（spawn 
   const res = await postJson(srv.baseUrl, `/api/task/${id}/open-editor`, {});
   assert.equal(res.status, 200);
   assert.equal(res.body.ok, false);
+});
+
+// ==== 新状态机（router conductor）：四列看板 + 通用人闸页 + legacy 兼容（AC-023/029/043） ====
+
+const ROUTER_SPEC_BODY = [
+  '# median 偶数分支返回错误',
+  '',
+  '## 验收标准',
+  '',
+  '- AC-001: median([1,2,3,4]) 返回 2.5',
+  '- AC-002: node --test 全绿',
+  '',
+  '## 待决问题',
+  '',
+  '| 问题 | safe default | 影响 |',
+  '| --- | --- | --- |',
+  '| 是否同时改 mode？ | 不改 | 另选会扩大范围 |',
+  '',
+].join('\n');
+
+/** 把任务推到 AWAIT_HUMAN(spec)。 */
+function driveToSpecGate(env, id) {
+  env.setScenario([
+    routerStep('spec', { summary: '新能力且改接口，先出 spec 交人审' }),
+    specStep(ROUTER_SPEC_BODY, { specPath: path.join(env.root, 'specs', `${id}.md`) }),
+  ]);
+  const r = env.run('run');
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(env.readRuntime(id).awaiting.kind, 'spec');
+}
+
+/** 把任务推到 AWAIT_HUMAN(merge)（无 spec 的直做路径）。 */
+function driveToMergeGate(env, id) {
+  env.setScenario([
+    routerStep('maker', { summary: 'brief 即 spec，直接实现' }),
+    makerStep(),
+    routerStep('review', { summary: 'maker 报全绿，整体冷审' }),
+    reviewerStep(),
+    routerStep('precommit', { tier: 'unit', summary: 'review 全 pass，跑 unit' }),
+    routerStep('merge', { summary: '版本规则满足，申请合并' }),
+  ]);
+  const r = env.run('run');
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(env.readRuntime(id).awaiting.kind, 'merge');
+}
+
+/** 把任务推到 AWAIT_HUMAN(help)（router 主动求助）。 */
+function driveToHelpGate(env, id) {
+  env.setScenario([routerStep('human', { summary: 'AC-001 与仓库现状冲突，请裁决取哪一边' })]);
+  const r = env.run('run');
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(env.readRuntime(id).awaiting.kind, 'help');
+}
+
+test('AC-029/043: 四列看板按 stage 分列，AWAIT_HUMAN 卡片带 awaiting.kind', async (t) => {
+  const { env, id } = newRouterEnv(t);
+  driveToHelpGate(env, id);
+  // 同一仓库里再放一个遗留 stage 名的旧任务
+  env.writeTask('task-20260705-900', { stage: 'READY' });
+
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+  const board = await getJson(srv.baseUrl, '/api/board');
+  assert.equal(board.status, 200);
+  assert.deepEqual(board.body.columns.map((c) => c.column), ['ROUTING', 'AWAIT_HUMAN', 'FAILED_BOX', 'DONE']);
+
+  const gateCol = board.body.columns.find((c) => c.column === 'AWAIT_HUMAN').tasks;
+  assert.deepEqual(gateCol.map((e) => e.id), [id]);
+  assert.equal(gateCol[0].awaitingKind, 'help');
+  assert.equal(gateCol[0].needsHuman, true);
+
+  // 旧任务归 legacy 分组，同时仍在旧泳道里；不占任何新列、不进 broken（AC-029）
+  assert.deepEqual(board.body.legacy.map((e) => e.id), ['task-20260705-900']);
+  assert.ok(board.body.lanes.find((l) => l.lane === 'maker').tasks.some((e) => e.id === 'task-20260705-900'));
+  assert.deepEqual(board.body.broken, []);
+});
+
+test('AC-043: spec 闸页渲染 kind/summary/refs + spec 全文与待决问题；approve 按钮走 POST 与 CLI 同效', async (t) => {
+  const { env, id } = newRouterEnv(t, { brief: '给 stats 增加 percentile 能力，涉及新接口。\n' });
+  driveToSpecGate(env, id);
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+
+  const detail = await getJson(srv.baseUrl, `/api/task/${id}`);
+  assert.equal(detail.status, 200);
+  assert.equal(detail.body.review.kind, 'human');
+  assert.equal(detail.body.review.gate.kind, 'spec');
+  assert.equal(detail.body.review.gate.requestedBy, 'kernel');
+  assert.ok(detail.body.review.gate.summary);
+  assert.ok(detail.body.review.gate.refs.some((r) => r.includes(`${id}.md`)), `refs 应含 spec 草稿：${detail.body.review.gate.refs}`);
+  assert.equal(detail.body.review.spec.markdown, ROUTER_SPEC_BODY);
+  assert.ok(detail.body.review.spec.pendingQuestions.startsWith('## 待决问题'));
+  assert.deepEqual(detail.body.review.actions, ['approve', 'reject']);
+  // P2 恒无方案：不渲染方案表，也不显示 --no-packages
+  assert.equal(detail.body.review.packages, null);
+  assert.equal(detail.body.review.showNoPackages, false);
+
+  const res = await postJson(srv.baseUrl, `/api/task/${id}/approve`, { notes: '按 A 做，不再拆细' });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true, res.body.message);
+
+  // 与 CLI `approve <id> --notes` 同效：冻结 spec、spec_approved、回 ROUTING、notes 进 human 记录
+  const rt = env.readRuntime(id);
+  assert.equal(rt.stage, 'ROUTING');
+  assert.equal(rt.spec_approved, true);
+  assert.equal(rt.awaiting, null);
+  assert.ok(env.exists(env.dossier(id, 'spec.md')));
+  const human = env.readJson(env.dossier(id, 'human-r1.json'));
+  assert.equal(human.decision, 'approved');
+  assert.equal(human.notes, '按 A 做，不再拆细');
+});
+
+test('AC-043: spec 闸 reject 缺 notes 时 200 但 ok:false，任务留在闸上（按钮语义等同 CLI）', async (t) => {
+  const { env, id } = newRouterEnv(t, { brief: '给 stats 增加 percentile 能力。\n' });
+  driveToSpecGate(env, id);
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+
+  const res = await postJson(srv.baseUrl, `/api/task/${id}/reject`, {});
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, false);
+  assert.match(res.body.message, /--notes/);
+  assert.equal(env.readRuntime(id).awaiting.kind, 'spec');
+
+  const ok = await postJson(srv.baseUrl, `/api/task/${id}/reject`, { notes: 'AC-002 与现有 Non-goal 冲突' });
+  assert.equal(ok.body.ok, true, ok.body.message);
+  assert.equal(env.readRuntime(id).stage, 'ROUTING');
+  assert.equal(env.readJson(env.dossier(id, 'human-r1.json')).decision, 'rejected');
+});
+
+test('AC-043: merge 闸页渲染最近 reviewer 记录与 precommit 三步；approve --message 走 POST 与 CLI 同效', async (t) => {
+  const { env, id } = newRouterEnv(t);
+  driveToMergeGate(env, id);
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+
+  const detail = await getJson(srv.baseUrl, `/api/task/${id}`);
+  assert.equal(detail.body.review.gate.kind, 'merge');
+  assert.deepEqual(detail.body.review.actions, ['approve', 'reject']);
+  assert.equal(detail.body.review.reviewer.role, 'reviewer');
+  assert.equal(detail.body.review.reviewer.outcome, 'ok');
+  assert.equal(detail.body.review.precommit.outcome, 'ok');
+  const steps = detail.body.review.precommit.steps.map((s) => s.step);
+  assert.ok(steps.includes('unit'), `precommit 三步应含 unit：${steps}`);
+  for (const s of detail.body.review.precommit.steps) {
+    assert.ok('status' in s && 'duration_ms' in s && 'tail' in s, `每步要有 status/用时/tail：${JSON.stringify(s)}`);
+  }
+  assert.ok(detail.body.review.diffShortstat, 'merge 闸应带 diff shortstat');
+  // 记录列表与内核事实随详情一起给出（新任务）
+  assert.equal(detail.body.isRouterTask, true);
+  assert.ok(detail.body.records.some((r) => r.role === 'router'));
+  assert.ok(detail.body.facts.text.includes('need_precommit=false'));
+  assert.ok(detail.body.events.some((e) => e.type === 'human_gate_opened'));
+
+  const res = await postJson(srv.baseUrl, `/api/task/${id}/approve`, { message: `task ${id}: 人给的文案` });
+  assert.equal(res.body.ok, true, res.body.message);
+  const done = env.findTask(id);
+  assert.equal(done.box, 'done');
+  assert.equal(done.runtime.stage, 'DONE');
+  const subject = execFileSync('git', ['-C', env.targetDir, 'log', '-1', '--pretty=%s'], { encoding: 'utf8' }).trim();
+  assert.equal(subject, `task ${id}: 人给的文案`);
+});
+
+test('AC-043: help 闸页只给 resume；resume 走 POST 与 CLI 同效（notes 进记录，不豁免版本规则）', async (t) => {
+  const { env, id } = newRouterEnv(t);
+  driveToHelpGate(env, id);
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+
+  const detail = await getJson(srv.baseUrl, `/api/task/${id}`);
+  assert.equal(detail.body.review.gate.kind, 'help');
+  assert.equal(detail.body.review.gate.requestedBy, 'router');
+  assert.deepEqual(detail.body.review.actions, ['resume']);
+
+  const res = await postJson(srv.baseUrl, `/api/task/${id}/resume`, { notes: '已在 worktree 里改好冲突' });
+  assert.equal(res.body.ok, true, res.body.message);
+  const rt = env.readRuntime(id);
+  assert.equal(rt.stage, 'ROUTING');
+  assert.equal(rt.awaiting, null);
+  const human = env.readJson(env.dossier(id, 'human-r1.json'));
+  assert.equal(human.decision, 'resumed');
+  assert.equal(human.notes, '已在 worktree 里改好冲突');
+  assert.ok(env.events(id).some((e) => e.type === 'human_intervened'));
+});
+
+test('AC-029: 遗留 stage 名 + 遗留产物（verify verdict / spec-verify / test-gate）照常渲染详情，不报错', async (t) => {
+  const { env } = newRouterEnv(t);
+  const legacyId = 'task-20260705-901';
+  env.writeTask(legacyId, { stage: 'AWAIT_HUMAN_MERGE' });
+  const dossier = path.join(env.root, 'dossier', legacyId);
+  fs.mkdirSync(dossier, { recursive: true });
+  fs.writeFileSync(path.join(dossier, 'maker-r1.json'), JSON.stringify({ ok: true, cost_usd: 2.5, raw: { num_turns: 8 } }));
+  fs.writeFileSync(path.join(dossier, 'test-gate-r1.json'), JSON.stringify({ verdict: 'ok', mode: 'per-ac' }));
+  fs.writeFileSync(path.join(dossier, 'green-gate-r1.json'), JSON.stringify({ exit_code: 0, stdout_tail: 'pass 41' }));
+  fs.writeFileSync(path.join(dossier, 'verify-r1.verdict.json'), JSON.stringify({
+    overall: 'pass', criteria_results: [{ ac_id: 'AC-001', status: 'pass', reason: 'ok', evidence: [] }],
+  }));
+  fs.writeFileSync(path.join(dossier, 'spec-verify-r1.verdict.json'), JSON.stringify({
+    overall: 'pass', summary: 'spec 可审', findings: [],
+  }));
+  fs.writeFileSync(path.join(dossier, 'spec-verify-r1.md'), '# spec verify 报告\n');
+
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+  const detail = await getJson(srv.baseUrl, `/api/task/${legacyId}`);
+  assert.equal(detail.status, 200);
+  assert.equal(detail.body.isRouterTask, false);
+  assert.deepEqual(detail.body.records, []);
+  assert.equal(detail.body.facts, null);
+  assert.equal(detail.body.review.kind, 'merge');
+  assert.equal(detail.body.review.verdict.overall, 'pass');
+  assert.equal(detail.body.rounds.rounds[0].testGate.verdict, 'ok');
+  assert.equal(detail.body.rounds.rounds[0].greenGate.pass, true);
+
+  const board = await getJson(srv.baseUrl, '/api/board');
+  assert.deepEqual(board.body.legacy.map((e) => e.id), [legacyId]);
+  assert.deepEqual(board.body.broken, []);
+
+  const metrics = await getJson(srv.baseUrl, '/api/metrics');
+  assert.equal(metrics.status, 200);
+});
+
+test('AC-023: dashboard 的 auto-run 不把 FAILED_BOX 任务搬出来（限额卡片给重置时刻）', async (t) => {
+  const { env, id } = newRouterEnv(t);
+  // 先造一个已收箱的限额任务，resets_at 已过（人还没 retry，就不该被任何自动路径搬走）
+  const boxedId = 'task-20260910-777';
+  const resetsAt = Math.floor(Date.now() / 1000) - 3600;
+  env.writeRouterTask(boxedId, {
+    stage: 'FAILED_BOX',
+    lastFailureType: 'rate_limited',
+    rateLimit: { type: 'five_hour', resets_at: resetsAt, hit_at: '2026-09-10T00:00:00.000Z', resume_stage: 'ROUTING' },
+  });
+  fs.renameSync(path.join(env.root, 'state', 'queue', boxedId), path.join(env.root, 'state', 'failed', boxedId));
+  const before = fs.readFileSync(path.join(env.root, 'state', 'failed', boxedId, 'runtime.json'), 'utf8');
+
+  // auto-run 打开：一次成功的同步动作会触发后台 conductor run
+  env.setScenario([routerStep('abandon', { summary: '无法继续，收箱' })]);
+  const srv = await startDashboard(t, env, ['--port', '0']);
+
+  const res = await postJson(srv.baseUrl, `/api/task/${id}/abandon`, {});
+  assert.equal(res.body.ok, true, res.body.message);
+  // 等后台 run 真的跑过一轮（queue 已空，run 会立刻结束）
+  await waitFor(() => fs.existsSync(path.join(env.root, 'state', 'failed', id)), 8000);
+
+  const after = fs.readFileSync(path.join(env.root, 'state', 'failed', boxedId, 'runtime.json'), 'utf8');
+  assert.equal(after, before, 'auto-run 不得改动 FAILED_BOX 任务的 runtime');
+  assert.equal(env.findTask(boxedId).box, 'failed');
+
+  const detail = await getJson(srv.baseUrl, `/api/task/${boxedId}`);
+  assert.equal(detail.body.review.kind, 'failed');
+  assert.equal(detail.body.review.lastFailureType, 'rate_limited');
+  assert.equal(detail.body.review.rateLimit.resets_at, resetsAt);
 });

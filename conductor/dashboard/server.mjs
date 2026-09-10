@@ -329,30 +329,34 @@ function serveStatic(res, pathname) {
   res.end(data);
 }
 
+/**
+ * 新建任务（新 CLI 形态）：title / brief 正文 / repo / base branch 四个字段，服务端只做
+ * 「必填非空」这一层，其余一切校验（profile 的 precommit 段、base 分支、方案文件残留）都由
+ * `conductor new` 自己判——服务端与 CLI 共用同一个函数（buildNewTaskArgv）与同一次进程调用，
+ * 绝不复制一份校验。profile 缺 precommit 段时 CLI 把完整样例打进 stderr，formatCliMessage
+ * 原样带回前端显示（AC-019）。
+ */
 async function handleNewTask(req, res, autoRun) {
   const raw = await readBody(req);
   const parsed = parseJsonBody(raw);
   if (!parsed.ok) { sendJson(res, 400, { error: 'invalid JSON body' }); return; }
-  const { kind, title, brief, feasibility } = parsed.body ?? {};
-  if (kind !== 'bugfix' && kind !== 'feature') { sendJson(res, 400, { error: 'kind must be bugfix or feature' }); return; }
+  const { title, brief, repo, baseBranch } = parsed.body ?? {};
   if (typeof title !== 'string' || title.trim() === '') { sendJson(res, 400, { error: 'title is required' }); return; }
+  if (typeof brief !== 'string' || brief.trim() === '') { sendJson(res, 400, { error: 'brief is required' }); return; }
 
-  let briefPath = null;
-  if (typeof brief === 'string' && brief.trim() !== '') {
-    briefPath = path.join(
-      os.tmpdir(),
-      `dashboard-brief-${process.pid}-${Date.now()}-${crypto.randomBytes(6).toString('hex')}.md`,
-    );
-    fs.writeFileSync(briefPath, brief);
-  }
+  const briefPath = path.join(
+    os.tmpdir(),
+    `dashboard-brief-${process.pid}-${Date.now()}-${crypto.randomBytes(6).toString('hex')}.md`,
+  );
+  fs.writeFileSync(briefPath, brief);
   try {
-    const argv = buildNewTaskArgv({ kind, title, briefPath, feasibility: feasibility === true });
+    const argv = buildNewTaskArgv({ title, briefPath, repo, baseBranch });
     const result = await runConductor(argv);
     const ok = result.exitCode === 0;
     if (ok && autoRun) spawnDetachedConductor(['run']);
     sendJson(res, 200, { ok, exitCode: result.exitCode, message: formatCliMessage(result), id: parseNewTaskId(result.stdout) });
   } finally {
-    if (briefPath) fs.rm(briefPath, { force: true }, () => {});
+    fs.rm(briefPath, { force: true }, () => {});
   }
 }
 
