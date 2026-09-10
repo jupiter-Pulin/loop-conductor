@@ -554,7 +554,11 @@ function buildCostChart(totals) {
   return wrap;
 }
 
-const REJECT_DOOR_LABELS = [['verifier', 'verifier'], ['test-gate', 'test gate'], ['green-gate', 'green gate'], ['maker', 'maker']];
+// 打回归因的取值域按纪元分开：旧任务是四门，新任务只有 precommit / reviewer / maker。
+const REJECT_DOOR_LABELS = [
+  ['verifier', 'verifier'], ['test-gate', 'test gate'], ['green-gate', 'green gate'], ['maker', 'maker'],
+  ['reviewer', 'reviewer'], ['precommit', 'precommit'],
+];
 
 function buildRejectChart(table) {
   const wrap = metricsChartNode(
@@ -572,10 +576,34 @@ function buildRejectChart(table) {
 
 function buildDurationChart(durations) {
   const wrap = metricsChartNode('阶段耗时', '单位：秒/分（p50 中位数） · 数据来源：dossier/<id>/timeline.md 的 stage → 转移时间戳差分');
-  const lanes = durations.lanes;
-  if (lanes.every((l) => l.n === 0)) { wrap.appendChild(el('div', { class: 'metrics-empty-inline', text: '暂无阶段耗时样本' })); return wrap; }
-  const widths = barWidths(lanes.map((l) => l.p50 ?? 0));
-  lanes.forEach((l, i) => wrap.appendChild(metricBarNode(l.lane, formatDurationSeconds(l.p50), widths[i], false)));
+  // 新任务按四列统计，旧任务按六泳道；两类都空才算「无样本」。
+  const columns = durations.columns || [];
+  const lanes = durations.lanes || [];
+  const rows = [
+    ...columns.filter((c) => c.n > 0).map((c) => ({ label: c.column, p50: c.p50 })),
+    ...lanes.filter((l) => l.n > 0).map((l) => ({ label: l.lane, p50: l.p50 })),
+  ];
+  if (rows.length === 0) { wrap.appendChild(el('div', { class: 'metrics-empty-inline', text: '暂无阶段耗时样本' })); return wrap; }
+  const widths = barWidths(rows.map((r) => r.p50 ?? 0));
+  rows.forEach((r, i) => wrap.appendChild(metricBarNode(r.label, formatDurationSeconds(r.p50), widths[i], false)));
+  return wrap;
+}
+
+/** 新状态机的良率盘：只在仓库里真有 router 任务时出现，绝不与旧四门口径混算。 */
+function buildRouterKpiRow(routerYield) {
+  if (!routerYield || routerYield.taskCount.done + routerYield.taskCount.failed === 0) return null;
+  const wrap = el('div', { class: 'metrics-kpi-row' });
+  const kpi = (label, value) => wrap.appendChild(el('div', { class: 'metrics-kpi' }, [
+    el('span', { class: 'metrics-kpi-label', text: label }),
+    el('span', { class: 'metrics-kpi-value mono', text: value }),
+  ]));
+  kpi('router 任务（done/failed）', `${routerYield.taskCount.done} / ${routerYield.taskCount.failed}`);
+  kpi('平均 router 轮次', routerYield.avgRounds.value == null ? '—' : routerYield.avgRounds.value.toFixed(1));
+  kpi('reviewer 打回率', formatPercent(routerYield.reviewerFailRate.value));
+  kpi('precommit 失败率', formatPercent(routerYield.precommitFailRate.value));
+  kpi('maker 交付缺失率', formatPercent(routerYield.makerProductMissRate.value));
+  const gates = routerYield.humanGates;
+  kpi('人闸（spec/merge/help）', `${gates.spec} / ${gates.merge} / ${gates.help}`);
   return wrap;
 }
 
@@ -641,6 +669,7 @@ function renderMetrics(metrics) {
   }
   const wrap = el('div', { class: 'metrics-view' }, [
     buildKpiRow(metrics),
+    buildRouterKpiRow(metrics.routerYield),
     buildCostChart(metrics.totals),
     buildRejectChart(metrics.table),
     buildDurationChart(metrics.durations),

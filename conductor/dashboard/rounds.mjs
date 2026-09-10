@@ -4,6 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { dossierPath } from '../lib/state.mjs';
+import { composeRecords } from '../lib/records.mjs';
 
 /** 读单个 JSON 文件 → { status:'ok', value } / { status:'absent' } / { status:'corrupt' }。 */
 function readJsonSafe(p) {
@@ -166,19 +167,59 @@ function buildAttemptsGroups(dossierDir) {
     });
 }
 
+// ---- 新状态机的轮次：router 轮次 + 该轮产生的记录（唯一来源是 lib/records.mjs） ----
+//
+// 旧任务的 `maker-r<n>.json` 与新契约同名但没有 `.log.json`，合成出来只会是一串
+// product=missing 的噪音；因此只有案卷里真有 router 轮次的任务才走这条线（AC-029）。
+
+const ROUTER_SPAWN_RE = /^router-r\d+\.json$/;
+
+function hasRouterRounds(dossierDir) {
+  try {
+    return fs.readdirSync(dossierDir).some((n) => ROUTER_SPAWN_RE.test(n));
+  } catch {
+    return false;
+  }
+}
+
 /**
- * 任务 dossier → { rounds, specRounds, attempts }（契约见 spec.md §Contract）。
+ * 记录列表 → 按 router 轮次分组：`{ round, router, agents[], precommit, human }`。
+ * 一轮里 router 先决策，随后是它派出的角色与人的裁决——渲染与统计都读这一个形状。
+ */
+export function groupRecordsByRound(records) {
+  const byRound = new Map();
+  for (const rec of records ?? []) {
+    const round = rec.round ?? 0;
+    if (!byRound.has(round)) byRound.set(round, { round, router: null, agents: [], precommit: null, human: null });
+    const slot = byRound.get(round);
+    if (rec.role === 'router') slot.router = rec;
+    else if (rec.role === 'precommit') slot.precommit = rec;
+    else if (rec.role === 'human') slot.human = rec;
+    else slot.agents.push(rec);
+  }
+  return [...byRound.values()].sort((a, b) => a.round - b.round);
+}
+
+/**
+ * 任务 dossier → { rounds, specRounds, attempts, routerRounds, records }（契约见 spec.md §Contract）。
+ * `records` / `routerRounds` 只对新状态机任务非空；旧任务保持原有三个字段的口径不变。
  * 全程容错：任意输入（缺失/半途/损坏 JSON）永不抛错，最坏退化为空数组。
  */
 export function buildRoundsView(cfg, id) {
   try {
     const dossierDir = dossierPath(cfg, id);
+    // 一个任务只属于一个纪元：新案卷里的 `maker-r<n>.json` 是新契约的 spawn 记录，
+    // 不是旧的 maker 门产物——拿旧四门解析它只会得到一堆假的「半途轮」，还会污染良率盘。
+    const isRouter = hasRouterRounds(dossierDir);
+    const records = isRouter ? composeRecords(cfg, id) : [];
     return {
-      rounds: buildRoundsForDir(dossierDir),
-      specRounds: buildSpecRoundsForDir(dossierDir),
+      rounds: isRouter ? [] : buildRoundsForDir(dossierDir),
+      specRounds: isRouter ? [] : buildSpecRoundsForDir(dossierDir),
       attempts: buildAttemptsGroups(dossierDir),
+      records,
+      routerRounds: groupRecordsByRound(records),
     };
   } catch {
-    return { rounds: [], specRounds: [], attempts: [] };
+    return { rounds: [], specRounds: [], attempts: [], records: [], routerRounds: [] };
   }
 }
