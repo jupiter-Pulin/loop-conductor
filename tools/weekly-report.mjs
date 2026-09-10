@@ -10,7 +10,10 @@ import { collectStats } from './dossier-stats.mjs';
 import { sendSlackMessage, loadSlackEnv } from './slack-notify.mjs';
 import { updateSignatures, renderSignatureSummary } from './signatures.mjs';
 
-const ROLE_FILE_RE = /^(setup|feasibility-agent|spec-agent|spec-verifier|maker|verifier|committer|reviewer)-r(\d+)\.json$/;
+// 角色成本文件名：旧五闸的六个角色 + 新状态机的 router / spec / spec-plan / maker / reviewer
+// （包 maker 带 `-P-xxx` 段，P2b 才会出现）。`precommit-r<n>.json` 不在此列：它没有 agent、
+// cost 恒 0，计入只会在成本盘上多一行 0。
+const ROLE_FILE_RE = /^(setup|feasibility-agent|spec-agent|spec-verifier|spec-plan|spec|router|maker|verifier|committer|reviewer)(?:-P-\d{3})?-r(\d+)\.json$/;
 
 function readJsonIf(p) {
   try {
@@ -140,6 +143,20 @@ function collectTaskWindow(root, t, { sinceMs, untilMs, nowMs }) {
   const doneInWindow = events.some((e) => e.type === 'stage' && e.stage === 'DONE' && e._ms >= sinceMs && e._ms < untilMs)
     || (t.stage === 'DONE' && inWindow.length > 0);
 
+  // 新状态机的窗口内事件计数（旧任务恒为 0，两类混装互不干扰）。
+  const inWin = (e) => e._ms >= sinceMs && e._ms < untilMs;
+  const router = {
+    decisions: events.filter((e) => e.type === 'router_decision' && inWin(e)).length,
+    action_rejected: events.filter((e) => e.type === 'action_rejected' && inWin(e)).length,
+    help_gates: events.filter((e) => e.type === 'human_gate_opened' && e.kind === 'help' && inWin(e)).length,
+    spec_gates: events.filter((e) => e.type === 'human_gate_opened' && e.kind === 'spec' && inWin(e)).length,
+    merge_gates: events.filter((e) => e.type === 'human_gate_opened' && e.kind === 'merge' && inWin(e)).length,
+    fuse_tripped: events.filter((e) => e.type === 'fuse_tripped' && inWin(e)).length,
+    budget_exhausted: events.filter((e) => e.type === 'budget_exhausted' && inWin(e)).length,
+    rate_limited: events.filter((e) => e.type === 'rate_limited' && inWin(e)).length,
+    version_gate_blocks: events.filter((e) => (e.type === 'main_moved' || e.type === 'stale_review') && inWin(e)).length,
+  };
+
   return {
     active: inWindow.length > 0,
     new_in_window: firstEver !== null && firstEver >= sinceMs && firstEver < untilMs,
@@ -153,6 +170,7 @@ function collectTaskWindow(root, t, { sinceMs, untilMs, nowMs }) {
       ? round2((nowMs - stageSinceMs) / 86400_000)
       : null,
     has_events: events.length > 0,
+    router,
   };
 }
 
@@ -213,10 +231,13 @@ export function collectWeekly(root, { sinceMs, untilMs, nowMs = Date.now() } = {
   const attention = [];
   for (const r of rows.filter((x) => x.stage?.startsWith('AWAIT_'))) {
     const disagreements = r.win.shadow.disagreements;
+    // 新状态机只有一个 AWAIT_HUMAN；闸别写进 stage 文本，人一眼看出在等哪道闸。
+    const gate = r.is_router ? (r.human_gates.find((g) => !g.decision)?.kind ?? null) : null;
     attention.push({
       type: 'await',
       task: r.id,
-      stage: r.stage,
+      stage: gate ? `${r.stage}(${gate})` : r.stage,
+      gate_kind: gate,
       aging_days: r.win.await_aging_days,
       spent_usd: r.spent_usd,
       shadow_disagreements: disagreements.map((d) => `${d.ac} ${d.main}→${d.shadow}`),
@@ -245,6 +266,30 @@ export function collectWeekly(root, { sinceMs, untilMs, nowMs = Date.now() } = {
       verifier_invalid_files: active.reduce((s, r) => s + r.verifier_invalid_files, 0),
       test_gate_vacuous: active.reduce((s, r) => s + r.test_gates.filter((g) => g.verdict === 'vacuous').length, 0),
     },
+    // 新状态机的窗口口径（旧任务对这些计数恒贡献 0）：router 轮次与被拒动作、三种人闸、
+    // 三条收箱线、版本规则拦下的 merge 申请，以及 reviewer / precommit 的成败。
+    router: (() => {
+      const routerActive = active.filter((r) => r.is_router);
+      const sum = (k) => active.reduce((s, r) => s + (r.win.router[k] ?? 0), 0);
+      const precommits = routerActive.flatMap((r) => r.precommit_rounds);
+      const agents = routerActive.flatMap((r) => r.agent_records);
+      return {
+        tasks: routerActive.length,
+        decisions: sum('decisions'),
+        action_rejected: sum('action_rejected'),
+        spec_gates: sum('spec_gates'),
+        merge_gates: sum('merge_gates'),
+        help_gates: sum('help_gates'),
+        fuse_tripped: sum('fuse_tripped'),
+        budget_exhausted: sum('budget_exhausted'),
+        rate_limited: sum('rate_limited'),
+        version_gate_blocks: sum('version_gate_blocks'),
+        reviewer_rounds: agents.filter((a) => a.role === 'reviewer').length,
+        reviewer_fails: agents.filter((a) => a.role === 'reviewer' && a.outcome === 'fail').length,
+        precommit_runs: precommits.length,
+        precommit_fails: precommits.filter((p) => p.outcome === 'fail').length,
+      };
+    })(),
     switches: {
       evidence_anchors: anchors,
       shadow,
@@ -290,6 +335,16 @@ export function renderMarkdown(rep) {
   L.push(`- maker r1 截断 ${q.maker_r1_max_turns_cutoff}/${q.maker_r1_total}（${pct(q.maker_r1_max_turns_cutoff, q.maker_r1_total)}），续跑使用 ${q.maker_rounds_with_continuation} 轮，需 r2+ 任务 ${q.tasks_needing_r2plus}`);
   L.push(`- committer a1 一次通过 ${q.committer_valid_a1}/${q.committer_with_proposal}，降级 ${q.committer_degraded}；verifier 协议 invalid ${q.verifier_invalid_files}；vacuous 拦截 ${q.test_gate_vacuous}`);
   L.push('');
+  const r = rep.router;
+  if (r && r.tasks > 0) {
+    L.push('## 新状态机（router，窗口内）');
+    L.push('');
+    L.push(`- ${r.tasks} 个任务；router 决策 ${r.decisions} 次，被内核拒 ${r.action_rejected} 次`);
+    L.push(`- 人闸：spec×${r.spec_gates}，merge×${r.merge_gates}，help×${r.help_gates}；版本规则拦下的 merge 申请 ${r.version_gate_blocks} 次`);
+    L.push(`- reviewer ${r.reviewer_rounds} 轮（fail ${r.reviewer_fails}）；precommit ${r.precommit_runs} 次（fail ${r.precommit_fails}）`);
+    L.push(`- 收箱：限额 ${r.rate_limited}，保险丝 ${r.fuse_tripped}，预算 ${r.budget_exhausted}`);
+    L.push('');
+  }
   L.push('## 开关收账（观测开关本窗口产出）');
   L.push('');
   const s = rep.switches;

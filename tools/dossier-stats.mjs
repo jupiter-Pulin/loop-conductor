@@ -6,8 +6,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { composeRecords } from '../conductor/lib/records.mjs';
 
 const TASK_DIR_RE = /^task-\d{8}-\d{3}$/;
+/** 新状态机的判据：案卷里有 router 轮次。一个 dossier 只属于一个纪元。 */
+const ROUTER_SPAWN_RE = /^router-r\d+\.json$/;
+const PRECOMMIT_STEPS = ['build', 'service', 'unit', 'integration', 'e2e'];
+const TIERS = ['unit', 'integration', 'e2e'];
 
 function readJsonIf(p) {
   try {
@@ -59,7 +64,11 @@ export function collectTask(root, box, id) {
     entries = fs.readdirSync(dossierDir);
   } catch { /* dossier 缺失（如 parked/极早期任务） */ }
 
-  for (const name of entries.sort()) {
+  // 一个案卷只属于一个纪元：新状态机的 `maker-r<n>.json` 是 spawn 记录（配套
+  // `maker-r<n>.log.json`），不是旧的 maker 门产物——按旧口径解析只会产生假轮次。
+  const isRouter = entries.some((n) => ROUTER_SPAWN_RE.test(n));
+
+  for (const name of isRouter ? [] : entries.sort()) {
     let m;
     if ((m = name.match(/^maker-r(\d+)\.json$/))) {
       const rec = readJsonIf(path.join(dossierDir, name)) ?? {};
@@ -109,6 +118,8 @@ export function collectTask(root, box, id) {
     } catch { /* timeline 缺失 */ }
   }
 
+  const router = collectRouterEra(root, id, isRouter);
+
   return {
     id,
     box,
@@ -124,6 +135,66 @@ export function collectTask(root, box, id) {
     committer_attempts: committerAttempts,
     committer_valid_attempt: committerValidAttempt,
     committer_degraded: committerDegraded,
+    ...router,
+  };
+}
+
+/**
+ * 新状态机的逐任务证据（AC-029）：router 轮次、precommit 各步与 tier、各角色成本、人闸。
+ * 记录合成复用 `conductor/lib/records.mjs::composeRecords`——本工具不另写一套 log 解析。
+ * P2b 的工作包字段（包数 / 并行轮数 / plan 次数）先按 0 输出并预留，字段名与后续实现对齐。
+ */
+function collectRouterEra(root, id, isRouter) {
+  const empty = {
+    is_router: false,
+    router_rounds: [],
+    agent_records: [],
+    precommit_rounds: [],
+    human_gates: [],
+    role_cost_usd: {},
+    packages_count: 0,
+    parallel_rounds: 0,
+    plan_runs: 0,
+  };
+  if (!isRouter) return empty;
+
+  let records = [];
+  try {
+    records = composeRecords({ dossierDir: path.join(root, 'dossier') }, id);
+  } catch { return empty; }
+
+  const roleCost = {};
+  for (const r of records) {
+    if (r.role === 'human') continue;
+    roleCost[r.role] = round6((roleCost[r.role] ?? 0) + (r.cost_usd ?? 0));
+  }
+
+  return {
+    is_router: true,
+    router_rounds: records.filter((r) => r.role === 'router').map((r) => ({
+      round: r.round, action: r.action, tier: r.tier, product: r.product, cost_usd: r.cost_usd ?? 0,
+    })),
+    agent_records: records
+      .filter((r) => r.role === 'spec' || r.role === 'maker' || r.role === 'reviewer')
+      .map((r) => ({
+        round: r.round, role: r.role, package: r.package, mode: r.mode, outcome: r.outcome,
+        tier: r.tier, product: r.product, truncated: r.truncated === true, cost_usd: r.cost_usd ?? 0,
+      })),
+    precommit_rounds: records.filter((r) => r.role === 'precommit').map((r) => ({
+      round: r.round,
+      outcome: r.outcome,
+      tier: r.tier,
+      steps: (r.steps ?? []).map((s) => ({ step: s.step ?? null, status: s.status ?? null })),
+      conflict_files: (r.conflict_files ?? []).length,
+    })),
+    human_gates: records.filter((r) => r.role === 'human').map((r) => ({
+      round: r.round, kind: r.kind, decision: r.decision,
+    })),
+    role_cost_usd: roleCost,
+    // P2b 预留：本阶段 packagesEnabled=false，恒为 0。
+    packages_count: 0,
+    parallel_rounds: 0,
+    plan_runs: records.filter((r) => r.role === 'spec' && r.mode === 'plan').length,
   };
 }
 
@@ -177,9 +248,71 @@ export function collectStats(root) {
       valid_a1: withCommitter.filter((t) => t.committer_valid_attempt === 1).length,
       degraded: withCommitter.filter((t) => t.committer_degraded).length,
     },
+    router: collectRouterSummary(tasks),
     spent_usd_total: round6(tasks.reduce((s, t) => s + (t.spent_usd ?? 0), 0)),
   };
   return { tasks, summary };
+}
+
+/** 新状态机的系统级汇总：router 轮次与动作分布、precommit 各步与 tier、角色成本、人闸。 */
+function collectRouterSummary(tasks) {
+  const routerTasks = tasks.filter((t) => t.is_router);
+  const routerRounds = routerTasks.flatMap((t) => t.router_rounds);
+  const agents = routerTasks.flatMap((t) => t.agent_records);
+  const precommits = routerTasks.flatMap((t) => t.precommit_rounds);
+
+  const actions = {};
+  for (const r of routerRounds) {
+    const key = r.action ?? 'invalid';
+    actions[key] = (actions[key] ?? 0) + 1;
+  }
+
+  const byStep = {};
+  for (const step of PRECOMMIT_STEPS) byStep[step] = { ok: 0, fail: 0, skipped: 0, not_run: 0 };
+  for (const p of precommits) {
+    for (const s of p.steps) {
+      if (byStep[s.step] && Object.hasOwn(byStep[s.step], s.status)) byStep[s.step][s.status] += 1;
+    }
+  }
+
+  const tierCounts = Object.fromEntries(TIERS.map((tier) => [tier, 0]));
+  for (const p of precommits) if (Object.hasOwn(tierCounts, p.tier)) tierCounts[p.tier] += 1;
+
+  const humanGates = { spec: 0, merge: 0, help: 0 };
+  for (const t of routerTasks) {
+    for (const g of t.human_gates) if (Object.hasOwn(humanGates, g.kind)) humanGates[g.kind] += 1;
+  }
+
+  const roleCost = {};
+  for (const t of routerTasks) {
+    for (const [role, c] of Object.entries(t.role_cost_usd)) {
+      roleCost[role] = round6((roleCost[role] ?? 0) + c);
+    }
+  }
+
+  return {
+    tasks: routerTasks.length,
+    rounds_total: routerRounds.length,
+    actions,
+    router_product_not_ok: routerRounds.filter((r) => r.product !== 'ok').length,
+    maker_product_not_ok: agents.filter((r) => r.role === 'maker' && r.product !== 'ok').length,
+    maker_truncated: agents.filter((r) => r.role === 'maker' && r.truncated).length,
+    reviewer_fails: agents.filter((r) => r.role === 'reviewer' && r.outcome === 'fail').length,
+    reviewer_rounds: agents.filter((r) => r.role === 'reviewer').length,
+    precommit: {
+      runs: precommits.length,
+      ok: precommits.filter((p) => p.outcome === 'ok').length,
+      fail: precommits.filter((p) => p.outcome === 'fail').length,
+      by_step: byStep,
+      by_tier: tierCounts,
+    },
+    human_gates: humanGates,
+    role_cost_usd: roleCost,
+    // P2b 预留列：工作包尚未实现，恒为 0（字段名与 packages-status.json 对齐）。
+    packages_total: routerTasks.reduce((s, t) => s + t.packages_count, 0),
+    parallel_rounds: routerTasks.reduce((s, t) => s + t.parallel_rounds, 0),
+    plan_runs: routerTasks.reduce((s, t) => s + t.plan_runs, 0),
+  };
 }
 
 function round6(n) {
@@ -208,18 +341,52 @@ export function renderMarkdown({ tasks, summary }) {
   const ft = Object.entries(summary.failure_types).map(([k, v]) => `${k}×${v}`).join('，') || '（无）';
   lines.push(`- 失败类型分布：${ft}`);
   lines.push('');
+  lines.push(...renderRouterSection(summary.router));
   lines.push('## 逐任务');
   lines.push('');
-  lines.push('| id | box | kind | maker 轮 | 截断腿 | verifier | committer | $ | 失败类型 |');
-  lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- |');
+  lines.push('| id | box | kind | maker 轮 | 截断腿 | verifier | committer | router 轮 | precommit | 包/并行/plan | $ | 失败类型 |');
+  lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
   for (const t of tasks) {
     const cuts = t.maker_rounds.filter((r) => r.subtype === 'error_max_turns').length;
     const ver = t.verifier_rounds.map((r) => r.overall?.[0] ?? '?').join('') || '-';
     const com = t.committer_valid_attempt ? `a${t.committer_valid_attempt}` : (t.committer_degraded ? 'degraded' : '-');
-    lines.push(`| ${t.id} | ${t.box} | ${t.kind ?? '-'} | ${t.maker_rounds.length} | ${cuts} | ${ver} | ${com} | ${t.spent_usd} | ${t.last_failure_type ?? '-'} |`);
+    const routerRounds = t.is_router ? String(t.router_rounds.length) : '-';
+    const pre = t.is_router
+      ? (t.precommit_rounds.map((p) => `${p.tier ?? '?'}:${p.outcome?.[0] ?? '?'}`).join(',') || '-')
+      : '-';
+    const pkg = t.is_router ? `${t.packages_count}/${t.parallel_rounds}/${t.plan_runs}` : '-';
+    lines.push(`| ${t.id} | ${t.box} | ${t.kind ?? '-'} | ${t.maker_rounds.length} | ${cuts} | ${ver} | ${com} | ${routerRounds} | ${pre} | ${pkg} | ${t.spent_usd} | ${t.last_failure_type ?? '-'} |`);
   }
   lines.push('');
   return lines.join('\n');
+}
+
+/** 新状态机小节：没有 router 任务时也照常出现（一行「（无）」），保持输出形状稳定。 */
+function renderRouterSection(router) {
+  const L = ['## 新状态机（router）', ''];
+  if (!router || router.tasks === 0) {
+    L.push('（本库没有 router 纪元的任务）', '');
+    return L;
+  }
+  const actions = Object.entries(router.actions).map(([k, v]) => `${k}×${v}`).join('，') || '（无）';
+  const steps = PRECOMMIT_STEPS
+    .map((step) => {
+      const c = router.precommit.by_step[step];
+      return `${step} ok${c.ok}/fail${c.fail}/skip${c.skipped}/not_run${c.not_run}`;
+    })
+    .join('；');
+  const tiers = TIERS.map((tier) => `${tier}×${router.precommit.by_tier[tier]}`).join('，');
+  const roles = Object.entries(router.role_cost_usd).map(([k, v]) => `${k} $${v}`).join('，') || '（无）';
+  L.push(`- router 任务：${router.tasks}；router 轮次：${router.rounds_total}；动作分布：${actions}`);
+  L.push(`- router 失效（product≠ok）：${router.router_product_not_ok}；maker 无交付：${router.maker_product_not_ok}；maker 截断：${router.maker_truncated}`);
+  L.push(`- reviewer：${router.reviewer_rounds} 轮（fail ${router.reviewer_fails}）`);
+  L.push(`- precommit：${router.precommit.runs} 次（ok ${router.precommit.ok} / fail ${router.precommit.fail}）；tier 分布：${tiers}`);
+  L.push(`- precommit 各步：${steps}`);
+  L.push(`- 人闸：spec×${router.human_gates.spec}，merge×${router.human_gates.merge}，help×${router.human_gates.help}`);
+  L.push(`- 各角色成本：${roles}`);
+  L.push(`- 工作包（P2b 预留）：包数 ${router.packages_total}；并行轮数 ${router.parallel_rounds}；plan 次数 ${router.plan_runs}`);
+  L.push('');
+  return L;
 }
 
 /**
@@ -270,17 +437,28 @@ export function renderTaskDetail(t) {
   const cuts = t.maker_rounds.filter((r) => r.subtype === 'error_max_turns').length;
   const ver = t.verifier_rounds.map((r) => r.overall?.[0] ?? '?').join('') || '-';
   const com = t.committer_valid_attempt ? `a${t.committer_valid_attempt}` : (t.committer_degraded ? 'degraded' : '-');
-  return [
+  const lines = [
     `id: ${t.id}`,
     `box: ${t.box}`,
     `kind: ${t.kind ?? '-'}`,
+    `纪元: ${t.is_router ? 'router' : 'legacy'}`,
     `maker 轮次数: ${t.maker_rounds.length}`,
     `截断腿数: ${cuts}`,
     `verifier: ${ver}`,
     `committer: ${com}`,
-    `成本(spent_usd): ${t.spent_usd}`,
-    `失败类型: ${t.last_failure_type ?? '-'}`,
-  ].join('\n');
+  ];
+  if (t.is_router) {
+    lines.push(`router 轮次数: ${t.router_rounds.length}`);
+    lines.push(`router 动作: ${t.router_rounds.map((r) => r.action ?? '?').join(',') || '-'}`);
+    lines.push(`precommit: ${t.precommit_rounds.map((p) => `r${p.round} ${p.tier ?? '?'} ${p.outcome ?? '?'}`).join('；') || '-'}`);
+    lines.push(`precommit 各步: ${t.precommit_rounds.map((p) => p.steps.map((s) => `${s.step}:${s.status}`).join(',')).join('；') || '-'}`);
+    lines.push(`人闸: ${t.human_gates.map((g) => `${g.kind}:${g.decision ?? 'pending'}`).join('，') || '-'}`);
+    lines.push(`各角色成本: ${Object.entries(t.role_cost_usd).map(([k, v]) => `${k} $${v}`).join('，') || '-'}`);
+    lines.push(`工作包(P2b 预留): 包数 ${t.packages_count} / 并行轮数 ${t.parallel_rounds} / plan 次数 ${t.plan_runs}`);
+  }
+  lines.push(`成本(spent_usd): ${t.spent_usd}`);
+  lines.push(`失败类型: ${t.last_failure_type ?? '-'}`);
+  return lines.join('\n');
 }
 
 /** CLI 入口：纯函数，argv → `{ code, stdout, stderr }`，供单测断言退出码/流向。 */
