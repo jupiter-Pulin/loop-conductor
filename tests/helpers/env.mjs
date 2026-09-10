@@ -56,10 +56,15 @@ function detectFakeClaudeVersion() {
  * 探测 spawn 而把剧本步骤全部错位。要测 AC-052 的终止路径时，配一个没预填的模型 id 即可。
  */
 function seedModelProbeCache(root, models) {
-  const version = detectFakeClaudeVersion();
+  // 两个版本键都填：fake-claude 自报的那个，以及 'unknown'——换了 CLAUDE_BIN 的测试
+  // （如故意不可执行的假二进制）探不出版本，缓存键会落到 'unknown'，那类测试盯的是
+  // spawn 层行为，不该被启动探测截胡。
+  const versions = [detectFakeClaudeVersion(), 'unknown'];
   const entries = {};
   for (const m of models) {
-    entries[`${m}@${version}`] = { ok: true, model: m, claude_version: version, checked_at: '2026-01-01T00:00:00.000Z' };
+    for (const version of versions) {
+      entries[`${m}@${version}`] = { ok: true, model: m, claude_version: version, checked_at: '2026-01-01T00:00:00.000Z' };
+    }
   }
   fs.mkdirSync(path.join(root, 'state'), { recursive: true });
   fs.writeFileSync(
