@@ -121,8 +121,12 @@ export function mergeBranch(repo, branch, message) {
   }
 }
 
-export function deleteBranch(repo, branch) {
-  git(['branch', '-d', branch], repo); // 已合并才删得掉；失败无害，忽略
+/**
+ * 删分支。默认 `-d`（已合并才删得掉；失败无害，忽略）。
+ * `{ force: true }` 用 `-D`：abandon 的任务分支从未合并，只有强删才清得掉（AC-045）。
+ */
+export function deleteBranch(repo, branch, { force = false } = {}) {
+  git(['branch', force ? '-D' : '-d', branch], repo);
 }
 
 /** worktree 相对 base 分支的三点 diff（verifier 的输入之一）。 */

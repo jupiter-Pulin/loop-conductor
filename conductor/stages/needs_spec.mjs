@@ -9,7 +9,7 @@ import path from 'node:path';
 import { runClaude } from '../lib/claude.mjs';
 import * as state from '../lib/state.mjs';
 import { validateSpecDoc } from '../lib/spec-contract.mjs';
-import { needsSpecAction, specContractInvalidNext } from './decisions.mjs';
+import { needsSpecAction, specContractInvalidNext, legacyMaxTurns } from './decisions.mjs';
 import {
   accountSpawnCost, archiveSpecDraft, budgetExceeded, buildSpecAgentPrompt, failToBox,
   nextRoleRound, runSpecContractGate, SPEC_AGENT_TOOLS, specDraftPath,
@@ -56,7 +56,7 @@ export default async function needsSpecHandler(ts, cfg) {
       res = await runClaude({
         cwd: iso.cwd,
         prompt: buildSpecAgentPrompt(ts, cfg, round, { mode: 'draft' }),
-        maxTurns: cfg.maxTurns,
+        maxTurns: legacyMaxTurns(cfg),
         model: cfg.models?.spec ?? null,
         tools: SPEC_AGENT_TOOLS,
         allowedTools: SPEC_AGENT_TOOLS,

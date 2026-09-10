@@ -241,6 +241,16 @@ export function archiveArtifactsMatching(cfg, id, pattern) {
  */
 export function appendEvent(cfg, id, type, fields = {}) {
   if (cfg?.eventsLogEnabled !== true) return;
+  appendEventAlways(cfg, id, type, fields);
+}
+
+/**
+ * 新状态机（ROUTING / AWAIT_HUMAN）的事件面：不受 `eventsLogEnabled` 开关约束。
+ * 理由：router 契约把 `router_decision` / `action_rejected` / `human_gate_opened` 等写进了
+ * 案卷布局表，它们是内核对人与 dashboard 的固定交代，不是可选观测。旧 stage 的事件仍走
+ * 开关（H17 的原意），两条路各自保持自己的承诺。同样 best-effort：写失败绝不打断主链。
+ */
+export function appendEventAlways(cfg, id, type, fields = {}) {
   try {
     const p = dossierPath(cfg, id, 'events.jsonl');
     fs.mkdirSync(path.dirname(p), { recursive: true });

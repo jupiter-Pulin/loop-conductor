@@ -6,6 +6,7 @@ import { runClaude } from '../lib/claude.mjs';
 import { hasApprovedSetupProfile, setupProfilePaths } from '../lib/profile.mjs';
 import { taskCfg } from '../lib/task-cfg.mjs';
 import * as state from '../lib/state.mjs';
+import { legacyMaxTurns } from './decisions.mjs';
 import {
   accountSpawnCost, budgetExceeded, buildSetupPrompt, entryStageAfterSetup, failToBox,
   finishSpawnRecord, nextRoleRound, READONLY_TOOLS, startSpawnRecord, canStartSpawn, rateLimitedToBox,
@@ -53,7 +54,7 @@ export default async function needsTargetSetupHandler(ts, cfg) {
     const res = await runClaude({
       cwd: tcfg.targetRepo,
       prompt: buildSetupPrompt(ts, cfg),
-      maxTurns: cfg.maxTurns,
+      maxTurns: legacyMaxTurns(cfg),
       model: cfg.models?.setup ?? null,
       tools: READONLY_TOOLS,
       allowedTools: READONLY_TOOLS,

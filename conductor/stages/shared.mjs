@@ -21,6 +21,7 @@ import {
   overBudget, testGateVerdict, perAcProbeVerdict, perAcGateVerdict, greenGatePassed,
   parseStrictJson, validateCommitMessage, verifierVerdictSkeleton, resolveGateCommands, reviewReportSkeleton,
   SPEC_VERIFIER_CONTRACT, VERIFIER_VERDICT_CONTRACT, COMMIT_MESSAGE_CONTRACT, REVIEW_REPORT_CONTRACT,
+  legacyMaxTurns,
 } from './decisions.mjs';
 
 export function worktreePath(cfg, id) {
@@ -1658,7 +1659,7 @@ export async function runMakerRound(ts, cfg, round, { mode, prompt, coldPrompt, 
     cwd: wt,
     permissionMode: 'acceptEdits',
     allowedTools: MAKER_ALLOWED_TOOLS,
-    maxTurns: cfg.maxTurns,
+    maxTurns: legacyMaxTurns(cfg),
     model: cfg.models?.maker ?? null,
     settings,
     streamFile,

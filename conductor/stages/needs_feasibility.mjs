@@ -9,7 +9,7 @@ import path from 'node:path';
 import { runClaude } from '../lib/claude.mjs';
 import * as state from '../lib/state.mjs';
 import { validateFeasibilityDoc } from '../lib/feasibility-contract.mjs';
-import { needsFeasibilityAction, feasibilityContractInvalidNext } from './decisions.mjs';
+import { needsFeasibilityAction, feasibilityContractInvalidNext, legacyMaxTurns } from './decisions.mjs';
 import {
   accountSpawnCost, archiveFeasibilityDraft, budgetExceeded, buildFeasibilityPrompt, failToBox,
   feasibilityDraftPath, FEASIBILITY_AGENT_TOOLS, nextRoleRound, runFeasibilityContractGate,
@@ -55,7 +55,7 @@ export default async function needsFeasibilityHandler(ts, cfg) {
       res = await runClaude({
         cwd: iso.cwd,
         prompt: buildFeasibilityPrompt(ts, cfg, round),
-        maxTurns: cfg.maxTurns,
+        maxTurns: legacyMaxTurns(cfg),
         model: cfg.models?.feasibility ?? null,
         tools: FEASIBILITY_AGENT_TOOLS,
         allowedTools: FEASIBILITY_AGENT_TOOLS,

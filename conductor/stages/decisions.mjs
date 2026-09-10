@@ -16,8 +16,27 @@ export const STAGES = [
   'FIXING',
   'AWAIT_HUMAN_MERGE',
   'AWAIT_PROBE_CLOSE',
+  // ---- 新状态机（router conductor）：ROUTING ⇄ AWAIT_HUMAN → DONE，外加 FAILED_BOX。
+  // 上面那些是 P3 才删的遗留 stage，此刻仍注册着 handler 让旧 queue 任务跑完。
+  'ROUTING',
+  'AWAIT_HUMAN',
   'FAILED_BOX',
+  'DONE',
 ];
+
+/** 新状态机的四个 stage（AC-001 的目标集合；P3 删掉遗留名后 STAGES 就只剩这四个）。 */
+export const ROUTER_STAGES = Object.freeze(['ROUTING', 'AWAIT_HUMAN', 'FAILED_BOX', 'DONE']);
+
+/** 人闸种类封闭（Invariant 5）。 */
+export const HUMAN_GATE_KINDS = Object.freeze(['spec', 'merge', 'help']);
+
+/**
+ * 遗留标量 `maxTurns` 的读取口（AC-027）：loadCfg 把 `cfg.maxTurns` 归一成按角色的对象后，
+ * 旧 stage 仍需要那个数字。新角色的轮次上限一律走 lib/agent-settings.mjs::maxTurnsFor。
+ */
+export function legacyMaxTurns(cfg) {
+  return cfg?.legacyMaxTurns ?? 30;
+}
 
 export const MAX_MISS = 3;
 
