@@ -145,8 +145,28 @@ function composePrecommitRecord(dir, fileName, round) {
   };
 }
 
+/**
+ * 版本规则拒回过的轮次（AC-014）。merge 闸被 stale_review / main_moved 拒回时不写 human
+ * decision —— 这是有意的：人没有裁决过什么，是内核按批准时刻的 H/B 复算后拒的。但那份
+ * human-r<n>.json 会以 `decision=pending` 长期挂在记录列表里，看着像「还有一道闸等着人点」。
+ * events.jsonl 里同轮的那条事件就是「这道闸已经作废」的事实，渲染层据此显示 void(version_gate)。
+ * 只影响渲染：human 记录的 schema 与 decision 取值集合都不动。
+ */
+function voidedGateRounds(dir) {
+  const rounds = new Set();
+  let text;
+  try { text = fs.readFileSync(path.join(dir, 'events.jsonl'), 'utf8'); } catch { return rounds; }
+  for (const line of text.split('\n')) {
+    if (line.trim() === '') continue;
+    let e;
+    try { e = JSON.parse(line); } catch { continue; } // 观测面有坏行不影响记录合成
+    if ((e?.type === 'stale_review' || e?.type === 'main_moved') && Number.isFinite(e.round)) rounds.add(e.round);
+  }
+  return rounds;
+}
+
 /** 人的裁决也进记录列表（AC-012）：kind / decision / notes 原文 / no_packages。 */
-function composeHumanRecord(dir, fileName, round) {
+function composeHumanRecord(dir, fileName, round, voidedRounds) {
   const obj = readJsonIf(path.join(dir, fileName)) ?? {};
   return {
     round,
@@ -154,6 +174,7 @@ function composeHumanRecord(dir, fileName, round) {
     kind: obj.kind ?? null,
     requested_by: obj.requested_by ?? null,
     decision: obj.decision ?? null,
+    void_reason: obj.decision == null && voidedRounds?.has(round) ? 'version_gate' : null,
     notes: obj.notes ?? null,
     no_packages: obj.no_packages === true,
     summary: typeof obj.summary === 'string' ? obj.summary : null,
@@ -175,6 +196,7 @@ export function composeRecords(cfg, id, { planActive = false } = {}) {
   let names = [];
   try { names = fs.readdirSync(dir); } catch { return []; }
 
+  const voided = voidedGateRounds(dir);
   const records = [];
   for (const name of names.sort()) {
     const spawn = name.match(SPAWN_FILE_RE);
@@ -185,7 +207,7 @@ export function composeRecords(cfg, id, { planActive = false } = {}) {
     const pre = name.match(PRECOMMIT_FILE_RE);
     if (pre) { records.push(composePrecommitRecord(dir, name, Number(pre[1]))); continue; }
     const human = name.match(HUMAN_FILE_RE);
-    if (human) records.push(composeHumanRecord(dir, name, Number(human[1])));
+    if (human) records.push(composeHumanRecord(dir, name, Number(human[1]), voided));
   }
 
   records.sort((a, b) => {
@@ -232,7 +254,9 @@ function agentFields(rec) {
 }
 
 function humanFields(rec) {
-  const fields = [`kind=${rec.kind ?? '-'}`, `decision=${rec.decision ?? 'pending'}`];
+  // 无 decision 且该轮被版本规则拒回过 → void(version_gate)，不是「等人点」的 pending。
+  const decision = rec.decision ?? (rec.void_reason ? `void(${rec.void_reason})` : 'pending');
+  const fields = [`kind=${rec.kind ?? '-'}`, `decision=${decision}`];
   if (rec.no_packages) fields.push('no_packages=yes');
   fields.push(`notes=${JSON.stringify(rec.notes ?? '')}`);
   return fields.join('  ');

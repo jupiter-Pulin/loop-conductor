@@ -129,6 +129,56 @@ test('AC-010: 截断的 reviewer —— 合法 JSON 带「未判」清单 → pr
   assert.equal(needReview(records, H), true, '未判完 → need_review 保持 true');
 });
 
+test('AC-014: 被版本规则拒回的 merge 闸渲染成 void(version_gate)，不是长期 pending', (t) => {
+  const d = makeDossier(t);
+  // 被拒回的那一轮：内核按批准时刻的 H/B 复算后拒了，人没有裁决过任何事 —— 记录里没有 decision，
+  // 事实落在 events.jsonl 的 stale_review 上。
+  d.write('human-r2.json', {
+    schema_version: 1, kind: 'merge', requested_by: 'kernel', summary: '申请合并', refs: [],
+    requested_at: '2026-08-30T01:00:00.000Z',
+  });
+  // 真正还等着人点的那一轮：没有事件，照旧 pending。
+  d.write('human-r3.json', {
+    schema_version: 1, kind: 'merge', requested_by: 'kernel', summary: '再次申请合并', refs: [],
+    requested_at: '2026-08-30T02:00:00.000Z',
+  });
+  d.writeRaw('events.jsonl', [
+    JSON.stringify({ ts: '2026-08-30T01:05:00.000Z', type: 'stale_review', round: 2, head_sha: H, base_sha: B }),
+    '{ 半行坏 JSON',
+    '',
+  ].join('\n'));
+
+  const records = composeRecords(d.cfg, d.id);
+  const [r2, r3] = records;
+  assert.equal(r2.decision, null, 'human 记录本身一个字节没改，仍然没有 decision');
+  assert.equal(r2.void_reason, 'version_gate');
+  assert.equal(r3.void_reason, null);
+
+  const rendered = renderRecordsForRouter(records);
+  assert.match(rendered, /r2 human\s+kind=merge\s+decision=void\(version_gate\)/);
+  assert.match(rendered, /r3 human\s+kind=merge\s+decision=pending/);
+  // 「已裁决事项」只收真正裁决过的：作废的闸不是人的决定，不进 Invariant 7 的比对面。
+  assert.equal(renderDecisions(records), '');
+});
+
+test('AC-014: main_moved 同样作废该轮闸；无事件文件时一切照旧', (t) => {
+  const d = makeDossier(t);
+  d.write('human-r1.json', { schema_version: 1, kind: 'merge', requested_by: 'kernel', summary: '申请合并', refs: [] });
+  assert.equal(composeRecords(d.cfg, d.id)[0].void_reason, null, '没有 events.jsonl 时不臆断');
+
+  d.writeRaw('events.jsonl', `${JSON.stringify({ ts: '2026-08-30T01:00:00.000Z', type: 'main_moved', round: 1 })}\n`);
+  assert.equal(composeRecords(d.cfg, d.id)[0].void_reason, 'version_gate');
+
+  // 人真的点过的记录不受影响：有 decision 就按 decision 渲染。
+  d.write('human-r1.json', {
+    schema_version: 1, kind: 'merge', requested_by: 'kernel', summary: '申请合并', refs: [],
+    decision: 'rejected', notes: '命名再改一版',
+  });
+  const rec = composeRecords(d.cfg, d.id)[0];
+  assert.equal(rec.void_reason, null);
+  assert.match(renderRecordsForRouter([rec]), /decision=rejected/);
+});
+
 test('AC-009: precommit 记录走同一契约；非法时同样只是 product=invalid', (t) => {
   const d = makeDossier(t);
   d.write('precommit-r1.json', {

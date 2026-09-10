@@ -483,15 +483,16 @@ function approveMergeGate(cfg, ts, opts) {
   const base = revParseOrNull(repo, ts.task.baseBranch);
   const records = composeRecords(cfg, id, { planActive: ts.runtime.plan_active === true });
 
+  const gateRound = ts.runtime.awaiting?.round ?? ts.runtime.current_round ?? null;
   if (needReview(records, head)) {
-    state.appendEventAlways(cfg, id, 'stale_review', { head_sha: head, base_sha: base });
+    state.appendEventAlways(cfg, id, 'stale_review', { round: gateRound, head_sha: head, base_sha: base });
     backToRouting(cfg, ts, 'merge 批准被版本规则拒绝：当前 HEAD 没有通过的整体 review');
     console.error(`${id} merge 拒绝：任务分支 HEAD 已变，当前版本没有通过的整体 review（need_review=true）→ 回 ROUTING`);
     process.exitCode = 1;
     return;
   }
   if (needPrecommit(records, head, base)) {
-    state.appendEventAlways(cfg, id, 'main_moved', { head_sha: head, base_sha: base });
+    state.appendEventAlways(cfg, id, 'main_moved', { round: gateRound, head_sha: head, base_sha: base });
     backToRouting(cfg, ts, 'merge 批准被版本规则拒绝：当前 H/B 上没有通过的 precommit');
     console.error(`${id} merge 拒绝：precommit 基线已过期（need_precommit=true）→ 回 ROUTING`);
     process.exitCode = 1;
