@@ -99,6 +99,48 @@ test('AC-021: 同一次 run 内其余任务不再 spawn，stage 不变并记 spa
   assert.match(timeline, new RegExp(new Date(resetsAt * 1000).toISOString()));
 });
 
+test('AC-021: 并发任务里，另一任务的动作 spawn 也被本次 run 的限额拦住', (t) => {
+  // ROUTING 只在派 router 前查过一次 run 级闸门，动作侧的 spawn 发生在那之后：
+  // maxConcurrentTasks>1 时任务 A 命中限额，同一轮里任务 B 的 maker 仍会发出去，
+  // 违反「本次 run 内不再发起任何新 spawn」。用一慢一快两个 router 把这条缝钉住。
+  const env = routerEnv(t, { config: { maxConcurrentTasks: 2 } });
+  const a = 'task-20260830-410';
+  const b = 'task-20260830-411';
+  env.writeRouterTask(a);
+  env.writeRouterTask(b);
+  const resetsAt = nowSec() + 2 * HOUR;
+  // 两个 router 步同形（谁先消费都一样），只有其中一个慢：先返回的那个任务去派 maker 并撞限额，
+  // 慢的那个醒来时本次 run 已经封盘。第 4 步故意不给——漏拦会让 fake-claude 报「多余的 spawn」。
+  env.setScenario([
+    routerStep('maker'),
+    { delayMs: 2000, ...routerStep('maker') },
+    rateLimitStep(resetsAt),
+  ]);
+
+  const run = env.run('run');
+  assert.equal(run.status, 0, run.stderr);
+
+  const boxed = [a, b].filter((id) => env.findTask(id).box === 'failed');
+  const spared = [a, b].filter((id) => env.findTask(id).box === 'queue');
+  assert.equal(boxed.length, 1, '只有命中的那个任务进箱');
+  assert.equal(spared.length, 1);
+  assert.equal(env.findTask(boxed[0]).runtime.last_failure_type, 'rate_limited');
+
+  const other = env.findTask(spared[0]);
+  assert.equal(other.runtime.stage, 'ROUTING', 'stage 不变');
+  assert.equal(other.runtime.last_failure_type, null);
+  assert.equal(env.calls().length, 3, '两次 router + 一次撞限额的 maker，此外零 spawn');
+
+  // 被拦的那次 spawn 不留任何痕迹：无 spawn 记录、无逐轮 settings、无 stream。
+  for (const name of ['maker-r1.json', 'maker-r1.settings.json', 'maker-r1.stream.jsonl']) {
+    assert.equal(env.exists(env.dossier(spared[0], name)), false, `${name} 不该存在`);
+  }
+  assert.ok(env.exists(env.dossier(spared[0], 'router-r1.log.json')), 'router 那一轮照常留档');
+  const timeline = fs.readFileSync(env.dossier(spared[0], 'timeline.md'), 'utf8');
+  assert.match(timeline, /maker spawn skipped: rate limited until /);
+  assert.match(timeline, new RegExp(new Date(resetsAt * 1000).toISOString()));
+});
+
 // ---- AC-022：retry 必须在重置时刻之后 ----
 
 test('AC-022: resets_at 未到 → retry exit 非 0、打印本地重置时刻、状态不变；--force 越过', (t) => {

@@ -23,7 +23,7 @@ import { canStartSpawn, failToBox, rateLimitedToBox } from './shared.mjs';
 import {
   checkBudgetAndBox, checkFuseAndBox, cleanupTaskArtifacts, everProducedSpec, helpSummaries,
   openHumanGate, readBriefText, readRouterState, relRef, revParseOrNull, spawnAgentRound,
-  taskBranchName, taskCfg, taskHasDiff, writeRouterState,
+  spawnSkipped, taskBranchName, taskCfg, taskHasDiff, writeRouterState,
 } from './router-kernel.mjs';
 import specAction from './actions/spec.mjs';
 import makerAction from './actions/maker.mjs';
@@ -253,6 +253,7 @@ export default async function routingHandler(ts, cfg) {
   ts.runtime.current_round = round;
   state.saveRuntime(ts); // 轮次先落盘：spawn 中途崩溃时下一轮用新编号，不覆盖案卷
   const res = await spawnAgentRound(ts, cfg, { role: 'router', round, prompt, planActive });
+  if (spawnSkipped(res)) return { changed: false }; // run 级闸门（上面已查过一次，这里是兜底）
   const limited = rateLimitedToBox(ts, cfg, 'router', res);
   if (limited) return limited;
 

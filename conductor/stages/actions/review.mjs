@@ -12,7 +12,7 @@ import { logPathFor } from '../../lib/agent-settings.mjs';
 import { HARNESS_ARTIFACTS, rateLimitedToBox, worktreePath } from '../shared.mjs';
 import {
   checkBudgetAndBox, readBriefText, readFrozenSpec, revParseOrNull, spawnAgentRound,
-  specGateNotes, taskBranchName, taskCfg,
+  spawnSkipped, specGateNotes, taskBranchName, taskCfg,
 } from '../router-kernel.mjs';
 
 /** AC 清单：有 spec 用枚举结果逐条渲染；无 spec 把 brief 原样交出去当验收线索。 */
@@ -55,6 +55,7 @@ export default async function reviewAction(ts, cfg, { round, records }) {
   const res = await spawnAgentRound(ts, cfg, {
     role: 'reviewer', round, prompt, cwd: wt, extraRecord: { head_sha: head },
   });
+  if (spawnSkipped(res)) return { changed: false }; // run 级闸门拦下：本轮无记录、无 timeline
   const limited = rateLimitedToBox(ts, cfg, 'reviewer', res);
   if (limited) return limited;
   state.appendTimeline(cfg, id, `reviewer r${round} 结束（head=${head ? head.slice(0, 6) : '?'}）`);
