@@ -262,6 +262,24 @@ export function makeEnv(t, { config = {}, trackedHarness = false } = {}) {
   return api;
 }
 
+/**
+ * 并发计数探针（FAKE_CLAUDE_INFLIGHT_LOG）的读侧：同时在飞的 fake-claude 进程数峰值。
+ * 相同毫秒上 end 先于 start 结算——宁可低估并发，也绝不把「首尾相接的串行」误报成并行。
+ */
+export function maxInFlight(logPath) {
+  let raw;
+  try { raw = fs.readFileSync(logPath, 'utf8'); } catch { return 0; }
+  const events = raw.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  events.sort((a, b) => (a.ms - b.ms) || (a.phase === 'end' ? -1 : 1) - (b.phase === 'end' ? -1 : 1));
+  let cur = 0;
+  let max = 0;
+  for (const e of events) {
+    if (e.phase === 'end') cur -= 1;
+    else { cur += 1; max = Math.max(max, cur); }
+  }
+  return max;
+}
+
 /** 从 fake-claude 日志条目取 prompt 正文（经 stdin 传入，fake-claude 原样记录）。 */
 export function promptOf(call) {
   return call.prompt ?? '';
