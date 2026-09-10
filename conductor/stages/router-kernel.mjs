@@ -315,16 +315,20 @@ export function cleanupTaskArtifacts(ts, cfg, { deleteTaskBranch = true, force =
     } catch { /* 清不掉不影响任务去向 */ }
   }
   const branches = [];
+  const failedBranches = [];
   const r = git(['for-each-ref', '--format=%(refname:short)', `refs/heads/${taskBranchName(id)}*`], repo);
   if (r.status === 0) {
     for (const b of r.stdout.split('\n').map((l) => l.trim()).filter(Boolean)) {
       if (b === taskBranchName(id) && !deleteTaskBranch) continue;
-      deleteBranch(repo, b, { force });
-      branches.push(b);
+      // 只列真删掉的：被别处 checkout 着的分支 `git branch -D` 会拒，报成「已清理」等于骗人
+      // ——下一个任务撞上同名分支时，人手上唯一的线索就是这行 timeline。
+      if (deleteBranch(repo, b, { force }).ok) branches.push(b);
+      else failedBranches.push(b);
     }
   }
-  if (removed.length > 0 || branches.length > 0) {
+  if (removed.length > 0 || branches.length > 0 || failedBranches.length > 0) {
     state.appendTimeline(cfg, id, `清理：worktree ${removed.join(', ') || '(无)'}；分支 ${branches.join(', ') || '(无)'}`);
+    for (const b of failedBranches) state.appendTimeline(cfg, id, `branch delete failed: ${b}`);
   }
-  return { worktrees: removed, branches };
+  return { worktrees: removed, branches, failed_branches: failedBranches };
 }
