@@ -4,11 +4,12 @@
 // ——没有工作包的任务绝不能看到工作包段，无 spec 的任务必须看到「先写复现测试」段。
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   buildRouterPrompt, buildSpecPrompt, buildMakerPrompt, buildReviewerPrompt,
-  splitSections, fill, readRolePrompt, readFewShot, NEXT_AGENTS_SUBDIR,
+  splitSections, fill, readRolePrompt, readFewShot, AGENTS_SUBDIR,
 } from '../../conductor/lib/prompts.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -34,8 +35,15 @@ test('splitSections / fill：段切分丢掉 marker 行；未提供的键原样�
   assert.equal(fill('x {{spec 或 brief}}', { 'spec 或 brief': 'spec' }), 'x spec');
 });
 
-test('磁盘资产：四份 prompt 与四份 few-shot 都在 agents/next 下且非空', () => {
-  assert.equal(NEXT_AGENTS_SUBDIR, path.join('agents', 'next'));
+test('AC-026: agents/ 恰好只含四份 prompt + fewshot/ 里的四份 few-shot，一个遗留文件都不剩', () => {
+  assert.equal(AGENTS_SUBDIR, 'agents');
+  const dir = path.join(REPO_ROOT, 'agents');
+  assert.deepEqual(fs.readdirSync(dir).sort(), [
+    'fewshot', 'maker-agent.md', 'reviewer-agent.md', 'router-agent.md', 'spec-agent.md',
+  ]);
+  assert.deepEqual(fs.readdirSync(path.join(dir, 'fewshot')).sort(), [
+    'maker.md', 'reviewer.md', 'router.md', 'spec.md',
+  ]);
   for (const role of ['router', 'spec', 'maker', 'reviewer']) {
     const sections = readRolePrompt(cfg, role);
     assert.ok(sections.get('base')?.length > 50, `${role} 缺 base 段`);
