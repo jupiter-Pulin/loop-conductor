@@ -5,7 +5,7 @@ description: 团队 git 提交与分支命名规范：选 commit type、写 subj
 
 # Git Conventions（commit 与分支规范）
 
-用本 skill 产出 commit 文案与分支名。核心原则与仓库 README 哲学同构：**commit 记「为什么 + 契约边界」，索引（README case 表 / request-log）管「去哪找」，代码和测试是事实源**。三层各干各的，不互相复述。
+用本 skill 产出 commit 文案与分支名。核心原则与仓库 AGENTS.md 索引哲学同构：**commit 记「为什么 + 契约边界」，索引（AGENTS.md case 表 / request-log）管「去哪找」，代码和测试是事实源**。三层各干各的，不互相复述。
 
 ## Scope
 
@@ -46,7 +46,7 @@ description: 团队 git 提交与分支命名规范：选 commit type、写 subj
 | 为什么 | 不改会出什么事故（代码永远记不住这个） |
 | 契约边界 | 动了/没动哪些不变量、schema、config；「无新字段」这类否定声明同样值钱 |
 | 验证 | `npm test N/N` + 新增 case 名 |
-| 索引指针 | README case 行 / request-log 路径，指过去，不复述 |
+| 索引指针 | AGENTS.md case 行 / request-log 路径，指过去，不复述 |
 
 反例清单（出现即返工）：
 
@@ -66,7 +66,7 @@ description: 团队 git 提交与分支命名规范：选 commit type、写 subj
 ## 查找 recipes
 
 - 时间轴索引：`git log --oneline --grep '^feat('`、`git log --grep 'test-gate'`。
-- 空间索引：README「Case 索引」表 → 测试文件；「最近一次实现证据」→ request-log。
+- 空间索引：AGENTS.md「Case 索引」表 → 测试文件；「最近一次实现证据」→ request-log。
 
 ## 机器裁决（conductor committer 用）
 
