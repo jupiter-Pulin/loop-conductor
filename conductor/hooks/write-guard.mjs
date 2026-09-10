@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// hooks/write-guard.mjs — 各角色的 PreToolUse hook：写路径白名单（spec-write-guard.mjs 的泛化）。
+// hooks/write-guard.mjs — 各角色的 PreToolUse hook：写路径白名单。
 // 每个角色只能写内核点名的那几个文件（router / reviewer 只有自己的 log；spec 是 spec + packages
 // + log；方案模式**只有** packages + log），写任何其他路径在落盘之前就被拒（exit 2 阻断工具调用，
 // stderr 喂回模型自纠）。这是 Invariant 8「方案不改范围」的执法点之一：方案模式下对 spec 正文的

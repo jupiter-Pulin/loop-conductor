@@ -26,14 +26,14 @@ import {
 
 /**
  * 状态机只有两个可推进的 stage：ROUTING 每轮问一次 router，AWAIT_HUMAN 停着等 CLI。
- * FAILED_BOX / DONE 是终态，没有 handler——它们只响应人的 retry。
+ * FAILED_BOX / DONE 是终态，连 no-op handler 都不注册——收箱那一刻 transitionState 已把
+ * 任务目录搬出 queue，scheduler 下一步读不到它就停；run 启动的巡检负责补搬崩在半路的残留。
  * queue 里出现遗留 stage 名（P3 之前建的任务）时 scheduler 打印「未知 stage，跳过」并放过，
  * 不抛错（AC-001）：旧任务只保留可读性，不再被这台机器推进。
  */
 const STAGE_HANDLERS = {
   ROUTING: routingHandler,
   AWAIT_HUMAN: awaitHumanHandler,
-  FAILED_BOX: async () => ({ changed: false }),
 };
 
 // ---- 配置与路径 ----

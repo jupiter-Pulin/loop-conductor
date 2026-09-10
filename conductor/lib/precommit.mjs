@@ -187,7 +187,7 @@ export function composePrecommitRecord({
 // ---- 默认执行器（可注入替换）----
 
 /**
- * 跑一条命令（与 stages/shared.mjs::runGreenGate 同构：shell + 独立进程组 + 超时 SIGTERM→SIGKILL），
+ * 跑一条命令（shell + 独立进程组 + 超时 SIGTERM→SIGKILL），
  * 另支持 env 叠加。不复用 shared.mjs 是为了不让 lib 反向依赖 stages（且 shared.mjs 在 P3 会瘦身）。
  */
 export function defaultRunCommand(command, cwd, { timeoutMs = 1_800_000, killGraceMs = 10_000, env = null } = {}) {
