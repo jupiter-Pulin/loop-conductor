@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // tools/dossier-stats.mjs — 跨任务失败分布/成本/轮次聚合（fable-loop 研究量尺）。
-// 只读 state/{queue,done,failed} + dossier/，不依赖 conductor 运行时；输出 Markdown 摘要或 --json。
+// 只读 state/{queue,done,failed} + dossier/，不触碰 conductor 运行时（不 spawn、不改状态、不搬箱）；
+// 唯一的仓内依赖是 lib/records.mjs 的记录合成纯函数——新纪元的 log 契约只有一个解析器。
+// 输出 Markdown 摘要或 --json。
 // 用途：每轮优化实验后一条命令拿到基线对比（截断率、返工率、committer 提案通过率、失败类型分布），
 // 不用重新人肉挖 dossier（fable-loop-STATE.md §4 H12）。
 import fs from 'node:fs';
