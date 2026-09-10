@@ -25,6 +25,13 @@ const AGING_THRESHOLD_MS = 72 * 3600_000;
  * | shadow_disagree    | shadow-compare: 分歧>0 且无 high-risk       | warn     | 否  |
  * | review_high_risk   | review-compare: high_risk=true（verifier pass 但 reviewer blocked——-001 拦截曾只留 timeline 的补课） | critical | 是 |
  * | review_disagree    | review-compare: disagreement=true 且非 high-risk | warn  | 否  |
+ *
+ * 新状态机（router conductor）追加的事件规则——都只读 events.jsonl，绝不移动任何任务（AC-023）：
+ * | rate_limited       | events: rate_limited（五小时/周限额收箱，带 resets_at） | error | 是 |
+ * | fuse_tripped       | events: fuse_tripped（同签名连击，无进展）             | error | 是 |
+ * | budget_exhausted   | events: budget_exhausted                              | error | 是 |
+ * | help_gate          | events: human_gate_opened{kind:help}（router/内核求助） | warn  | 是 |
+ * | merge_blocked      | events: main_moved / stale_review（merge 闸被版本规则拒回） | warn | 否 |
  */
 const SEVERITY_ICON = { info: 'ℹ️', warn: '⚠️', error: '🔴', critical: '🚨' };
 
@@ -74,13 +81,27 @@ export function scanAlerts(root, cursor = { seen: {} }, { nowMs = Date.now() } =
           enteredAt = 'unknown';
         }
       }
-      add(`${id}:await:${runtime.stage}:${enteredAt}`, 'info', false, `${id} 进入 ${runtime.stage}${enterEv?.note ? `（${enterEv.note}）` : ''} — 待人工处理`);
+      // 新状态机只有一个 AWAIT_HUMAN，闸别在 runtime.awaiting.kind 上（Invariant 5）。
+      const gateKind = runtime.awaiting?.kind ? `(${runtime.awaiting.kind})` : '';
+      add(`${id}:await:${runtime.stage}${gateKind}:${enteredAt}`, 'info', false, `${id} 进入 ${runtime.stage}${gateKind}${enterEv?.note ? `（${enterEv.note}）` : ''} — 待人工处理`);
     }
 
     // 规则 merge_failed（E30/F14）：merge 失败事件即时纠偏「以为合了」。每次失败独立报（key 带 ts）。
+    // 新状态机的收箱与求助事件同在这一遍里认；本工具全程只读，绝不改任何 state（AC-023）。
     for (const ev of events) {
       if (ev.type === 'merge_failed') {
         add(`${id}:merge_failed:${ev.ts}`, 'error', true, `${id} merge 失败（${ev.reason ?? '?'}${ev.auto ? ',auto' : ''}）：${(ev.detail ?? '').slice(0, 120)} — 任务留在闸门,需人处置`);
+      } else if (ev.type === 'rate_limited') {
+        const resets = Number.isFinite(ev.resets_at) ? new Date(ev.resets_at * 1000).toISOString() : '未知';
+        add(`${id}:rate_limited:${ev.ts}`, 'error', true, `${id} 撞限额收箱（${ev.limit_type ?? 'unknown'}，重置于 ${resets}）— 到点后人手动 retry,没有任何自动续跑`);
+      } else if (ev.type === 'fuse_tripped') {
+        add(`${id}:fuse_tripped:${ev.ts}`, 'error', true, `${id} 保险丝断开：${ev.role ?? '?'}${ev.package ? ` ${ev.package}` : ''} 连续同签名无进展 — 需人裁决后 retry`);
+      } else if (ev.type === 'budget_exhausted') {
+        add(`${id}:budget_exhausted:${ev.ts}`, 'error', true, `${id} 预算耗尽（已花 $${ev.spent_usd ?? '?'} / 上限 $${ev.budget_usd ?? '?'}）— 需人裁决后 retry`);
+      } else if (ev.type === 'human_gate_opened' && ev.kind === 'help') {
+        add(`${id}:help_gate:${ev.ts}`, 'warn', true, `${id} ${ev.requested_by ?? '?'} 求助（help 闸）：${String(ev.summary ?? '').slice(0, 160)} — resume 前需人裁决`);
+      } else if (ev.type === 'main_moved' || ev.type === 'stale_review') {
+        add(`${id}:${ev.type}:${ev.ts}`, 'warn', false, `${id} merge 闸被版本规则拒回（${ev.type}）— 需重跑 review / precommit,不是人点一下就能过`);
       }
     }
 

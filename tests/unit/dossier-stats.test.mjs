@@ -256,3 +256,141 @@ test('AC-009：--task <id> 不传 root 时用 CONDUCTOR_ROOT 默认 root 命中�
   assert.equal(parsedWithRoot.root, path.resolve(otherRoot));
   assert.equal(selectTask(parsedWithRoot.root, 'task-20260702-001').spent_usd, 9);
 });
+
+// ---- 新旧两纪元混装（AC-029）：router 任务统计 router 轮次 / precommit 各步与 tier / 角色成本 ----
+
+const ROUTER_DOSSIER = {
+  'router-r1.json': { role: 'router', round: 1, cost_usd: 0.02 },
+  'router-r1.log.json': { role: 'router', outcome: 'ok', action: 'maker', summary: '直接实现' },
+  'maker-r1.json': { role: 'maker', round: 1, cost_usd: 1.5, truncated: true },
+  'router-r2.json': { role: 'router', round: 2, cost_usd: 0.02 },
+  'router-r2.log.json': { role: 'router', outcome: 'ok', action: 'review', summary: '整体冷审' },
+  'reviewer-r2.json': { role: 'reviewer', round: 2, cost_usd: 0.4, head_sha: 'a'.repeat(40) },
+  'reviewer-r2.log.json': { role: 'reviewer', outcome: 'fail', tier: 'integration', summary: 'AC-001 fail lib/x.mjs:1' },
+  'router-r3.json': { role: 'router', round: 3, cost_usd: 0.02 },
+  'router-r3.log.json': { role: 'router', outcome: 'ok', action: 'precommit', tier: 'integration', summary: '跑 integration' },
+  'precommit-r3.json': {
+    role: 'precommit', outcome: 'fail', tier: 'integration', summary: 'build ok；integration 2 fail', cost_usd: 0,
+    head_sha: 'a'.repeat(40), base_sha: 'b'.repeat(40), candidate_sha: 'c'.repeat(40),
+    steps: [
+      { step: 'build', command: 'npm run build', status: 'ok', exit_code: 0, timed_out: false, duration_ms: 1000, tail: '' },
+      { step: 'service', command: null, status: 'skipped', exit_code: null, timed_out: false, duration_ms: 0, tail: '', ready_ms: null, pid: null, stopped: false },
+      { step: 'unit', command: 'node --test', status: 'ok', exit_code: 0, timed_out: false, duration_ms: 900, tail: '' },
+      { step: 'integration', command: 'npm run it', status: 'fail', exit_code: 1, timed_out: false, duration_ms: 800, tail: 'fail 2' },
+      { step: 'e2e', command: null, status: 'not_run', exit_code: null, timed_out: false, duration_ms: 0, tail: '' },
+    ],
+    skipped_tiers: ['e2e'], conflict_files: [],
+  },
+  'human-r3.json': {
+    schema_version: 1, kind: 'help', requested_by: 'router', summary: '请裁决', refs: [],
+    requested_at: '2026-09-10T00:00:00.000Z', decision: 'resumed', notes: '按 A 做',
+  },
+};
+
+test('collectStats：含新旧两类 dossier 的仓库运行成功，router 纪元单独统计且不污染旧口径（AC-029）', (t) => {
+  const root = makeRoot(t);
+
+  // 旧任务（legacy 五闸）
+  writeTaskFixture(root, 'done', 'task-20260701-010', {
+    runtime: { stage: 'DONE', spent_usd: 3 },
+    dossier: {
+      'maker-r1.json': { round: 1, mode: 'cold', ok: true, cost_usd: 2, raw: { subtype: 'success' } },
+      'verify-r1.verdict.json': { overall: 'pass' },
+      'test-gate-r1.json': { mode: 'per-ac', verdict: 'falsifies' },
+    },
+  });
+  // 新任务（router）
+  writeTaskFixture(root, 'queue', 'task-20260910-400', {
+    runtime: { stage: 'ROUTING', spent_usd: 1.96 },
+    dossier: ROUTER_DOSSIER,
+  });
+
+  const { tasks, summary } = collectStats(root);
+  assert.equal(summary.tasks_total, 2);
+
+  // 旧口径只看旧任务：新任务的 maker-r1.json 是 spawn 记录，不进 maker 门统计
+  assert.equal(summary.maker.rounds_total, 1);
+  assert.equal(summary.verifier.rounds_total, 1);
+  assert.equal(summary.test_gate.per_ac_rounds, 1);
+
+  const r = summary.router;
+  assert.equal(r.tasks, 1);
+  assert.equal(r.rounds_total, 3);
+  assert.deepEqual(r.actions, { maker: 1, review: 1, precommit: 1 });
+  assert.equal(r.maker_product_not_ok, 1, 'maker 没写 log → product=missing');
+  assert.equal(r.maker_truncated, 1);
+  assert.equal(r.reviewer_rounds, 1);
+  assert.equal(r.reviewer_fails, 1);
+  assert.equal(r.precommit.runs, 1);
+  assert.equal(r.precommit.fail, 1);
+  assert.deepEqual(r.precommit.by_tier, { unit: 0, integration: 1, e2e: 0 });
+  assert.deepEqual(r.precommit.by_step.build, { ok: 1, fail: 0, skipped: 0, not_run: 0 });
+  assert.deepEqual(r.precommit.by_step.service, { ok: 0, fail: 0, skipped: 1, not_run: 0 });
+  assert.deepEqual(r.precommit.by_step.integration, { ok: 0, fail: 1, skipped: 0, not_run: 0 });
+  assert.deepEqual(r.precommit.by_step.e2e, { ok: 0, fail: 0, skipped: 0, not_run: 1 });
+  assert.deepEqual(r.human_gates, { spec: 0, merge: 0, help: 1 });
+  assert.equal(r.role_cost_usd.router, 0.06);
+  assert.equal(r.role_cost_usd.maker, 1.5);
+  assert.equal(r.role_cost_usd.reviewer, 0.4);
+  // P2b 预留列：本阶段恒 0
+  assert.deepEqual(
+    [r.packages_total, r.parallel_rounds, r.plan_runs],
+    [0, 0, 0],
+  );
+
+  // 逐任务：新任务带 router 证据，旧任务带旧证据，互不串台
+  const routerTask = tasks.find((x) => x.id === 'task-20260910-400');
+  assert.equal(routerTask.is_router, true);
+  assert.equal(routerTask.maker_rounds.length, 0);
+  assert.equal(routerTask.router_rounds.length, 3);
+  const legacyTask = tasks.find((x) => x.id === 'task-20260701-010');
+  assert.equal(legacyTask.is_router, false);
+  assert.deepEqual(legacyTask.router_rounds, []);
+
+  const md = renderMarkdown({ tasks, summary });
+  assert.ok(md.includes('## 新状态机（router）'));
+  assert.ok(md.includes('router 轮次：3'));
+  assert.ok(md.includes('tier 分布：unit×0，integration×1，e2e×0'));
+  assert.ok(md.includes('包数 0；并行轮数 0；plan 次数 0'));
+  assert.ok(md.includes('| task-20260910-400 | queue |'));
+});
+
+test('runCli：--task 与 --json 两种模式在 router 任务上都工作（AC-029）', (t) => {
+  const root = makeRoot(t);
+  writeTaskFixture(root, 'queue', 'task-20260910-401', {
+    runtime: { stage: 'ROUTING', spent_usd: 1.96 },
+    dossier: ROUTER_DOSSIER,
+  });
+
+  const detail = runCli(['--task', 'task-20260910-401', root]);
+  assert.equal(detail.code, 0, detail.stderr);
+  assert.ok(detail.stdout.includes('纪元: router'));
+  assert.ok(detail.stdout.includes('router 轮次数: 3'));
+  assert.ok(detail.stdout.includes('router 动作: maker,review,precommit'));
+  assert.ok(detail.stdout.includes('precommit 各步: build:ok,service:skipped,unit:ok,integration:fail,e2e:not_run'));
+  assert.ok(detail.stdout.includes('人闸: help:resumed'));
+  assert.ok(detail.stdout.includes('工作包(P2b 预留): 包数 0 / 并行轮数 0 / plan 次数 0'));
+
+  const json = runCli(['--task', 'task-20260910-401', '--json', root]);
+  assert.equal(json.code, 0, json.stderr);
+  const parsed = JSON.parse(json.stdout);
+  assert.equal(parsed.is_router, true);
+  assert.equal(parsed.router_rounds.length, 3);
+  assert.equal(parsed.precommit_rounds[0].tier, 'integration');
+
+  const full = runCli(['--json', root]);
+  assert.equal(full.code, 0, full.stderr);
+  assert.equal(JSON.parse(full.stdout).summary.router.tasks, 1);
+});
+
+test('collectStats：只有旧任务的仓库里 router 小节为空结构，渲染不报错（AC-029）', (t) => {
+  const root = makeRoot(t);
+  writeTaskFixture(root, 'done', 'task-20260701-011', {
+    dossier: { 'maker-r1.json': { round: 1, ok: true, cost_usd: 1 } },
+  });
+  const stats = collectStats(root);
+  assert.equal(stats.summary.router.tasks, 0);
+  assert.equal(stats.summary.router.rounds_total, 0);
+  const md = renderMarkdown(stats);
+  assert.ok(md.includes('（本库没有 router 纪元的任务）'));
+});

@@ -159,3 +159,94 @@ test('collectWeekly：空窗口零任务不炸，摘要给全绿文案', (t) => 
   assert.equal(rep.attention.length, 0);
   assert.match(renderDigest(rep), /无停靠任务/);
 });
+
+// ---- 新状态机（router conductor）：新角色成本文件与新事件进窗口口径，旧任务不受影响 ----
+
+test('collectWeekly：router 纪元的角色成本与事件计数进窗口，AWAIT_HUMAN 的待办带闸别', (t) => {
+  const root = makeRoot(t);
+  const now = Date.now();
+  const sinceMs = now - 7 * DAY;
+  const untilMs = now + 3600_000;
+  const inWindow = now - DAY;
+  const iso = (ms) => new Date(ms).toISOString();
+
+  writeTask(root, 'queue', 'task-20260910-600', {
+    kind: undefined,
+    runtime: { stage: 'AWAIT_HUMAN', awaiting: { kind: 'merge', round: 4 }, spent_usd: 3.2 },
+    dossier: {
+      'router-r1.json': { role: 'router', round: 1, cost_usd: 0.02 },
+      'router-r1.log.json': { role: 'router', outcome: 'ok', action: 'maker', summary: '直接实现' },
+      'maker-r1.json': { role: 'maker', round: 1, cost_usd: 2.0 },
+      'maker-r1.log.json': { role: 'maker', outcome: 'ok', summary: 'AC-001 done' },
+      'router-r2.json': { role: 'router', round: 2, cost_usd: 0.02 },
+      'router-r2.log.json': { role: 'router', outcome: 'ok', action: 'review', summary: '整体冷审' },
+      'reviewer-r2.json': { role: 'reviewer', round: 2, cost_usd: 0.4, head_sha: 'a'.repeat(40) },
+      'reviewer-r2.log.json': { role: 'reviewer', outcome: 'fail', tier: 'unit', summary: 'AC-001 fail lib/x.mjs:1' },
+      'precommit-r3.json': {
+        role: 'precommit', outcome: 'fail', tier: 'unit', summary: 'unit 2 fail', cost_usd: 0,
+        head_sha: 'a'.repeat(40), base_sha: 'b'.repeat(40), candidate_sha: 'c'.repeat(40),
+        steps: [{ step: 'unit', command: 'node --test', status: 'fail', exit_code: 1, timed_out: false, duration_ms: 10, tail: 'x' }],
+        skipped_tiers: [], conflict_files: [],
+      },
+      'human-r4.json': {
+        schema_version: 1, kind: 'merge', requested_by: 'kernel', summary: '申请合并',
+        refs: [], requested_at: '2026-09-10T00:00:00.000Z',
+      },
+    },
+    events: [
+      { ts: iso(inWindow), type: 'router_decision', action: 'maker' },
+      { ts: iso(inWindow), type: 'router_decision', action: 'review' },
+      { ts: iso(inWindow), type: 'action_rejected', action: 'merge', reason: '版本规则未满足' },
+      { ts: iso(inWindow), type: 'stale_review', head_sha: 'a', base_sha: 'b' },
+      { ts: iso(inWindow), type: 'human_gate_opened', kind: 'merge', requested_by: 'kernel', summary: '申请合并' },
+      { ts: iso(inWindow), type: 'stage', stage: 'AWAIT_HUMAN', note: 'merge 闸（kernel）' },
+    ],
+    mtimeMs: inWindow,
+  });
+
+  const rep = collectWeekly(root, { sinceMs, untilMs, nowMs: now });
+
+  // 新角色的成本进 by_role（router / maker / reviewer 各自成列）
+  assert.equal(rep.cost.by_role.router, 0.04);
+  assert.equal(rep.cost.by_role.maker, 2);
+  assert.equal(rep.cost.by_role.reviewer, 0.4);
+  assert.equal(rep.cost.by_role.precommit, undefined, 'precommit 无 agent、cost 恒 0，不进成本盘');
+
+  const r = rep.router;
+  assert.equal(r.tasks, 1);
+  assert.equal(r.decisions, 2);
+  assert.equal(r.action_rejected, 1);
+  assert.equal(r.merge_gates, 1);
+  assert.equal(r.help_gates, 0);
+  assert.equal(r.version_gate_blocks, 1);
+  assert.equal(r.reviewer_rounds, 1);
+  assert.equal(r.reviewer_fails, 1);
+  assert.equal(r.precommit_runs, 1);
+  assert.equal(r.precommit_fails, 1);
+
+  // 待你动作：AWAIT_HUMAN 带闸别
+  const item = rep.attention.find((a) => a.task === 'task-20260910-600');
+  assert.equal(item.gate_kind, 'merge');
+  assert.equal(item.stage, 'AWAIT_HUMAN(merge)');
+
+  const md = renderMarkdown(rep);
+  assert.ok(md.includes('## 新状态机（router，窗口内）'));
+  assert.ok(md.includes('router 决策 2 次，被内核拒 1 次'));
+  assert.ok(md.includes('AWAIT_HUMAN(merge)'));
+  assert.doesNotThrow(() => renderDigest(rep));
+});
+
+test('collectWeekly：只有旧任务时不渲染 router 小节，旧口径逐项不变', (t) => {
+  const root = makeRoot(t);
+  const now = Date.now();
+  const inWindow = now - DAY;
+  writeTask(root, 'done', 'task-20260707-601', {
+    runtime: { stage: 'DONE', spent_usd: 2 },
+    dossier: { 'maker-r1.json': { round: 1, ok: true, cost_usd: 2, raw: { subtype: 'success' } } },
+    mtimeMs: inWindow,
+  });
+  const rep = collectWeekly(root, { sinceMs: now - 7 * DAY, untilMs: now + 3600_000, nowMs: now });
+  assert.equal(rep.router.tasks, 0);
+  assert.equal(rep.cost.by_role.maker, 2);
+  assert.ok(!renderMarkdown(rep).includes('## 新状态机（router，窗口内）'));
+});
