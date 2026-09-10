@@ -7,7 +7,27 @@ import * as state from '../lib/state.mjs';
 import { setupProfilePaths } from '../lib/profile.mjs';
 import { validateFeasibilityDoc } from '../lib/feasibility-contract.mjs';
 import { git, branchExists } from '../lib/git.mjs';
+import { composeRecords, renderFacts, renderRecordsForRouter } from '../lib/records.mjs';
+import { needPrecommit, needReview } from '../lib/version-gate.mjs';
 import { buildRoundsView } from './rounds.mjs';
+
+// ---- 新状态机的四列（router conductor）：stage 就是列，不再有派生泳道 ----
+//
+// 旧任务（state/done|failed 里带遗留 stage 名的历史案卷，以及崩溃巡检未跑完的 queue 残留）
+// 继续走下面的 LANE_ORDER 泳道口径渲染（AC-029）：两套映射并存，互不覆盖，任何一侧缺失
+// 都只是「这个任务不在那一侧出现」，不是错误。
+
+export const COLUMN_ORDER = ['ROUTING', 'AWAIT_HUMAN', 'FAILED_BOX', 'DONE'];
+
+/** AWAIT_HUMAN 的三种闸（Invariant 5：人闸种类封闭）。 */
+export const AWAITING_KINDS = ['spec', 'merge', 'help'];
+
+const COLUMN_STAGES = new Set(COLUMN_ORDER);
+
+/** stage → 新看板的列（纯函数）。遗留 stage 名返回 null（归 legacy 分组）。 */
+export function columnForStage(stage) {
+  return COLUMN_STAGES.has(stage) ? stage : null;
+}
 
 // ---- 泳道映射（wireframes.md 屏 1 映射表，逐项一致） ----
 
@@ -34,9 +54,10 @@ export function laneForStage(stage) {
   return STAGE_LANE[stage] ?? null;
 }
 
-/** 人审闸门 stage（needsHuman 判据）。 */
+/** 人审闸门 stage（needsHuman 判据）。新状态机只有 AWAIT_HUMAN 一个，闸别看 awaiting.kind。 */
 export const HUMAN_STAGES = [
   'AWAIT_SETUP_APPROVAL', 'AWAIT_FEASIBILITY_APPROVAL', 'AWAIT_SCOPE_DECISION', 'AWAIT_SPEC_APPROVAL', 'AWAIT_HUMAN_MERGE',
+  'AWAIT_HUMAN',
 ];
 
 // ---- 任务 id 校验（一切含 <id> 的路由的第一道闸门） ----
@@ -52,15 +73,18 @@ export function isValidTaskId(id) {
 /** box+stage → { needsHuman, working } 判定（唯一口径，board 与详情抽屉共用）。 */
 function computeWorkingFlags(box, stage) {
   const lane = laneForStage(stage);
+  const needsHuman = box === 'queue' && HUMAN_STAGES.includes(stage);
   return {
-    needsHuman: box === 'queue' && HUMAN_STAGES.includes(stage),
-    working: box === 'queue' && lane != null && !HUMAN_STAGES.includes(stage),
+    needsHuman,
+    working: box === 'queue' && !needsHuman && (stage === 'ROUTING' || lane != null),
   };
 }
 
 function taskEntry(ts) {
   const stage = ts.runtime.stage;
   const lane = laneForStage(stage);
+  const column = columnForStage(stage);
+  const awaitingKind = stage === 'AWAIT_HUMAN' ? (ts.runtime.awaiting?.kind ?? null) : null;
   return {
     id: ts.task.id ?? ts.id,
     kind: ts.task.kind ?? '?',
@@ -68,35 +92,53 @@ function taskEntry(ts) {
     stage,
     box: ts.box,
     lane,
+    column,
+    awaitingKind,
+    // 遗留 stage 名（旧五闸状态机）在新看板里不占列，单独归 legacy 分组（AC-029）。
+    legacy: column == null,
     ...computeWorkingFlags(ts.box, stage),
     spentUsd: ts.runtime.spent_usd ?? 0,
+    lastFailureType: ts.runtime.last_failure_type ?? null,
   };
 }
 
 export function buildBoard(cfg) {
   const broken = [];
+  const legacy = [];
   const laneBuckets = new Map(LANE_ORDER.map((lane) => [lane, []]));
+  const columnBuckets = new Map(COLUMN_ORDER.map((column) => [column, []]));
 
+  // queue 只可能落在活着的两列；箱与 stage 不一致（如 queue 里 stage=DONE 的崩溃残留）
+  // 不进任何列——那是残留，不是「已完成」，仍按旧口径降级 broken。
   for (const ts of state.listTaskStates(cfg.queueDir, 'queue')) {
     if (ts.error) { broken.push({ box: ts.box, id: ts.id, error: ts.error }); continue; }
     const entry = taskEntry(ts);
-    if (entry.lane == null) broken.push(entry);
-    else laneBuckets.get(entry.lane).push(entry);
+    const column = entry.column === 'ROUTING' || entry.column === 'AWAIT_HUMAN' ? entry.column : null;
+    if (column != null) columnBuckets.get(column).push(entry);
+    else if (entry.lane != null) legacy.push(entry);
+    else broken.push(entry);
+    if (entry.lane != null) laneBuckets.get(entry.lane).push(entry);
   }
 
   const done = [];
   for (const ts of state.listTaskStates(cfg.doneDir, 'done')) {
     if (ts.error) { broken.push({ box: ts.box, id: ts.id, error: ts.error }); continue; }
-    done.push(taskEntry(ts));
+    const entry = taskEntry(ts);
+    done.push(entry);
+    if (entry.column === 'DONE') columnBuckets.get('DONE').push(entry);
   }
 
   const failed = [];
   for (const ts of state.listTaskStates(cfg.failedDir, 'failed')) {
     if (ts.error) { broken.push({ box: ts.box, id: ts.id, error: ts.error }); continue; }
-    failed.push(taskEntry(ts));
+    const entry = taskEntry(ts);
+    failed.push(entry);
+    if (entry.column === 'FAILED_BOX') columnBuckets.get('FAILED_BOX').push(entry);
   }
 
   return {
+    columns: COLUMN_ORDER.map((column) => ({ column, tasks: columnBuckets.get(column) })),
+    legacy,
     lanes: LANE_ORDER.map((lane) => ({ lane, tasks: laneBuckets.get(lane) })),
     done,
     failed,
@@ -268,6 +310,192 @@ function buildScopeReview(cfg, id) {
   };
 }
 
+// ---- 新状态机：记录 / 内核事实 / 事件流 / 通用人闸页 ----
+//
+// 全部读自 lib/records.mjs 与 lib/version-gate.mjs——dashboard 只消费内核合成好的记录，
+// 绝不自己解析 `.log.json`、不自己推导版本规则。git 只用来现算 H / B（内核也这么算）。
+
+const ROUTER_SPAWN_RE = /^router-r\d+\.json$/;
+
+/** 这个任务是不是新状态机的任务：stage 在四列内，或案卷里有 router 轮次。 */
+export function isRouterTask(cfg, ts) {
+  const stage = ts?.runtime?.stage;
+  if (stage === 'ROUTING' || stage === 'AWAIT_HUMAN') return true;
+  try {
+    return fs.readdirSync(state.dossierPath(cfg, ts.id)).some((n) => ROUTER_SPAWN_RE.test(n));
+  } catch {
+    return false;
+  }
+}
+
+function revParse(repo, ref) {
+  try {
+    const r = git(['rev-parse', '--verify', '--quiet', ref], repo);
+    return r.status === 0 && r.stdout.trim() !== '' ? r.stdout.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+function taskBranchOf(id) {
+  return `task/${id}`;
+}
+
+/** dossier/<id>/events.jsonl → 事件数组（缺失返回 []；截断残行逐行跳过，不抛错）。 */
+export function readEvents(cfg, id) {
+  let text;
+  try { text = fs.readFileSync(state.dossierPath(cfg, id, 'events.jsonl'), 'utf8'); } catch { return []; }
+  const out = [];
+  for (const line of text.split('\n')) {
+    if (line.trim() === '') continue;
+    try { out.push(JSON.parse(line)); } catch { /* 截断残行忽略 */ }
+  }
+  return out;
+}
+
+/**
+ * 内核事实（renderFacts 的输入与渲染文本）。git 不可用/分支不存在一律降级为 null，
+ * 绝不抛错——详情页永远要能开出来。
+ */
+export function buildTaskFacts(cfg, ts, records) {
+  const repo = ts.task?.targetRepo ?? cfg.targetRepo;
+  const base = ts.task?.baseBranch ?? cfg.baseBranch ?? null;
+  const branch = taskBranchOf(ts.id);
+  const head = repo && branchExists(repo, branch) ? revParse(repo, branch) : null;
+  const baseSha = repo && base ? revParse(repo, base) : null;
+  let hasDiff = null;
+  if (repo && base && head) {
+    try {
+      const r = git(['diff', '--name-only', `${base}...${branch}`], repo);
+      hasDiff = r.status === 0 ? r.stdout.trim() !== '' : null;
+    } catch { hasDiff = null; }
+  }
+  const facts = {
+    stage: ts.runtime?.stage ?? null,
+    round: ts.runtime?.current_round ?? null,
+    head,
+    base: baseSha,
+    baseBranch: base,
+    needReview: needReview(records, head),
+    needPrecommit: needPrecommit(records, head, baseSha),
+    hasDiff,
+    rateLimit: ts.runtime?.rate_limit ?? null,
+    spentUsd: ts.runtime?.spent_usd ?? 0,
+    budgetUsd: cfg.budgetUsd ?? null,
+  };
+  return { ...facts, text: renderFacts({ ...facts, records }) };
+}
+
+/** `## 待决问题` 段原文（含标题行）；spec 里没有这一段返回 null。 */
+export function extractPendingQuestions(markdown) {
+  const text = String(markdown ?? '');
+  const m = /^##[ \t]+待决问题[ \t]*$/m.exec(text);
+  if (!m) return null;
+  const rest = text.slice(m.index + m[0].length);
+  const next = /^##[ \t]+/m.exec(rest);
+  return `${m[0]}\n${(next ? rest.slice(0, next.index) : rest).replace(/^\n+/, '').trimEnd()}`;
+}
+
+/** dossier/<id>/human-r<n>.json（缺失返回 null）。 */
+function readHumanGate(cfg, id, round) {
+  return state.readJsonIf(state.dossierPath(cfg, id, `human-r${round}.json`));
+}
+
+/** awaiting.round 缺失时的兜底：dossier 里轮号最大的那份 human 请求。 */
+function latestHumanRound(cfg, id) {
+  return latestRoundFile(state.dossierPath(cfg, id), /^human-r(\d+)\.json$/);
+}
+
+function latestRecord(records, role, predicate = () => true) {
+  let best = null;
+  for (const r of records ?? []) {
+    if (r.role !== role || !predicate(r)) continue;
+    if (best == null || r.round >= best.round) best = r;
+  }
+  return best;
+}
+
+function shortstatOf(repo, baseBranch, branch) {
+  try {
+    const r = git(['diff', '--shortstat', `${baseBranch}...${branch}`], repo);
+    if (r.status !== 0) return null;
+    return (r.stdout || '').trim() || '(无变更)';
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 通用人闸页（AC-043 在 P2 的适用部分）：dashboard 只渲染 human-r<n>.json 这一种东西——
+ * kind / summary / refs / requested_by 与可用按钮。三种 kind 各自额外挂它需要的同屏材料：
+ *   spec  → specs/<id>.md 全文与「## 待决问题」段（P2 无方案：不渲染方案表、不给 --no-packages）
+ *   merge → 最近 reviewer 记录、最近 precommit 记录（三步结果）、diff shortstat
+ *   help  → 只有 resume
+ * 按钮语义等同 CLI：approve / reject / resume，一个不多一个不少。
+ */
+function buildHumanGateReview(cfg, ts) {
+  const id = ts.id;
+  const round = ts.runtime.awaiting?.round ?? latestHumanRound(cfg, id);
+  const gateRaw = round == null ? null : readHumanGate(cfg, id, round);
+  const kind = ts.runtime.awaiting?.kind ?? gateRaw?.kind ?? null;
+  const gate = {
+    round: round ?? null,
+    kind,
+    requestedBy: gateRaw?.requested_by ?? null,
+    summary: gateRaw?.summary ?? null,
+    refs: Array.isArray(gateRaw?.refs) ? gateRaw.refs : [],
+    requestedAt: gateRaw?.requested_at ?? null,
+    missing: gateRaw == null,
+  };
+  const base = {
+    kind: 'human',
+    gate,
+    // P2：packagesEnabled=false，任何任务都没有方案 —— 不渲染方案表，也不给 --no-packages 按钮。
+    packages: null,
+    showNoPackages: false,
+  };
+
+  if (kind === 'spec') {
+    const draft = path.join(cfg.specsDir, `${id}.md`);
+    let markdown = null;
+    try { markdown = fs.readFileSync(draft, 'utf8'); } catch { /* 草稿缺失也是一种状态 */ }
+    return {
+      ...base,
+      actions: ['approve', 'reject'],
+      spec: markdown == null
+        ? { missing: true, message: `spec 草稿缺失：${draft}` }
+        : { markdown, pendingQuestions: extractPendingQuestions(markdown) },
+    };
+  }
+
+  if (kind === 'merge') {
+    const records = composeRecords(cfg, id, { planActive: ts.runtime.plan_active === true });
+    const repo = ts.task?.targetRepo ?? cfg.targetRepo;
+    const baseBranch = ts.task?.baseBranch ?? cfg.baseBranch ?? null;
+    const branch = taskBranchOf(id);
+    const reviewer = latestRecord(records, 'reviewer');
+    const precommit = latestRecord(records, 'precommit');
+    return {
+      ...base,
+      actions: ['approve', 'reject'],
+      reviewer,
+      precommit: precommit == null ? null : {
+        round: precommit.round,
+        outcome: precommit.outcome,
+        tier: precommit.tier,
+        summary: precommit.summary,
+        headSha: precommit.head_sha,
+        baseSha: precommit.base_sha,
+        steps: precommit.steps ?? [],
+        conflictFiles: precommit.conflict_files ?? [],
+      },
+      diffShortstat: repo && baseBranch ? shortstatOf(repo, baseBranch, branch) : null,
+    };
+  }
+
+  return { ...base, actions: ['resume'] };
+}
+
 function buildMergeReview(cfg, ts) {
   const branch = `task/${ts.id}`;
   const r = git(['diff', '--shortstat', `${ts.task.baseBranch}...${branch}`], ts.task.targetRepo);
@@ -279,6 +507,7 @@ function buildMergeReview(cfg, ts) {
 }
 
 function buildReview(cfg, ts, stage) {
+  if (stage === 'AWAIT_HUMAN') return buildHumanGateReview(cfg, ts);
   if (stage === 'AWAIT_SETUP_APPROVAL') return buildSetupReview(cfg);
   if (stage === 'AWAIT_FEASIBILITY_APPROVAL') return buildFeasibilityReview(ts);
   if (stage === 'AWAIT_SPEC_APPROVAL') return buildSpecReview(cfg, ts.id);
@@ -309,24 +538,36 @@ export function buildTaskDetail(cfg, id) {
     dossierDir: state.dossierPath(cfg, id),
   };
   const rounds = buildRoundsView(cfg, id);
+  const events = readEvents(cfg, id);
   if (ts.error) {
     return {
-      task: null, runtime: null, box: ts.box, lane: null, needsHuman: false, working: false,
+      task: null, runtime: null, box: ts.box, lane: null, column: null, needsHuman: false, working: false,
       timeline, timelineEntries, paths, review: { kind: 'broken', error: ts.error }, rounds,
+      records: [], recordsText: '', facts: null, events, isRouterTask: false,
     };
   }
   const stage = ts.runtime.stage;
+  // 记录列表与内核事实只对新状态机任务成立：旧案卷里 `maker-r<n>.json` 同名但没有 log 契约，
+  // 合成出来只会是一串 product=missing 的噪音，那类任务继续看 rounds 轮次视图（AC-029）。
+  const routerTask = isRouterTask(cfg, ts);
+  const records = routerTask ? composeRecords(cfg, id, { planActive: ts.runtime.plan_active === true }) : [];
   return {
     task: ts.task,
     runtime: ts.runtime,
     box: ts.box,
     lane: laneForStage(stage),
+    column: columnForStage(stage),
     ...computeWorkingFlags(ts.box, stage),
     timeline,
     timelineEntries,
     paths,
     review: buildReview(cfg, ts, stage),
     rounds,
+    isRouterTask: routerTask,
+    records,
+    recordsText: routerTask ? renderRecordsForRouter(records) : '',
+    facts: routerTask ? buildTaskFacts(cfg, ts, records) : null,
+    events,
   };
 }
 
@@ -557,16 +798,23 @@ export function buildStreamTail(cfg, id) {
 
 // ---- 写路径：CLI 透传支撑（纯函数，AC-013/014/016/017/018） ----
 
-/** 同步动作端点对应的 CLI 子命令名与路由 action 一致，直接透传（merge/retry 已 job 化，见 P4）。 */
+/**
+ * 同步动作端点对应的 CLI 子命令名与路由 action 一致，直接透传（merge/retry 已 job 化，见 P4）。
+ * 新状态机的人闸按钮就是 `approve` / `reject` / `resume`，语义等同 CLI，一个不多一个不少；
+ * `abandon` 供 ROUTING 中的任务人工收箱。
+ */
 export const SYNC_ACTIONS = [
   'approve', 'approve-setup', 'approve-feasibility', 'reject', 'reject-feasibility', 'approve-scope', 'reject-scope',
+  'resume', 'abandon',
 ];
 
-/** body.option / body.notes → argv 数组（不经 shell）。未知子命令自身会忽略多余 flag。 */
+/** body.option / body.notes / body.message → argv 数组（不经 shell）。未知子命令自身会忽略多余 flag。 */
 export function buildSyncActionArgv(action, id, body = {}) {
   const argv = [action, id];
   if (typeof body?.option === 'string' && body.option !== '') argv.push('--option', body.option);
   if (typeof body?.notes === 'string' && body.notes !== '') argv.push('--notes', body.notes);
+  // merge 闸批准可覆盖机器 merge 文案（CLI `approve <id> --message "…"`）。
+  if (typeof body?.message === 'string' && body.message !== '') argv.push('--message', body.message);
   return argv;
 }
 
@@ -584,13 +832,14 @@ export function parseNewTaskId(stdout) {
   return m ? m[1] : null;
 }
 
-/** kind=feature 显式传 --feasibility 或 --feasibility false；bugfix 不传（AC-017）。 */
-export function buildNewTaskArgv({ kind, title, briefPath, feasibility }) {
-  const argv = ['new', '--kind', kind, '--title', title];
+/**
+ * `new --title "…" --brief <file> [--repo <path>] [--base-branch <b>]`（新 CLI 唯一形态）。
+ * 不再有 --kind / --feasibility / --auto-approve-spec：任务的路由由 router 决定，不由建单人预判。
+ */
+export function buildNewTaskArgv({ title, briefPath, repo, baseBranch }) {
+  const argv = ['new', '--title', title];
   if (briefPath) argv.push('--brief', briefPath);
-  if (kind === 'feature') {
-    if (feasibility === true) argv.push('--feasibility');
-    else argv.push('--feasibility', 'false');
-  }
+  if (typeof repo === 'string' && repo.trim() !== '') argv.push('--repo', repo.trim());
+  if (typeof baseBranch === 'string' && baseBranch.trim() !== '') argv.push('--base-branch', baseBranch.trim());
   return argv;
 }

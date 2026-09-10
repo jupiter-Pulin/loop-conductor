@@ -11,6 +11,7 @@ import { writeNewTask } from '../../conductor/lib/state.mjs';
 import { validateFeasibilityDoc } from '../../conductor/lib/feasibility-contract.mjs';
 import {
   LANE_ORDER, laneForStage, isValidTaskId,
+  COLUMN_ORDER, columnForStage, isRouterTask, extractPendingQuestions, readEvents,
   buildBoard, buildTaskDetail, parseTimeline,
   SYNC_ACTIONS, buildSyncActionArgv, formatCliMessage, parseNewTaskId, buildNewTaskArgv,
 } from '../../conductor/dashboard/model.mjs';
@@ -143,8 +144,11 @@ test('buildBoard：needsHuman 仅人审 stage 为 true，working 仅非人审推
   assert.equal(board.failed[0].needsHuman, false);
   assert.equal(board.failed[0].working, false);
 
-  // 契约字段齐全（AC-005）
-  assert.deepEqual(Object.keys(spec).sort(), ['box', 'id', 'kind', 'lane', 'needsHuman', 'spentUsd', 'stage', 'title', 'working'].sort());
+  // 契约字段齐全（AC-005 + 新状态机的列/闸别/遗留标记）
+  assert.deepEqual(
+    Object.keys(spec).sort(),
+    ['awaitingKind', 'box', 'column', 'id', 'kind', 'lane', 'lastFailureType', 'legacy', 'needsHuman', 'spentUsd', 'stage', 'title', 'working'].sort(),
+  );
 });
 
 // ---- 详情抽屉误显示 working 回归守卫：GET /api/task/<id> 载荷与看板同口径 ----
@@ -354,8 +358,11 @@ test('isValidTaskId：仅接受 task-YYYYMMDD-NNN，拒绝路径穿越等非法�
 test('SYNC_ACTIONS：同步动作与 CLI 子命令名逐字一致，retry 已 job 化不再属同步动作集合（P4-AC-014④）', () => {
   assert.deepEqual(SYNC_ACTIONS, [
     'approve', 'approve-setup', 'approve-feasibility', 'reject', 'reject-feasibility', 'approve-scope', 'reject-scope',
+    'resume', 'abandon',
   ]);
   assert.equal(SYNC_ACTIONS.includes('retry'), false);
+  // 新状态机的三个人闸按钮就是这三个 CLI 动词，一个不多一个不少。
+  for (const verb of ['approve', 'reject', 'resume']) assert.ok(SYNC_ACTIONS.includes(verb), verb);
 });
 
 test('buildSyncActionArgv：body.option/notes → argv 数组，缺省不带多余 flag', () => {
@@ -389,23 +396,23 @@ test('parseNewTaskId：解析 conductor new stdout 的 `id: ` 行，无匹配返
   assert.equal(parseNewTaskId(undefined), null);
 });
 
-test('buildNewTaskArgv：kind=feature 显式传 --feasibility 布尔；bugfix 不传（AC-017）', () => {
+test('buildNewTaskArgv：新 CLI 四字段（title/brief/repo/base-branch），不再有 kind 与 feasibility', () => {
   assert.deepEqual(
-    buildNewTaskArgv({ kind: 'bugfix', title: 't', briefPath: null, feasibility: undefined }),
-    ['new', '--kind', 'bugfix', '--title', 't'],
+    buildNewTaskArgv({ title: 't', briefPath: '/tmp/brief.md' }),
+    ['new', '--title', 't', '--brief', '/tmp/brief.md'],
   );
   assert.deepEqual(
-    buildNewTaskArgv({ kind: 'bugfix', title: 't', briefPath: '/tmp/brief.md', feasibility: undefined }),
-    ['new', '--kind', 'bugfix', '--title', 't', '--brief', '/tmp/brief.md'],
+    buildNewTaskArgv({ title: 't', briefPath: '/tmp/brief.md', repo: '/abs/repo', baseBranch: 'dev' }),
+    ['new', '--title', 't', '--brief', '/tmp/brief.md', '--repo', '/abs/repo', '--base-branch', 'dev'],
   );
+  // 空串等价于「不给」：绝不把 --repo '' 这种空值透传给 CLI。
   assert.deepEqual(
-    buildNewTaskArgv({ kind: 'feature', title: 't', briefPath: null, feasibility: true }),
-    ['new', '--kind', 'feature', '--title', 't', '--feasibility'],
+    buildNewTaskArgv({ title: 't', briefPath: '/tmp/brief.md', repo: '  ', baseBranch: '' }),
+    ['new', '--title', 't', '--brief', '/tmp/brief.md'],
   );
-  assert.deepEqual(
-    buildNewTaskArgv({ kind: 'feature', title: 't', briefPath: '/tmp/brief.md', feasibility: false }),
-    ['new', '--kind', 'feature', '--title', 't', '--brief', '/tmp/brief.md', '--feasibility', 'false'],
-  );
+  const argv = buildNewTaskArgv({ title: 't', briefPath: '/tmp/brief.md', repo: 'r', baseBranch: 'b' });
+  assert.equal(argv.includes('--kind'), false);
+  assert.equal(argv.includes('--feasibility'), false);
 });
 
 // ---- AC-003/AC-004 静态守卫 ----
@@ -1129,4 +1136,348 @@ test('parseRouteHash：#/task/<id> → task 视图并透传 id；#/metrics → m
   for (const h of ['', '#', '#/', null, undefined, '#/task/', '#/task/../etc', '#/task/a b', '#/unknown']) {
     assert.deepEqual(parseRouteHash(h), { view: 'board' }, `hash ${String(h)} 应回落 board`);
   }
+});
+
+// ---- 新状态机（router conductor）：四列看板 / legacy 分组 / 通用人闸页 / 记录与事实 ----
+
+/** 新状态机的 runtime（字段集合严格按 spec：没有 miss / inval / epoch）。 */
+function routerRuntime(stage, over = {}) {
+  return {
+    schema_version: 1,
+    stage,
+    current_round: 1,
+    awaiting: null,
+    spec_approved: false,
+    plan_active: false,
+    plan_source: null,
+    rate_limit: null,
+    spent_usd: 2.25,
+    last_failure_type: null,
+    updated_at: '2026-09-10T00:00:00.000Z',
+    ...over,
+  };
+}
+
+function routerTask(id, over = {}) {
+  return {
+    schema_version: 1,
+    id,
+    title: `标题 ${id}`,
+    repo: 'target',
+    targetRepo: '/abs/target',
+    baseBranch: 'main',
+    testCommand: 'node --test',
+    created_at: '2026-09-10T00:00:00.000Z',
+    ...over,
+  };
+}
+
+function writeDossier(cfg, id, files) {
+  const dir = path.join(cfg.dossierDir, id);
+  fs.mkdirSync(dir, { recursive: true });
+  for (const [name, content] of Object.entries(files)) {
+    fs.writeFileSync(path.join(dir, name), typeof content === 'string' ? content : `${JSON.stringify(content, null, 2)}\n`);
+  }
+  return dir;
+}
+
+test('columnForStage / COLUMN_ORDER：只有四个新 stage 成列，遗留 stage 名一律 null（AC-029）', () => {
+  assert.deepEqual(COLUMN_ORDER, ['ROUTING', 'AWAIT_HUMAN', 'FAILED_BOX', 'DONE']);
+  for (const stage of COLUMN_ORDER) assert.equal(columnForStage(stage), stage);
+  for (const stage of ['READY', 'VERIFY', 'AWAIT_SPEC_APPROVAL', 'AWAIT_HUMAN_MERGE', 'NOPE']) {
+    assert.equal(columnForStage(stage), null, stage);
+  }
+});
+
+test('view.mjs：BOARD_COLUMNS 与 model.COLUMN_ORDER 深等', async () => {
+  const view = await import('../../conductor/dashboard/static/view.mjs');
+  assert.deepEqual(view.BOARD_COLUMNS, COLUMN_ORDER);
+});
+
+test('buildBoard：新任务按四列分列、AWAIT_HUMAN 带 awaiting.kind；旧 stage 名进 legacy 且仍在泳道里（AC-029）', (t) => {
+  const root = mkroot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cfg = baseCfg(root);
+  ensureDirs(cfg);
+
+  writeNewTask(cfg.queueDir, routerTask('task-20260910-001'), routerRuntime('ROUTING'));
+  writeNewTask(cfg.queueDir, routerTask('task-20260910-002'), routerRuntime('AWAIT_HUMAN', { awaiting: { kind: 'spec', round: 1 } }));
+  writeNewTask(cfg.queueDir, routerTask('task-20260910-003'), routerRuntime('AWAIT_HUMAN', { awaiting: { kind: 'merge', round: 4 } }));
+  writeNewTask(cfg.queueDir, routerTask('task-20260910-004'), routerRuntime('AWAIT_HUMAN', { awaiting: { kind: 'help', round: 2 } }));
+  writeNewTask(cfg.failedDir, routerTask('task-20260910-005'), routerRuntime('FAILED_BOX', { last_failure_type: 'rate_limited' }));
+  writeNewTask(cfg.doneDir, routerTask('task-20260910-006'), routerRuntime('DONE'));
+  // 旧状态机残留：queue 里一个 READY、done 箱一个旧任务（同样以 DONE 收尾）
+  writeNewTask(cfg.queueDir, baseTask('task-20260705-010'), baseRuntime('READY'));
+  writeNewTask(cfg.doneDir, baseTask('task-20260705-011'), baseRuntime('DONE'));
+
+  const board = buildBoard(cfg);
+  const col = (name) => board.columns.find((c) => c.column === name).tasks.map((e) => e.id);
+
+  assert.deepEqual(board.columns.map((c) => c.column), COLUMN_ORDER);
+  assert.deepEqual(col('ROUTING'), ['task-20260910-001']);
+  assert.deepEqual(col('AWAIT_HUMAN'), ['task-20260910-002', 'task-20260910-003', 'task-20260910-004']);
+  assert.deepEqual(col('FAILED_BOX'), ['task-20260910-005']);
+  assert.deepEqual(col('DONE').sort(), ['task-20260705-011', 'task-20260910-006']);
+
+  const kinds = board.columns.find((c) => c.column === 'AWAIT_HUMAN').tasks.map((e) => e.awaitingKind);
+  assert.deepEqual(kinds, ['spec', 'merge', 'help']);
+
+  // 遗留任务：进 legacy 分组，同时按旧逻辑落泳道；不进任何新列、不进 broken。
+  assert.deepEqual(board.legacy.map((e) => e.id), ['task-20260705-010']);
+  assert.equal(board.legacy[0].legacy, true);
+  assert.ok(board.lanes.find((l) => l.lane === 'maker').tasks.some((e) => e.id === 'task-20260705-010'));
+  assert.deepEqual(board.broken, []);
+
+  // 新任务不落旧泳道（lane=null），也就不会被 AC-008 的残留判据误伤。
+  assert.equal(board.columns.find((c) => c.column === 'ROUTING').tasks[0].lane, null);
+});
+
+test('buildBoard：ROUTING 是 working、AWAIT_HUMAN 是 needsHuman；FAILED_BOX/DONE 两者皆 false', (t) => {
+  const root = mkroot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cfg = baseCfg(root);
+  ensureDirs(cfg);
+
+  writeNewTask(cfg.queueDir, routerTask('task-20260910-001'), routerRuntime('ROUTING'));
+  writeNewTask(cfg.queueDir, routerTask('task-20260910-002'), routerRuntime('AWAIT_HUMAN', { awaiting: { kind: 'help', round: 1 } }));
+  writeNewTask(cfg.failedDir, routerTask('task-20260910-003'), routerRuntime('FAILED_BOX', { last_failure_type: 'fuse_no_progress' }));
+
+  const board = buildBoard(cfg);
+  const routing = board.columns.find((c) => c.column === 'ROUTING').tasks[0];
+  assert.equal(routing.working, true);
+  assert.equal(routing.needsHuman, false);
+
+  const gate = board.columns.find((c) => c.column === 'AWAIT_HUMAN').tasks[0];
+  assert.equal(gate.needsHuman, true);
+  assert.equal(gate.working, false);
+
+  const failed = board.columns.find((c) => c.column === 'FAILED_BOX').tasks[0];
+  assert.equal(failed.needsHuman, false);
+  assert.equal(failed.working, false);
+  assert.equal(failed.lastFailureType, 'fuse_no_progress');
+});
+
+const ROUTER_SPEC_MD = [
+  '# median 偶数分支返回错误',
+  '',
+  '## 验收标准',
+  '',
+  '- AC-001: median 偶数长度取中间两数平均',
+  '',
+  '## 待决问题',
+  '',
+  '| 问题 | safe default | 影响 |',
+  '| --- | --- | --- |',
+  '| 是否同时改 mode？ | 不改 | 另选会扩大范围 |',
+  '',
+  '## 验证方式',
+  '',
+  'unit：node --test',
+  '',
+].join('\n');
+
+test('extractPendingQuestions：抽出 `## 待决问题` 整段，遇下一个二级标题即止；无该段返回 null', () => {
+  const seg = extractPendingQuestions(ROUTER_SPEC_MD);
+  assert.ok(seg.startsWith('## 待决问题'));
+  assert.ok(seg.includes('是否同时改 mode？'));
+  assert.equal(seg.includes('## 验证方式'), false);
+  assert.equal(extractPendingQuestions('# 无待决问题的 spec\n\n## 验收标准\n\n- AC-001: x\n'), null);
+  assert.equal(extractPendingQuestions(''), null);
+});
+
+test('buildTaskDetail：spec 闸渲染 kind/summary/refs/requested_by + spec 全文与待决问题；无方案不给方案表与 --no-packages（AC-043）', (t) => {
+  const root = mkroot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cfg = baseCfg(root);
+  ensureDirs(cfg);
+  const id = 'task-20260910-101';
+  writeNewTask(cfg.queueDir, routerTask(id), routerRuntime('AWAIT_HUMAN', { awaiting: { kind: 'spec', round: 2 } }));
+  fs.writeFileSync(path.join(cfg.specsDir, `${id}.md`), ROUTER_SPEC_MD);
+  writeDossier(cfg, id, {
+    'human-r2.json': {
+      schema_version: 1, kind: 'spec', requested_by: 'kernel',
+      summary: 'spec 已通过契约校验，请审',
+      refs: [`specs/${id}.md`],
+      requested_at: '2026-09-10T01:00:00.000Z',
+    },
+  });
+
+  const detail = buildTaskDetail(cfg, id);
+  assert.equal(detail.review.kind, 'human');
+  assert.equal(detail.review.gate.kind, 'spec');
+  assert.equal(detail.review.gate.requestedBy, 'kernel');
+  assert.equal(detail.review.gate.round, 2);
+  assert.equal(detail.review.gate.summary, 'spec 已通过契约校验，请审');
+  assert.deepEqual(detail.review.gate.refs, [`specs/${id}.md`]);
+  assert.deepEqual(detail.review.actions, ['approve', 'reject']);
+  assert.equal(detail.review.spec.markdown, ROUTER_SPEC_MD);
+  assert.ok(detail.review.spec.pendingQuestions.startsWith('## 待决问题'));
+  // P2 恒无方案：不渲染方案表，也不显示 --no-packages。
+  assert.equal(detail.review.packages, null);
+  assert.equal(detail.review.showNoPackages, false);
+  assert.equal(detail.needsHuman, true);
+  assert.equal(detail.column, 'AWAIT_HUMAN');
+});
+
+test('buildTaskDetail：merge 闸挂最近 reviewer 记录与 precommit 三步结果（AC-043）', (t) => {
+  const root = mkroot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cfg = baseCfg(root);
+  ensureDirs(cfg);
+  const id = 'task-20260910-102';
+  writeNewTask(cfg.queueDir, routerTask(id), routerRuntime('AWAIT_HUMAN', { awaiting: { kind: 'merge', round: 5 } }));
+  writeDossier(cfg, id, {
+    'human-r5.json': {
+      schema_version: 1, kind: 'merge', requested_by: 'kernel', summary: '版本规则满足，申请合并',
+      refs: [`dossier/${id}/reviewer-r3.log.json`, `dossier/${id}/precommit-r4.json`],
+      requested_at: '2026-09-10T02:00:00.000Z',
+    },
+    'reviewer-r3.json': { role: 'reviewer', round: 3, head_sha: 'a'.repeat(40), cost_usd: 0.4, done: '2026-09-10T01:00:00.000Z' },
+    'reviewer-r3.log.json': { role: 'reviewer', outcome: 'ok', tier: 'unit', summary: 'AC-001 pass' },
+    'precommit-r4.json': {
+      role: 'precommit', outcome: 'ok', tier: 'unit', summary: 'build ok 2s；service skipped；unit 41/41 ok',
+      cost_usd: 0, head_sha: 'a'.repeat(40), base_sha: 'b'.repeat(40), candidate_sha: 'c'.repeat(40),
+      steps: [
+        { step: 'build', command: 'npm run build', status: 'ok', exit_code: 0, timed_out: false, duration_ms: 2000, tail: '' },
+        { step: 'service', command: null, status: 'skipped', exit_code: null, timed_out: false, duration_ms: 0, tail: '', ready_ms: null, pid: null, stopped: false },
+        { step: 'unit', command: 'node --test', status: 'ok', exit_code: 0, timed_out: false, duration_ms: 4100, tail: 'pass 41' },
+      ],
+      skipped_tiers: ['integration', 'e2e'],
+      conflict_files: [],
+    },
+  });
+
+  const detail = buildTaskDetail(cfg, id);
+  assert.equal(detail.review.gate.kind, 'merge');
+  assert.deepEqual(detail.review.actions, ['approve', 'reject']);
+  assert.equal(detail.review.reviewer.role, 'reviewer');
+  assert.equal(detail.review.reviewer.outcome, 'ok');
+  assert.equal(detail.review.reviewer.tier, 'unit');
+  assert.equal(detail.review.precommit.outcome, 'ok');
+  assert.deepEqual(detail.review.precommit.steps.map((s) => `${s.step}:${s.status}`), ['build:ok', 'service:skipped', 'unit:ok']);
+  assert.equal(detail.review.precommit.steps[2].tail, 'pass 41');
+});
+
+test('buildTaskDetail：help 闸只给 resume；human-r<n>.json 缺失也不抛错', (t) => {
+  const root = mkroot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cfg = baseCfg(root);
+  ensureDirs(cfg);
+  const id = 'task-20260910-103';
+  writeNewTask(cfg.queueDir, routerTask(id), routerRuntime('AWAIT_HUMAN', { awaiting: { kind: 'help', round: 3 } }));
+  writeDossier(cfg, id, {
+    'human-r3.json': {
+      schema_version: 1, kind: 'help', requested_by: 'router', summary: 'AC-013 连续两轮同因 fail，请裁决',
+      refs: [], requested_at: '2026-09-10T03:00:00.000Z',
+    },
+  });
+  const detail = buildTaskDetail(cfg, id);
+  assert.deepEqual(detail.review.actions, ['resume']);
+  assert.equal(detail.review.gate.requestedBy, 'router');
+  assert.equal(detail.review.gate.summary, 'AC-013 连续两轮同因 fail，请裁决');
+
+  const bare = 'task-20260910-104';
+  writeNewTask(cfg.queueDir, routerTask(bare), routerRuntime('AWAIT_HUMAN', { awaiting: { kind: 'help', round: 9 } }));
+  const bareDetail = buildTaskDetail(cfg, bare);
+  assert.equal(bareDetail.review.gate.missing, true);
+  assert.deepEqual(bareDetail.review.actions, ['resume']);
+});
+
+test('buildTaskDetail：新任务带 records（含 human 记录、product≠ok 标记、cost/truncated）与内核事实文本', (t) => {
+  const root = mkroot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cfg = baseCfg(root);
+  ensureDirs(cfg);
+  const id = 'task-20260910-105';
+  writeNewTask(cfg.queueDir, routerTask(id), routerRuntime('ROUTING', { current_round: 3, spec_approved: true }));
+  writeDossier(cfg, id, {
+    'router-r1.json': { role: 'router', round: 1, cost_usd: 0.02, done: '2026-09-10T00:10:00.000Z' },
+    'router-r1.log.json': { role: 'router', outcome: 'ok', action: 'maker', summary: 'brief 即 spec，直接实现' },
+    'maker-r2.json': { role: 'maker', round: 2, cost_usd: 1.5, truncated: true, done: '2026-09-10T00:20:00.000Z' },
+    'human-r3.json': {
+      schema_version: 1, kind: 'help', requested_by: 'router', summary: '请裁决',
+      refs: [], requested_at: '2026-09-10T00:30:00.000Z',
+      decision: 'resumed', notes: '按 A 做', decided_at: '2026-09-10T00:40:00.000Z',
+    },
+    'events.jsonl': [
+      JSON.stringify({ ts: '2026-09-10T00:10:00.000Z', type: 'router_decision', action: 'maker' }),
+      JSON.stringify({ ts: '2026-09-10T00:30:00.000Z', type: 'human_gate_opened', kind: 'help' }),
+      '{ 半行截断',
+      '',
+    ].join('\n'),
+  });
+
+  const detail = buildTaskDetail(cfg, id);
+  assert.equal(detail.isRouterTask, true);
+  assert.deepEqual(detail.records.map((r) => `${r.round}:${r.role}`), ['1:router', '2:maker', '3:human']);
+  const maker = detail.records.find((r) => r.role === 'maker');
+  assert.equal(maker.product, 'missing'); // 撞 max-turns 没写 log：只是记录里的一个字段
+  assert.equal(maker.truncated, true);
+  assert.equal(maker.cost_usd, 1.5);
+  const human = detail.records.find((r) => r.role === 'human');
+  assert.equal(human.decision, 'resumed');
+  assert.equal(human.notes, '按 A 做');
+  assert.ok(detail.recordsText.includes('router'));
+
+  assert.ok(detail.facts.text.includes('need_review='));
+  assert.ok(detail.facts.text.includes('need_precommit='));
+  assert.equal(detail.facts.needReview, true); // 没有任务分支 → 恒 true
+
+  // 事件流：截断残行跳过，其余原样
+  assert.deepEqual(detail.events.map((e) => e.type), ['router_decision', 'human_gate_opened']);
+});
+
+test('buildTaskDetail / isRouterTask：旧任务不走记录合成，rounds 视图与遗留产物照常渲染（AC-029）', (t) => {
+  const root = mkroot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cfg = baseCfg(root);
+  ensureDirs(cfg);
+  const id = 'task-20260705-030';
+  writeNewTask(cfg.doneDir, baseTask(id), baseRuntime('DONE'));
+  writeDossier(cfg, id, {
+    'maker-r1.json': { role: 'maker', round: 1, ok: true, cost_usd: 2.5 },
+    'test-gate-r1.json': { verdict: 'ok', mode: 'per-ac' },
+    'green-gate-r1.json': { exit_code: 0, stdout_tail: 'pass 41' },
+    'verify-r1.verdict.json': { overall: 'pass', criteria_results: [{ ac_id: 'AC-001', status: 'pass' }] },
+    'spec-verify-r1.verdict.json': { overall: 'pass', summary: 'ok', findings: [] },
+    'spec-verify-r1.md': '# spec verify report\n',
+  });
+
+  const ts = { id, runtime: baseRuntime('DONE') };
+  assert.equal(isRouterTask(cfg, ts), false);
+
+  const detail = buildTaskDetail(cfg, id);
+  assert.equal(detail.isRouterTask, false);
+  assert.deepEqual(detail.records, []);
+  assert.equal(detail.facts, null);
+  // 遗留产物照常进 rounds 视图与 review 面板
+  assert.equal(detail.rounds.rounds[0].maker.status, 'ok');
+  assert.equal(detail.rounds.rounds[0].testGate.verdict, 'ok');
+  assert.equal(detail.review.kind, 'done');
+  assert.equal(detail.review.verdict.overall, 'pass');
+});
+
+test('readEvents：events.jsonl 缺失返回空数组，不抛错', (t) => {
+  const root = mkroot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cfg = baseCfg(root);
+  ensureDirs(cfg);
+  assert.deepEqual(readEvents(cfg, 'task-20260910-999'), []);
+});
+
+test('summarizeBoard：queue 口径 = ROUTING + AWAIT_HUMAN 两列 + legacy 分组（新载荷）', async () => {
+  const { summarizeBoard } = await import('../../conductor/dashboard/static/view.mjs');
+  const board = {
+    columns: [
+      { column: 'ROUTING', tasks: [{ id: 'a' }] },
+      { column: 'AWAIT_HUMAN', tasks: [{ id: 'b' }, { id: 'c' }] },
+      { column: 'FAILED_BOX', tasks: [{ id: 'd' }] },
+      { column: 'DONE', tasks: [{ id: 'e' }] },
+    ],
+    legacy: [{ id: 'f' }],
+    lanes: [],
+    done: [{ id: 'e', spentUsd: 1.25 }],
+    failed: [{ id: 'd' }],
+  };
+  assert.deepEqual(summarizeBoard(board), { queue: 4, done: 1, failed: 1, doneSpentUsd: 1.25 });
 });
