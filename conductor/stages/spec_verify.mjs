@@ -8,6 +8,7 @@ import * as state from '../lib/state.mjs';
 import {
   parseStrictJson, specFailRoute, specMissNext, specScaleGateViolation, specVerifierInvalidNext,
   validateSpecVerifierVerdict,
+  legacyMaxTurns,
 } from './decisions.mjs';
 import {
   accountSpawnCost, archiveSpecDraft, budgetExceeded, buildSpecVerifierPrompt, failToBox,
@@ -58,7 +59,7 @@ export default async function specVerifyHandler(ts, cfg) {
     res = await runClaudeWithRetry({
       cwd: iso.cwd,
       prompt: buildSpecVerifierPrompt(ts, cfg, round, scaleGate),
-      maxTurns: cfg.maxTurns,
+      maxTurns: legacyMaxTurns(cfg),
       model: cfg.models?.specVerifier ?? null,
       tools: SPEC_TOOLS,
       allowedTools: SPEC_TOOLS,

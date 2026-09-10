@@ -16,6 +16,7 @@ import { mergeBaseWith, diffNameStatusAgainstBase, parseNameStatusPaths, showFil
 import {
   parseStrictJson, validateVerifierVerdict, verdictNext, verifierInvalidNext, makerMissNext, makerRound,
   checkEvidenceAnchors, validateReviewReport, evaluateAutoMerge, parseNumstat,
+  legacyMaxTurns,
 } from './decisions.mjs';
 import {
   worktreePath, buildVerifierPrompt, buildReviewerPrompt, buildRepairContext, writeRepairContext, renderVerifyReport,
@@ -63,7 +64,7 @@ export default async function verifyHandler(ts, cfg) {
   const res = await runClaudeWithRetry({
     cwd: worktreePath(cfg, id),
     prompt,
-    maxTurns: cfg.maxTurns,
+    maxTurns: legacyMaxTurns(cfg),
     model: cfg.models?.verifier ?? null,
     tools: VERIFIER_TOOLS,        // 工具集硬限制
     allowedTools: VERIFIER_TOOLS, // 免审批放行同一集合
@@ -211,7 +212,7 @@ async function runReviewerShadow(ts, cfg, round, mainVerdict, { acList, expected
   const res = await runClaude({
     cwd: worktreePath(cfg, id),
     prompt: buildReviewerPrompt(ts, cfg, round, acList),
-    maxTurns: cfg.maxTurns,
+    maxTurns: legacyMaxTurns(cfg),
     model: cfg.models?.reviewer ?? null,
     tools: VERIFIER_TOOLS,
     allowedTools: VERIFIER_TOOLS,

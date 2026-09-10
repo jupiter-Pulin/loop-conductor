@@ -4,7 +4,7 @@
 import path from 'node:path';
 import { runClaude } from '../lib/claude.mjs';
 import * as state from '../lib/state.mjs';
-import { specContractInvalidNext } from './decisions.mjs';
+import { specContractInvalidNext, legacyMaxTurns } from './decisions.mjs';
 import {
   accountSpawnCost, budgetExceeded, buildSpecAgentPrompt, failToBox,
   finishSpawnRecord, nextRoleRound, runSpecContractGate, SPEC_AGENT_TOOLS,
@@ -30,7 +30,7 @@ export default async function specFixingHandler(ts, cfg) {
     res = await runClaude({
       cwd: iso.cwd,
       prompt: buildSpecAgentPrompt(ts, cfg, round, { mode: 'repair' }),
-      maxTurns: cfg.maxTurns,
+      maxTurns: legacyMaxTurns(cfg),
       model: cfg.models?.spec ?? null,
       tools: SPEC_AGENT_TOOLS,
       allowedTools: SPEC_AGENT_TOOLS,
