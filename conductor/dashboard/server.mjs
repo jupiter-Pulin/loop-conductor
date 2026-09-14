@@ -289,22 +289,22 @@ async function openWorktreeInEditor(cfg, id) {
   let stat = null;
   try { stat = fs.statSync(dir); } catch { /* 不存在走统一文案 */ }
   if (!stat || !stat.isDirectory()) {
-    return { ok: false, message: `worktree 不存在或已清理：${dir}（任务已合并归档，或尚未进入 maker 阶段）` };
+    return { ok: false, message: `Worktree missing or cleaned up: ${dir} (the task was merged and archived, or has not reached maker yet)` };
   }
   const override = process.env.DASHBOARD_EDITOR_CMD;
   if (override) {
     const r = await spawnEditorProcess(override, [dir]);
     return editorLaunchOk(r)
-      ? { ok: true, message: `已用 ${override} 打开 ${dir}` }
-      : { ok: false, message: `${override} 启动失败（exitCode=${r.exitCode}）` };
+      ? { ok: true, message: `Opened ${dir} with ${override}` }
+      : { ok: false, message: `${override} failed to start (exitCode=${r.exitCode})` };
   }
   if (editorLaunchOk(await spawnEditorProcess('code', [dir]))) {
-    return { ok: true, message: `已在 VS Code 打开 ${dir}` };
+    return { ok: true, message: `Opened ${dir} in VS Code` };
   }
   if (process.platform === 'darwin' && editorLaunchOk(await spawnEditorProcess('open', ['-a', 'Visual Studio Code', dir]))) {
-    return { ok: true, message: `已在 VS Code 打开 ${dir}` };
+    return { ok: true, message: `Opened ${dir} in VS Code` };
   }
-  return { ok: false, message: '找不到 code 命令：在 VS Code 里执行「Shell Command: Install \'code\' command in PATH」后重试' };
+  return { ok: false, message: 'The code command was not found: in VS Code, run "Shell Command: Install \'code\' command in PATH" and try again' };
 }
 
 /** `/static/<rel>` → 磁盘绝对路径；逃逸白名单目录 STATIC_DIR 一律返回 null（供 404）。 */

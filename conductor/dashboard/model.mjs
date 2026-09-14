@@ -194,7 +194,7 @@ function buildSetupReview(cfg) {
   try {
     return { kind: 'setup', markdown: fs.readFileSync(draft, 'utf8') };
   } catch {
-    return { kind: 'setup', missing: true, message: `setup profile 草稿缺失：${draft}` };
+    return { kind: 'setup', missing: true, message: `setup profile draft missing: ${draft}` };
   }
 }
 
@@ -207,7 +207,7 @@ function buildFeasibilityReview(ts) {
   let md = null;
   try { md = fs.readFileSync(draft, 'utf8'); } catch { /* 缺失也是一种状态 */ }
   if (md == null) {
-    return { kind: 'feasibility', legacy: true, missing: true, message: `feasibility 草稿缺失：${draft}`, options: [] };
+    return { kind: 'feasibility', legacy: true, missing: true, message: `feasibility draft missing: ${draft}`, options: [] };
   }
   return { kind: 'feasibility', legacy: true, markdown: md, options: [] };
 }
@@ -298,7 +298,7 @@ function buildSpecReview(cfg, id) {
   try {
     return { kind: 'spec', markdown: fs.readFileSync(draft, 'utf8'), specVerify };
   } catch {
-    return { kind: 'spec', missing: true, message: `spec 草稿缺失：${draft}`, specVerify };
+    return { kind: 'spec', missing: true, message: `spec draft missing: ${draft}`, specVerify };
   }
 }
 
@@ -425,7 +425,7 @@ function shortstatOf(repo, baseBranch, branch) {
   try {
     const r = git(['diff', '--shortstat', `${baseBranch}...${branch}`], repo);
     if (r.status !== 0) return null;
-    return (r.stdout || '').trim() || '(无变更)';
+    return (r.stdout || '').trim() || '(no changes)';
   } catch {
     return null;
   }
@@ -469,7 +469,7 @@ function buildHumanGateReview(cfg, ts) {
       ...base,
       actions: ['approve', 'reject'],
       spec: markdown == null
-        ? { missing: true, message: `spec 草稿缺失：${draft}` }
+        ? { missing: true, message: `spec draft missing: ${draft}` }
         : { markdown, pendingQuestions: extractPendingQuestions(markdown) },
     };
   }
@@ -507,9 +507,9 @@ function buildMergeReview(cfg, ts) {
   const r = git(['diff', '--shortstat', `${ts.task.baseBranch}...${branch}`], ts.task.targetRepo);
   const verdict = buildVerdictPanel(cfg, ts.id);
   if (r.status === 0) {
-    return { kind: 'merge', diffShortstat: (r.stdout || '').trim() || '(无变更)', verdict };
+    return { kind: 'merge', diffShortstat: (r.stdout || '').trim() || '(no changes)', verdict };
   }
-  return { kind: 'merge', error: (r.stderr || r.stdout || 'git diff 失败').trim(), verdict };
+  return { kind: 'merge', error: (r.stderr || r.stdout || 'git diff failed').trim(), verdict };
 }
 
 function buildReview(cfg, ts, stage) {

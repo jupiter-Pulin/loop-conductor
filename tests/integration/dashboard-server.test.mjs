@@ -1098,7 +1098,7 @@ test('P6: open-editor 非法 id 400；worktree 缺失 200 ok:false 且文案指�
   const missing = await postJson(srv.baseUrl, `/api/task/${missingId}/open-editor`, {});
   assert.equal(missing.status, 200);
   assert.equal(missing.body.ok, false);
-  assert.match(missing.body.message, /worktree 不存在或已清理/);
+  assert.match(missing.body.message, /Worktree missing or cleaned up/);
 
   const ok = await postJson(srv.baseUrl, `/api/task/${id}/open-editor`, {});
   assert.equal(ok.status, 200);

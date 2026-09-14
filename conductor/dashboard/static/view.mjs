@@ -8,10 +8,10 @@ export const GAUGE_LANES = ['setup', 'feasibility', 'spec', 'maker', 'verify', '
 export const BOARD_COLUMNS = ['ROUTING', 'AWAIT_HUMAN', 'FAILED_BOX', 'DONE'];
 
 /** AWAIT_HUMAN 的闸别 → 卡片徽标文案（Invariant 5：三种，封闭）。 */
-const AWAITING_LABELS = { spec: 'spec 闸', merge: 'merge 闸', help: 'help 闸' };
+const AWAITING_LABELS = { spec: 'spec gate', merge: 'merge gate', help: 'help gate' };
 
 export function awaitingLabel(kind) {
-  return AWAITING_LABELS[kind] ?? '人闸';
+  return AWAITING_LABELS[kind] ?? 'human gate';
 }
 
 /**
@@ -146,12 +146,12 @@ export function rateLimitPanel(rateLimit, nowMs = Date.now()) {
     ? rateLimit.resets_at
     : null;
   const resetsAtMs = resetsAt == null ? null : resetsAt * 1000;
-  const resetText = resetsAtMs == null ? '未知' : new Date(resetsAtMs).toLocaleString();
+  const resetText = resetsAtMs == null ? 'unknown' : new Date(resetsAtMs).toLocaleString();
   return {
     type: rateLimit.type || 'unknown',
     resetsAtMs,
     resetText,
     canResume: resetsAtMs == null || nowMs >= resetsAtMs,
-    label: `限额 ${rateLimit.type || 'unknown'}，重置于 ${resetText}`,
+    label: `Rate limit ${rateLimit.type || 'unknown'}, resets at ${resetText}`,
   };
 }

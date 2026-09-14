@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="zh">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>回路看板</title>
+<title>Loop Conductor · Dashboard</title>
 <link rel="stylesheet" href="/static/tokens.css">
 <link rel="stylesheet" href="/static/app.css">
 </head>
@@ -11,12 +11,12 @@
 <div class="board-shell" id="board-shell" tabindex="-1">
 <header class="top">
   <div class="header-main">
-    <h1>回路看板</h1>
+    <h1>Loop Conductor</h1>
     <nav class="view-nav" id="view-nav">
-      <button class="view-nav-btn active" id="nav-board" data-view="board">看板</button>
-      <button class="view-nav-btn" id="nav-metrics" data-view="metrics">指标</button>
+      <button class="view-nav-btn active" id="nav-board" data-view="board">Board</button>
+      <button class="view-nav-btn" id="nav-metrics" data-view="metrics">Metrics</button>
     </nav>
-    <button class="btn btn-primary" id="btn-new-task">+ 新建任务</button>
+    <button class="btn btn-primary" id="btn-new-task">+ New task</button>
   </div>
   <div class="header-stats" id="header-stats"></div>
   <div class="header-activity" id="header-activity"></div>
@@ -34,7 +34,7 @@
   <div id="broken-banner-slot"></div>
   <div id="columns"></div>
   <div id="legacy-wrap" hidden>
-    <div class="legacy-title">遗留状态机任务（旧 stage 名，按旧泳道显示）</div>
+    <div class="legacy-title">Legacy state-machine tasks (old stage names, shown in the old lanes)</div>
     <div id="lanes"></div>
   </div>
   <div id="empty-state-slot"></div>

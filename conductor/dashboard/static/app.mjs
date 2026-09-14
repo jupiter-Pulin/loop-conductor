@@ -74,8 +74,8 @@ const HEADER_STAT_DEFS = [
   ['target repo', 'targetRepo'],
   ['base branch', 'baseBranch'],
   ['queue/done/failed', 'queueDoneFailed'],
-  ['done 花费', 'doneSpentUsd'],
-  ['刷新于', 'refreshedAt'],
+  ['done spend', 'doneSpentUsd'],
+  ['refreshed at', 'refreshedAt'],
 ];
 const headerStatEls = new Map(); // key -> stat-value span
 
@@ -164,7 +164,7 @@ function buildColumnCardNode(entry) {
       el('span', { class: 'spent', text: fmtUsd(entry.spentUsd) }),
     ]),
     badges.length > 0 ? el('div', {}, badges) : null,
-    el('div', { class: 'title', text: entry.title || '(无标题)' }),
+    el('div', { class: 'title', text: entry.title || '(untitled)' }),
     rateLimit ? el('div', { class: 'rate-limit', text: rateLimit.label }) : null,
   ]);
   if (entry.needsHuman) {
@@ -196,7 +196,7 @@ function buildCardNode(entry) {
     el('div', {}, [
       el('span', { class: 'badge badge-kind', text: String(entry.kind || '?').toUpperCase() }),
     ]),
-    el('div', { class: 'title', text: entry.title || '(无标题)' }),
+    el('div', { class: 'title', text: entry.title || '(untitled)' }),
     buildGaugeNode(entry),
   ]);
   if (entry.needsHuman) {
@@ -305,10 +305,10 @@ function renderEmptyState() {
   const slot = document.getElementById('empty-state-slot');
   slot.innerHTML = '';
   slot.appendChild(el('div', { class: 'empty-state' }, [
-    el('div', { class: 'empty-title', text: '队列为空' }),
-    el('div', { class: 'empty-hint', text: '尚无任何任务在跑 — 用「新建任务」投递第一个任务' }),
+    el('div', { class: 'empty-title', text: 'Queue is empty' }),
+    el('div', { class: 'empty-hint', text: 'No tasks are running — use "New task" to submit the first one' }),
     el('button', {
-      class: 'btn btn-primary', text: '+ 新建任务',
+      class: 'btn btn-primary', text: '+ New task',
       onclick: () => { document.getElementById('btn-new-task').click(); },
     }),
   ]));
@@ -410,7 +410,7 @@ function renderBrokenBanner(broken) {
   if (!broken || broken.length === 0) return;
   slot.appendChild(el('div', {
     class: 'broken-banner',
-    text: `⚠ ${broken.length} 个任务目录状态异常：${broken.map((b) => b.id).join(', ')}`,
+    text: `⚠ Task directories in an abnormal state (${broken.length}): ${broken.map((b) => b.id).join(', ')}`,
   }));
 }
 
@@ -550,9 +550,9 @@ function metricsChartNode(title, meta) {
 }
 
 function buildCostChart(totals) {
-  const wrap = metricsChartNode('花费分布', '单位：USD（分位） · 数据来源：state/{done,failed}/<id>/runtime.json 的 spent_usd');
+  const wrap = metricsChartNode('Spend distribution', 'Unit: USD (percentiles) · Source: spent_usd in state/{done,failed}/<id>/runtime.json');
   const sp = totals.spentPercentiles;
-  if (sp.n === 0) { wrap.appendChild(el('div', { class: 'metrics-empty-inline', text: '暂无花费样本' })); return wrap; }
+  if (sp.n === 0) { wrap.appendChild(el('div', { class: 'metrics-empty-inline', text: 'No spend samples yet' })); return wrap; }
   const rows = [['p50', sp.p50], ['p90', sp.p90], ['max', sp.max]];
   const widths = barWidths(rows.map(([, v]) => v ?? 0));
   rows.forEach(([label, v], i) => wrap.appendChild(metricBarNode(label, formatUsd(v), widths[i], false)));
@@ -567,10 +567,10 @@ const REJECT_DOOR_LABELS = [
 
 function buildRejectChart(table) {
   const wrap = metricsChartNode(
-    '打回归因',
-    '单位：任务数 · 数据来源：各轮 verify-r*.verdict.json / test-gate-r*.json / green-gate-r*.json / maker-r*.json（任务最大轮首个命中门）',
+    'Rejection causes',
+    'Unit: tasks · Source: per-round verify-r*.verdict.json / test-gate-r*.json / green-gate-r*.json / maker-r*.json (first gate hit in the final round of each task)',
   );
-  if (table.length === 0) { wrap.appendChild(el('div', { class: 'metrics-empty-inline', text: '暂无任务明细' })); return wrap; }
+  if (table.length === 0) { wrap.appendChild(el('div', { class: 'metrics-empty-inline', text: 'No task details yet' })); return wrap; }
   const counts = Object.fromEntries(REJECT_DOOR_LABELS.map(([key]) => [key, 0]));
   for (const row of table) if (row.primaryRejectDoor && counts[row.primaryRejectDoor] !== undefined) counts[row.primaryRejectDoor]++;
   const values = REJECT_DOOR_LABELS.map(([key]) => counts[key]);
@@ -580,7 +580,7 @@ function buildRejectChart(table) {
 }
 
 function buildDurationChart(durations) {
-  const wrap = metricsChartNode('阶段耗时', '单位：秒/分（p50 中位数） · 数据来源：dossier/<id>/timeline.md 的 stage → 转移时间戳差分');
+  const wrap = metricsChartNode('Stage durations', 'Unit: s/min (p50 median) · Source: stage transition timestamps in dossier/<id>/timeline.md');
   // 新任务按四列统计，旧任务按六泳道；两类都空才算「无样本」。
   const columns = durations.columns || [];
   const lanes = durations.lanes || [];
@@ -588,7 +588,7 @@ function buildDurationChart(durations) {
     ...columns.filter((c) => c.n > 0).map((c) => ({ label: c.column, p50: c.p50 })),
     ...lanes.filter((l) => l.n > 0).map((l) => ({ label: l.lane, p50: l.p50 })),
   ];
-  if (rows.length === 0) { wrap.appendChild(el('div', { class: 'metrics-empty-inline', text: '暂无阶段耗时样本' })); return wrap; }
+  if (rows.length === 0) { wrap.appendChild(el('div', { class: 'metrics-empty-inline', text: 'No stage duration samples yet' })); return wrap; }
   const widths = barWidths(rows.map((r) => r.p50 ?? 0));
   rows.forEach((r, i) => wrap.appendChild(metricBarNode(r.label, formatDurationSeconds(r.p50), widths[i], false)));
   return wrap;
@@ -602,13 +602,13 @@ function buildRouterKpiRow(routerYield) {
     el('span', { class: 'metrics-kpi-label', text: label }),
     el('span', { class: 'metrics-kpi-value mono', text: value }),
   ]));
-  kpi('router 任务（done/failed）', `${routerYield.taskCount.done} / ${routerYield.taskCount.failed}`);
-  kpi('平均 router 轮次', routerYield.avgRounds.value == null ? '—' : routerYield.avgRounds.value.toFixed(1));
-  kpi('reviewer 打回率', formatPercent(routerYield.reviewerFailRate.value));
-  kpi('precommit 失败率', formatPercent(routerYield.precommitFailRate.value));
-  kpi('maker 交付缺失率', formatPercent(routerYield.makerProductMissRate.value));
+  kpi('router tasks (done/failed)', `${routerYield.taskCount.done} / ${routerYield.taskCount.failed}`);
+  kpi('avg router rounds', routerYield.avgRounds.value == null ? '—' : routerYield.avgRounds.value.toFixed(1));
+  kpi('reviewer fail rate', formatPercent(routerYield.reviewerFailRate.value));
+  kpi('precommit fail rate', formatPercent(routerYield.precommitFailRate.value));
+  kpi('maker missing-product rate', formatPercent(routerYield.makerProductMissRate.value));
   const gates = routerYield.humanGates;
-  kpi('人闸（spec/merge/help）', `${gates.spec} / ${gates.merge} / ${gates.help}`);
+  kpi('human gates (spec/merge/help)', `${gates.spec} / ${gates.merge} / ${gates.help}`);
   return wrap;
 }
 
@@ -618,12 +618,12 @@ function buildKpiRow(metrics) {
     el('span', { class: 'metrics-kpi-label', text: label }),
     el('span', { class: 'metrics-kpi-value mono', text: value }),
   ]));
-  kpi('总花费', formatUsd(metrics.totals.totalSpentUsd));
-  kpi('任务数（done/failed）', `${metrics.totals.taskCount.done} / ${metrics.totals.taskCount.failed}`);
-  kpi('一次通过率', formatPercent(metrics.yield.firstPassRate.value));
-  kpi('平均轮次', metrics.yield.avgRounds.value == null ? '—' : metrics.yield.avgRounds.value.toFixed(1));
-  kpi('maker miss 率', formatPercent(metrics.yield.makerMissRate.value));
-  kpi('verifier 打回率', formatPercent(metrics.yield.verifierRejectRate.value));
+  kpi('total spend', formatUsd(metrics.totals.totalSpentUsd));
+  kpi('tasks (done/failed)', `${metrics.totals.taskCount.done} / ${metrics.totals.taskCount.failed}`);
+  kpi('first-pass rate', formatPercent(metrics.yield.firstPassRate.value));
+  kpi('avg rounds', metrics.yield.avgRounds.value == null ? '—' : metrics.yield.avgRounds.value.toFixed(1));
+  kpi('maker miss rate', formatPercent(metrics.yield.makerMissRate.value));
+  kpi('verifier reject rate', formatPercent(metrics.yield.verifierRejectRate.value));
   return wrap;
 }
 
@@ -633,8 +633,8 @@ const METRICS_TABLE_COLUMNS = [
 ];
 
 function buildMetricsTable(table) {
-  const wrap = metricsChartNode('逐任务明细', '数据来源：state/{done,failed}/<id>/{task.json,runtime.json} + dossier/<id>/ 各轮门 JSON');
-  if (table.length === 0) { wrap.appendChild(el('div', { class: 'metrics-empty-inline', text: '暂无任务明细' })); return wrap; }
+  const wrap = metricsChartNode('Per-task details', 'Source: state/{done,failed}/<id>/{task.json,runtime.json} + per-round gate JSON in dossier/<id>/');
+  if (table.length === 0) { wrap.appendChild(el('div', { class: 'metrics-empty-inline', text: 'No task details yet' })); return wrap; }
   const sorted = sortTableRows(table, metricsSort.key, metricsSort.dir);
   const thead = el('tr', {}, METRICS_TABLE_COLUMNS.map((col) => {
     const arrow = metricsSort.key === col.key ? (metricsSort.dir === 'asc' ? ' ▲' : ' ▼') : '';
@@ -667,8 +667,8 @@ function renderMetrics(metrics) {
   if (!metrics) return;
   if (isMetricsEmpty(metrics)) {
     container.appendChild(el('div', { class: 'metrics-empty' }, [
-      el('div', { class: 'empty-title', text: '暂无指标数据' }),
-      el('div', { class: 'empty-hint', text: 'done/failed 箱都还是空的 — 等 loop 跑完至少一个任务后回来看这里；先去「看板」确认队列进度' }),
+      el('div', { class: 'empty-title', text: 'No metrics yet' }),
+      el('div', { class: 'empty-hint', text: 'The done and failed boxes are still empty — come back once the loop has finished a task; meanwhile, follow the queue on the Board' }),
     ]));
     return;
   }
@@ -806,7 +806,7 @@ function renderDetailFromCache() {
   if (detailMode === 'drawer') {
     const drawer = document.getElementById('drawer');
     drawer.innerHTML = '';
-    if (!lastDetail) { drawer.appendChild(el('div', { text: '任务未找到或已归档' })); return; }
+    if (!lastDetail) { drawer.appendChild(el('div', { text: 'Task not found or archived' })); return; }
     renderDrawerPeek(drawer, detailTaskId, lastDetail);
   } else if (detailMode === 'page') {
     const page = document.getElementById('view-task');
@@ -814,10 +814,10 @@ function renderDetailFromCache() {
     if (!lastDetail) {
       page.appendChild(el('div', { class: 'task-page' }, [
         el('div', { class: 'task-page-topbar' }, [
-          el('button', { class: 'btn btn-ghost', text: '← 看板', onclick: gotoBoard }),
+          el('button', { class: 'btn btn-ghost', text: '← Board', onclick: gotoBoard }),
         ]),
         el('div', { class: 'empty-state' }, [
-          el('div', { class: 'empty-title', text: '任务未找到或已归档' }),
+          el('div', { class: 'empty-title', text: 'Task not found or archived' }),
           el('div', { class: 'empty-hint', text: `id: ${detailTaskId}` }),
         ]),
       ]));
@@ -912,8 +912,8 @@ function doorChipStatus(kind, door) {
 
 /** 门 → 关键数字文案；未到达/损坏均给明确文案，不留空白。 */
 function doorDetailText(kind, door) {
-  if (!door || door.status === 'absent') return '未到达';
-  if (door.status === 'corrupt') return '数据损坏';
+  if (!door || door.status === 'absent') return 'not reached';
+  if (door.status === 'corrupt') return 'corrupt data';
   if (kind === 'maker') return `$${(door.costUsd ?? 0).toFixed(2)} · ${door.turns ?? '?'} turns`;
   if (kind === 'testGate') return door.verdict ?? '?';
   if (kind === 'greenGate') return door.pass ? 'pass' : 'fail';
@@ -940,9 +940,9 @@ function buildRoundNode(round, defaultOpen) {
   const body = el('div', { class: 'round-body' }, [doors]);
   const rc = round.repairContext;
   if (rc && rc.status === 'ok' && rc.instruction) {
-    body.appendChild(el('div', { class: 'round-repair mono', text: `打回（${rc.source}）：${rc.instruction}` }));
+    body.appendChild(el('div', { class: 'round-repair mono', text: `Sent back (${rc.source}): ${rc.instruction}` }));
   } else if (rc && rc.status === 'corrupt') {
-    body.appendChild(el('div', { class: 'round-repair', text: 'repair-context 数据损坏' }));
+    body.appendChild(el('div', { class: 'round-repair', text: 'repair-context data is corrupt' }));
   }
   return el('details', { class: 'round-section', open: defaultOpen ? '' : null }, [
     el('summary', { class: 'round-header mono', text: `r${round.round}` }),
@@ -952,9 +952,9 @@ function buildRoundNode(round, defaultOpen) {
 
 function buildRoundsSectionNode(rounds) {
   const wrap = el('div', { class: 'rounds-section' });
-  wrap.appendChild(el('h3', { text: '轮次' }));
+  wrap.appendChild(el('h3', { text: 'Rounds' }));
   if (!rounds || rounds.length === 0) {
-    wrap.appendChild(el('div', { class: 'verdict-empty', text: '尚无轮次记录' }));
+    wrap.appendChild(el('div', { class: 'verdict-empty', text: 'No rounds recorded yet' }));
     return wrap;
   }
   const list = el('div', { class: 'rounds-list' });
@@ -966,9 +966,9 @@ function buildRoundsSectionNode(rounds) {
 /** 「实时输出」折叠区（P4-G3）：stream tail 增量文本，纯文本渲染（textContent，不解析 HTML）。 */
 function buildStreamTailNode(lines) {
   const wrap = el('details', { class: 'stream-tail', open: '' }, [
-    el('summary', { text: `实时输出${lines && lines.length ? ` · ${lines.length}` : ''}` }),
+    el('summary', { text: `Live output${lines && lines.length ? ` · ${lines.length}` : ''}` }),
   ]);
-  const pre = el('pre', { class: 'stream-tail-pre', text: lines && lines.length ? lines.join('\n') : '(暂无输出)' });
+  const pre = el('pre', { class: 'stream-tail-pre', text: lines && lines.length ? lines.join('\n') : '(no output yet)' });
   wrap.appendChild(pre);
   return wrap;
 }
@@ -976,7 +976,7 @@ function buildStreamTailNode(lines) {
 function buildAttemptsSectionNode(attempts) {
   if (!attempts || attempts.length === 0) return null;
   const wrap = el('details', { class: 'attempts-section' }, [
-    el('summary', { text: `早前攻坚周期 · ${attempts.length}` }),
+    el('summary', { text: `Earlier attempts · ${attempts.length}` }),
   ]);
   for (const group of attempts) {
     const groupWrap = el('div', { class: 'attempt-group' }, [
@@ -992,7 +992,7 @@ function buildAttemptsSectionNode(attempts) {
 function buildTimelineListNode(entries) {
   const frag = document.createDocumentFragment();
   if (!entries || entries.length === 0) {
-    frag.appendChild(el('div', { class: 'timeline-item', text: '(无记录)' }));
+    frag.appendChild(el('div', { class: 'timeline-item', text: '(no entries)' }));
     return frag;
   }
   let i = 0;
@@ -1054,11 +1054,11 @@ async function confirmAndSubmitJob(id, action, confirmMessage) {
   if (!window.confirm(confirmMessage)) return;
   const resBody = await doAction(id, action, {});
   if (!resBody || typeof resBody.jobId !== 'string') {
-    pendingActionMessage = { ok: false, message: (resBody && resBody.error) || '提交失败' };
+    pendingActionMessage = { ok: false, message: (resBody && resBody.error) || 'Submit failed' };
     await refreshDetail();
     return;
   }
-  pendingActionMessage = { ok: null, message: `已提交，job ${resBody.jobId} 处理中…` };
+  pendingActionMessage = { ok: null, message: `Submitted — job ${resBody.jobId} in progress…` };
   renderDetailFromCache();
   pollJobUntilDone(id, resBody.jobId);
 }
@@ -1068,17 +1068,17 @@ async function confirmAndSubmitJob(id, action, confirmMessage) {
 function buildEditorControls(id) {
   const status = el('span', { class: 'editor-status' });
   const btn = el('button', {
-    class: 'btn btn-ghost', text: '在 VS Code 打开 ↗',
+    class: 'btn btn-ghost', text: 'Open in VS Code ↗',
     onclick: async () => {
       btn.disabled = true;
-      status.textContent = '打开中…';
+      status.textContent = 'Opening…';
       status.classList.remove('editor-status-fail');
       const { body } = await api(`/api/task/${encodeURIComponent(id)}/open-editor`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
       });
       btn.disabled = false;
       const ok = body && body.ok === true;
-      status.textContent = ok ? '已打开' : ((body && body.message) || '打开失败');
+      status.textContent = ok ? 'Opened' : ((body && body.message) || 'Failed to open');
       if (body && body.message) status.title = body.message;
       status.classList.toggle('editor-status-fail', !ok);
     },
@@ -1109,15 +1109,15 @@ function countCriteria(criteria) {
   return counts;
 }
 
-function buildVerdictPanelNode(verdict, { title = 'Verifier 裁决' } = {}) {
+function buildVerdictPanelNode(verdict, { title = 'Verifier verdict' } = {}) {
   const wrap = el('div', { class: 'verdict-block' });
   wrap.appendChild(el('h3', { text: title }));
   if (!verdict || verdict.missing) {
-    wrap.appendChild(el('div', { class: 'verdict-empty', text: '尚无 verifier 裁决记录' }));
+    wrap.appendChild(el('div', { class: 'verdict-empty', text: 'No verifier verdict yet' }));
     return wrap;
   }
   if (verdict.corrupt) {
-    wrap.appendChild(el('div', { class: 'verdict-empty', text: 'verifier 裁决文件已损坏，无法解析' }));
+    wrap.appendChild(el('div', { class: 'verdict-empty', text: 'The verifier verdict file is corrupt and cannot be parsed' }));
     return wrap;
   }
   const counts = countCriteria(verdict.criteria);
@@ -1147,7 +1147,7 @@ function buildVerdictPanelNode(verdict, { title = 'Verifier 裁决' } = {}) {
   wrap.appendChild(list);
   if (verdict.reportMarkdown) {
     wrap.appendChild(el('details', { class: 'verdict-report' }, [
-      el('summary', { text: '完整 verify 报告' }),
+      el('summary', { text: 'Full verify report' }),
       el('pre', { class: 'readonly', text: verdict.reportMarkdown }),
     ]));
   }
@@ -1156,13 +1156,13 @@ function buildVerdictPanelNode(verdict, { title = 'Verifier 裁决' } = {}) {
 
 function buildSpecVerifyNode(specVerify) {
   const wrap = el('div', { class: 'verdict-block' });
-  wrap.appendChild(el('h3', { text: 'Spec-verifier 机器审' }));
+  wrap.appendChild(el('h3', { text: 'Spec-verifier review' }));
   if (!specVerify || specVerify.missing) {
-    wrap.appendChild(el('div', { class: 'verdict-empty', text: '尚无 spec-verifier 机器审记录' }));
+    wrap.appendChild(el('div', { class: 'verdict-empty', text: 'No spec-verifier review yet' }));
     return wrap;
   }
   if (specVerify.corrupt) {
-    wrap.appendChild(el('div', { class: 'verdict-empty', text: 'spec-verifier 裁决文件已损坏，无法解析' }));
+    wrap.appendChild(el('div', { class: 'verdict-empty', text: 'The spec-verifier verdict file is corrupt and cannot be parsed' }));
     return wrap;
   }
   wrap.appendChild(el('div', { class: 'verdict-summary' }, [
@@ -1186,7 +1186,7 @@ function buildSpecVerifyNode(specVerify) {
   }
   if (specVerify.reportMarkdown) {
     wrap.appendChild(el('details', { class: 'verdict-report' }, [
-      el('summary', { text: '完整 spec-verify 报告' }),
+      el('summary', { text: 'Full spec-verify report' }),
       el('pre', { class: 'readonly', text: specVerify.reportMarkdown }),
     ]));
   }
@@ -1221,9 +1221,9 @@ function buildDiffFileNode(f) {
   const body = el('div', { class: 'diff-file-body' });
   if (isOpen) {
     if (f.binary) {
-      body.appendChild(el('div', { class: 'diff-empty', text: '(二进制文件，不展示 patch)' }));
+      body.appendChild(el('div', { class: 'diff-empty', text: '(binary file, patch not shown)' }));
     } else if (f.oversize) {
-      body.appendChild(el('div', { class: 'diff-empty', text: 'diff 过大，已省略正文（仍计入 +/− 统计）' }));
+      body.appendChild(el('div', { class: 'diff-empty', text: 'Diff too large; body omitted (still counted in +/−)' }));
     } else {
       const pre = el('pre', { class: 'diff-patch mono' });
       pre.innerHTML = renderPatchHtml(f.patch);
@@ -1247,19 +1247,19 @@ function buildDiffSectionNode(diff, { taskId, shortstat } = {}) {
     el('h3', { text: 'Diff' }),
     shortstat ? el('span', { class: 'diff-shortstat mono', text: shortstat }) : null,
   ]));
-  wrap.appendChild(el('div', { class: 'diff-note', text: '在这里粗览改动范围与文件分布；逐行深审建议跳到 VS Code 里进行。' }));
+  wrap.appendChild(el('div', { class: 'diff-note', text: 'Skim the scope and the file spread here; for a line-by-line review, open it in VS Code.' }));
   if (!diff) {
-    wrap.appendChild(el('div', { class: 'diff-empty', text: 'diff 加载中或加载失败' }));
+    wrap.appendChild(el('div', { class: 'diff-empty', text: 'Diff is loading or failed to load' }));
     return wrap;
   }
   if (diff.cleaned || diff.files.length === 0) {
-    wrap.appendChild(el('div', { class: 'diff-empty', text: '分支已清理，无可展示的 diff（任务已合并或从未产生改动）' }));
+    wrap.appendChild(el('div', { class: 'diff-empty', text: 'Branch cleaned up; no diff to show (the task was merged or never changed anything)' }));
     return wrap;
   }
   const allOpen = diff.files.every((f) => expandedDiffFiles.has(f.path));
   const toggleAllBtn = el('button', {
     class: 'btn btn-ghost',
-    text: allOpen ? '收起全部' : '展开全部',
+    text: allOpen ? 'Collapse all' : 'Expand all',
     onclick: () => {
       if (allOpen) expandedDiffFiles = new Set();
       else expandedDiffFiles = new Set(diff.files.map((f) => f.path));
@@ -1285,7 +1285,7 @@ function renderDrawerPeek(drawer, id, detail) {
     el('div', {}, [
       el('div', { class: 'mono', text: id }),
       task && task.kind ? el('span', { class: 'badge badge-kind', text: String(task.kind).toUpperCase() }) : null,
-      el('h2', { text: task ? task.title : '(损坏任务目录)' }),
+      el('h2', { text: task ? task.title : '(corrupt task directory)' }),
       el('div', { class: 'mono drawer-stage', text: `stage: ${runtime ? runtime.stage : '(unknown)'}` }),
       needsHuman ? el('span', { class: 'needs-you', text: '⚑ needs you' }) : null,
     ]),
@@ -1295,7 +1295,7 @@ function renderDrawerPeek(drawer, id, detail) {
   drawer.appendChild(el('div', { class: 'action-row' }, [
     el('button', {
       class: 'btn btn-primary',
-      text: needsHuman ? '进入审查 →' : '完整详情 →',
+      text: needsHuman ? 'Review →' : 'Full details →',
       onclick: () => gotoTask(id),
     }),
     editorRelevant(detail) ? buildEditorControls(id) : null,
@@ -1374,7 +1374,7 @@ function buildRecordRowNode(rec) {
 function buildRecordsSectionNode(records) {
   if (!records || records.length === 0) return null;
   return el('details', { class: 'attempts-section', open: 'open' }, [
-    el('summary', { text: `记录（${records.length} 条）` }),
+    el('summary', { text: `Records (${records.length})` }),
     el('div', { class: 'record-list' }, records.map(buildRecordRowNode)),
   ]);
 }
@@ -1382,7 +1382,7 @@ function buildRecordsSectionNode(records) {
 function buildFactsSectionNode(facts) {
   if (!facts) return null;
   return el('details', { class: 'attempts-section', open: 'open' }, [
-    el('summary', { text: '内核事实' }),
+    el('summary', { text: 'Kernel facts' }),
     el('pre', { class: 'readonly', text: facts.text || '' }),
   ]);
 }
@@ -1401,14 +1401,14 @@ function buildEventsSectionNode(events) {
     ]);
   });
   return el('details', { class: 'attempts-section' }, [
-    el('summary', { text: `事件流（${events.length} 条）` }),
+    el('summary', { text: `Event stream (${events.length})` }),
     el('div', { class: 'event-list' }, rows),
   ]);
 }
 
 /** precommit 三步结果：每步 status / 用时 / tail（merge 闸同屏必看的东西）。 */
 function buildPrecommitNode(pre) {
-  if (!pre) return el('div', { class: 'verdict-empty', text: '本任务尚无 precommit 记录' });
+  if (!pre) return el('div', { class: 'verdict-empty', text: 'No precommit record for this task yet' });
   const stepChip = (status) => {
     const chip = verdictChip(status === 'ok' ? 'pass' : (status === 'fail' ? 'fail' : 'unknown'));
     return el('span', { class: `chip ${chip.className}`, text: `${chip.symbol} ${status}` });
@@ -1446,7 +1446,7 @@ function buildPrecommitNode(pre) {
 function buildHumanGateMain(id, detail, content, actions) {
   const review = detail.review;
   const gate = review.gate || {};
-  content.push(el('h3', { text: `人闸 · ${awaitingLabel(gate.kind)}` }));
+  content.push(el('h3', { text: `Human gate · ${awaitingLabel(gate.kind)}` }));
   content.push(el('div', { class: 'gate-meta' }, [
     el('span', { class: 'badge badge-kind', text: `kind=${gate.kind || '?'}` }),
     el('span', { class: 'badge badge-kind', text: `requested_by=${gate.requestedBy || '?'}` }),
@@ -1454,7 +1454,7 @@ function buildHumanGateMain(id, detail, content, actions) {
   ]));
   content.push(el('pre', {
     class: 'readonly',
-    text: gate.summary || (gate.missing ? '(human-r<n>.json 缺失：产物与状态不一致，可按 CLI 提示直接处理)' : '(内核未写 summary)'),
+    text: gate.summary || (gate.missing ? '(human-r<n>.json is missing: artifacts and state disagree; follow the CLI hints to resolve it)' : '(the kernel wrote no summary)'),
   }));
   if (gate.refs && gate.refs.length > 0) {
     content.push(el('div', { class: 'gate-refs' }, gate.refs.map((r) => el('span', { text: r }))));
@@ -1463,20 +1463,20 @@ function buildHumanGateMain(id, detail, content, actions) {
   if (gate.kind === 'spec') {
     const spec = review.spec || {};
     if (spec.pendingQuestions) {
-      content.push(el('h3', { text: '待决问题' }));
+      content.push(el('h3', { text: 'Open questions' }));
       content.push(el('pre', { class: 'readonly', text: spec.pendingQuestions }));
     }
-    content.push(el('h3', { text: 'Spec 全文' }));
+    content.push(el('h3', { text: 'Full spec' }));
     content.push(el('pre', { class: 'readonly readonly-tall', text: spec.missing ? spec.message : spec.markdown }));
     const notes = el('textarea', { id: 'gate-notes', rows: 3 });
-    content.push(el('div', { class: 'field' }, [el('label', { text: '备注（approve 可选，reject 必填）' }), notes]));
+    content.push(el('div', { class: 'field' }, [el('label', { text: 'Notes (optional to approve, required to reject)' }), notes]));
     const approveBtn = el('button', {
-      class: 'btn btn-primary', text: '通过 spec',
-      onclick: () => confirmAndSubmit(id, 'approve', { notes: notes.value }, '确定通过 spec？'),
+      class: 'btn btn-primary', text: 'Approve spec',
+      onclick: () => confirmAndSubmit(id, 'approve', { notes: notes.value }, 'Approve this spec?'),
     });
     const rejectBtn = el('button', {
-      class: 'btn btn-danger', text: '打回并留言',
-      onclick: () => confirmAndSubmit(id, 'reject', { notes: notes.value }, '确定打回 spec 并留言？'),
+      class: 'btn btn-danger', text: 'Reject with notes',
+      onclick: () => confirmAndSubmit(id, 'reject', { notes: notes.value }, 'Reject the spec with these notes?'),
     });
     rejectBtn.disabled = true;
     notes.addEventListener('input', () => { rejectBtn.disabled = notes.value.trim() === ''; });
@@ -1485,26 +1485,26 @@ function buildHumanGateMain(id, detail, content, actions) {
   }
 
   if (gate.kind === 'merge') {
-    content.push(el('h3', { text: '最近一次整体 review' }));
+    content.push(el('h3', { text: 'Latest full review' }));
     const reviewer = review.reviewer;
     content.push(reviewer
       ? el('div', { class: 'record-list' }, [buildRecordRowNode(reviewer)])
-      : el('div', { class: 'verdict-empty', text: '本任务尚无 reviewer 记录' }));
-    content.push(el('h3', { text: 'precommit 三步' }));
+      : el('div', { class: 'verdict-empty', text: 'No reviewer record for this task yet' }));
+    content.push(el('h3', { text: 'Precommit steps' }));
     content.push(buildPrecommitNode(review.precommit));
     content.push(buildDiffSectionNode(lastDiff, { taskId: id, shortstat: review.diffShortstat }));
     const message = el('input', { type: 'text', id: 'gate-message' });
     const notes = el('textarea', { id: 'gate-notes', rows: 3 });
-    content.push(el('div', { class: 'field' }, [el('label', { text: 'merge commit 文案（可选，留空用机器文案）' }), message]));
-    content.push(el('div', { class: 'field' }, [el('label', { text: '打回理由（reject 必填）' }), notes]));
+    content.push(el('div', { class: 'field' }, [el('label', { text: 'Merge commit message (optional; leave empty for the generated one)' }), message]));
+    content.push(el('div', { class: 'field' }, [el('label', { text: 'Reason (required to reject)' }), notes]));
     const base = detail.task ? detail.task.baseBranch : 'base';
     const approveBtn = el('button', {
-      class: 'btn btn-primary', text: `批准合并到 ${base}`,
-      onclick: () => confirmAndSubmit(id, 'approve', { message: message.value }, `确定合并到 ${base}？此操作不可撤销。`),
+      class: 'btn btn-primary', text: `Approve merge into ${base}`,
+      onclick: () => confirmAndSubmit(id, 'approve', { message: message.value }, `Merge into ${base}? This cannot be undone.`),
     });
     const rejectBtn = el('button', {
-      class: 'btn btn-danger', text: '打回并留言',
-      onclick: () => confirmAndSubmit(id, 'reject', { notes: notes.value }, '确定打回 merge 并留言？'),
+      class: 'btn btn-danger', text: 'Reject with notes',
+      onclick: () => confirmAndSubmit(id, 'reject', { notes: notes.value }, 'Reject the merge with these notes?'),
     });
     rejectBtn.disabled = true;
     notes.addEventListener('input', () => { rejectBtn.disabled = notes.value.trim() === ''; });
@@ -1513,10 +1513,10 @@ function buildHumanGateMain(id, detail, content, actions) {
   }
 
   const notes = el('textarea', { id: 'gate-notes', rows: 3 });
-  content.push(el('div', { class: 'field' }, [el('label', { text: '备注（可选，进「已裁决事项」）' }), notes]));
+  content.push(el('div', { class: 'field' }, [el('label', { text: 'Notes (optional; recorded with the decided items)' }), notes]));
   actions.push(el('button', {
-    class: 'btn btn-primary', text: '恢复 · resume',
-    onclick: () => confirmAndSubmit(id, 'resume', { notes: notes.value }, '确定恢复该任务？notes 不豁免版本规则。'),
+    class: 'btn btn-primary', text: 'Resume',
+    onclick: () => confirmAndSubmit(id, 'resume', { notes: notes.value }, 'Resume this task? Notes do not waive the version rules.'),
   }));
 }
 
@@ -1525,11 +1525,11 @@ function buildHumanGateMain(id, detail, content, actions) {
 /** 旧状态机遗留的 review 形态：只读渲染，没有任何决策按钮（对应动词已随 P3 一起删）。 */
 const LEGACY_REVIEW_KINDS = new Set(['feasibility', 'setup', 'spec', 'scope', 'merge']);
 const LEGACY_REVIEW_LABEL = {
-  feasibility: '遗留任务：feasibility memo（旧状态机产物，只读）',
-  setup: '遗留任务：setup profile 草稿（旧状态机产物，只读）',
-  spec: '遗留任务：spec 草稿与 spec-verifier 裁决（旧状态机产物，只读）',
-  scope: '遗留任务：spec 规模升闸（旧状态机产物，只读）',
-  merge: '遗留任务：旧 merge 闸（旧状态机产物，只读）',
+  feasibility: 'Legacy task: feasibility memo (old state-machine artifact, read-only)',
+  setup: 'Legacy task: setup profile draft (old state-machine artifact, read-only)',
+  spec: 'Legacy task: spec draft and spec-verifier verdict (old state-machine artifact, read-only)',
+  scope: 'Legacy task: spec size escalation gate (old state-machine artifact, read-only)',
+  merge: 'Legacy task: old merge gate (old state-machine artifact, read-only)',
 };
 
 /** review kind → { content: node[], actions: node[] }。content 顺序即页面主列顺序：报告在前。 */
@@ -1559,33 +1559,33 @@ function buildReviewMain(id, detail) {
       content.push(buildSpecVerifyNode(review.specVerify));
     }
   } else if (review.kind === 'failed') {
-    content.push(el('h3', { text: '失败信息' }));
-    content.push(el('div', { text: review.lastFailureType || '(未知失败类型)' }));
+    content.push(el('h3', { text: 'Failure' }));
+    content.push(el('div', { text: review.lastFailureType || '(unknown failure type)' }));
     const rl = rateLimitPanel(review.rateLimit);
     if (rl) {
       // 限额收箱：只有人能恢复，且必须在重置时刻之后（与 CLI retry 同一条规则）。
       content.push(el('div', { class: 'rate-limit-note', text: rl.label }));
       actions.push(el('button', {
-        class: 'btn btn-danger', text: '↻ 恢复', disabled: rl.canResume ? null : 'disabled',
-        title: rl.canResume ? null : `限额重置于 ${rl.resetText} 之后才能恢复`,
-        onclick: rl.canResume ? () => confirmAndSubmitJob(id, 'retry', '确定恢复该任务？') : null,
+        class: 'btn btn-danger', text: '↻ Resume', disabled: rl.canResume ? null : 'disabled',
+        title: rl.canResume ? null : `Can resume once the rate limit resets at ${rl.resetText}`,
+        onclick: rl.canResume ? () => confirmAndSubmitJob(id, 'retry', 'Resume this task?') : null,
       }));
     } else {
       actions.push(el('button', {
-        class: 'btn btn-danger', text: '↻ 重试',
-        onclick: () => confirmAndSubmitJob(id, 'retry', '确定重试该任务？'),
+        class: 'btn btn-danger', text: '↻ Retry',
+        onclick: () => confirmAndSubmitJob(id, 'retry', 'Retry this task?'),
       }));
     }
-    content.push(buildVerdictPanelNode(review.verdict, { title: '最终 verifier 裁决' }));
+    content.push(buildVerdictPanelNode(review.verdict, { title: 'Final verifier verdict' }));
     content.push(buildDiffSectionNode(lastDiff, { taskId: id }));
   } else if (review.kind === 'done') {
-    content.push(el('h3', { text: '任务已完成' }));
-    content.push(buildVerdictPanelNode(review.verdict, { title: '最终 verifier 裁决' }));
+    content.push(el('h3', { text: 'Task done' }));
+    content.push(buildVerdictPanelNode(review.verdict, { title: 'Final verifier verdict' }));
     content.push(buildDiffSectionNode(lastDiff, { taskId: id }));
   } else if (review.kind === 'broken') {
     content.push(el('div', { class: 'broken-banner', text: review.error }));
   } else {
-    content.push(el('div', { text: `当前 stage：${detail.runtime ? detail.runtime.stage : '?'}` }));
+    content.push(el('div', { text: `Current stage: ${detail.runtime ? detail.runtime.stage : '?'}` }));
   }
   return { content, actions };
 }
@@ -1597,7 +1597,7 @@ function renderTaskPage(page, id, detail) {
   const wrap = el('div', { class: 'task-page' });
 
   wrap.appendChild(el('div', { class: 'task-page-topbar' }, [
-    el('button', { class: 'btn btn-ghost', text: '← 看板', onclick: gotoBoard }),
+    el('button', { class: 'btn btn-ghost', text: '← Board', onclick: gotoBoard }),
     el('div', { class: 'task-topbar-right' }, [
       buildEditorControls(id),
       typeof runtime?.spent_usd === 'number' ? el('span', { class: 'spent mono', text: fmtUsd(runtime.spent_usd) }) : null,
@@ -1610,7 +1610,7 @@ function renderTaskPage(page, id, detail) {
       task && task.kind ? el('span', { class: 'badge badge-kind', text: String(task.kind).toUpperCase() }) : null,
       detail.needsHuman ? el('span', { class: 'needs-you', text: '⚑ needs you' }) : null,
     ]),
-    el('h2', { class: 'task-page-title', text: task ? task.title : '(损坏任务目录)' }),
+    el('h2', { class: 'task-page-title', text: task ? task.title : '(corrupt task directory)' }),
     el('div', { class: 'task-page-stage' }, [
       el('span', { class: 'mono', text: `stage: ${runtime ? runtime.stage : '(unknown)'}` }),
       detail.working ? workingLabel() : null,
@@ -1677,7 +1677,7 @@ function renderNewTaskPanel(resultBody) {
   const panel = document.getElementById('new-task-panel');
   panel.innerHTML = '';
   panel.appendChild(el('div', { class: 'panel-header' }, [
-    el('h2', { text: '新建任务' }),
+    el('h2', { text: 'New task' }),
     el('button', { class: 'close-x', text: '×', onclick: () => hideOverlay('panel-overlay') }),
   ]));
 
@@ -1686,20 +1686,20 @@ function renderNewTaskPanel(resultBody) {
   const cfg = (latestBoard && latestBoard.config) || {};
   panel.appendChild(el('div', { class: 'field' }, [el('label', { text: 'Title' }), el('input', { type: 'text', id: 'nt-title' })]));
   panel.appendChild(el('div', { class: 'field' }, [
-    el('label', { text: 'Brief 正文（需求原文，随任务落盘为 brief.md）' }),
+    el('label', { text: 'Brief (saved with the task as brief.md)' }),
     el('textarea', { id: 'nt-brief', rows: 8 }),
   ]));
   panel.appendChild(el('div', { class: 'field' }, [
-    el('label', { text: `目标仓库（留空用默认 ${cfg.targetRepo || ''}）` }),
+    el('label', { text: `Target repository (empty = default ${cfg.targetRepo || ''})` }),
     el('input', { type: 'text', id: 'nt-repo', placeholder: cfg.targetRepo || '' }),
   ]));
   panel.appendChild(el('div', { class: 'field' }, [
-    el('label', { text: `base 分支（留空用默认 ${cfg.baseBranch || 'currentBranch'}）` }),
+    el('label', { text: `Base branch (empty = default ${cfg.baseBranch || 'currentBranch'})` }),
     el('input', { type: 'text', id: 'nt-base-branch', placeholder: cfg.baseBranch || '(currentBranch)' }),
   ]));
 
   panel.appendChild(el('details', { class: 'advanced' }, [
-    el('summary', { text: '高级参数（只读）' }),
+    el('summary', { text: 'Advanced settings (read-only)' }),
     el('div', { class: 'advanced-field' }, [el('span', { text: 'target repo' }), el('span', { text: cfg.targetRepo || '' })]),
     el('div', { class: 'advanced-field' }, [el('span', { text: 'base branch' }), el('span', { text: cfg.baseBranch || '(currentBranch)' })]),
     el('div', { class: 'advanced-field' }, [el('span', { text: 'test command' }), el('span', { text: cfg.testCommand || '' })]),
@@ -1712,7 +1712,7 @@ function renderNewTaskPanel(resultBody) {
   }
 
   const submitBtn = el('button', {
-    class: 'btn btn-primary', text: '创建并运行 · Create & Run',
+    class: 'btn btn-primary', text: 'Create & Run',
     onclick: async () => {
       const reqBody = {
         title: document.getElementById('nt-title').value,
@@ -1730,7 +1730,7 @@ function renderNewTaskPanel(resultBody) {
     },
   });
   const cancelBtn = el('button', {
-    class: 'btn btn-ghost', text: '取消',
+    class: 'btn btn-ghost', text: 'Cancel',
     onclick: () => hideOverlay('panel-overlay'),
   });
   panel.appendChild(el('div', { class: 'action-row' }, [submitBtn, cancelBtn]));

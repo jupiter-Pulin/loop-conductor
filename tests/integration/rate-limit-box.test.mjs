@@ -268,7 +268,7 @@ test('AC-023: dashboard 详情暴露 rate_limit；resets_at 前「恢复」disab
 
   const before = rateLimitPanel(detail.review.rateLimit, resetsAt * 1000 - 1);
   assert.equal(before.canResume, false, '重置时刻之前「恢复」按钮 disabled');
-  assert.match(before.label, /^限额 five_hour，重置于 /);
+  assert.match(before.label, /^Rate limit five_hour, resets at /);
   const after = rateLimitPanel(detail.review.rateLimit, resetsAt * 1000);
   assert.equal(after.canResume, true, '到点后启用');
 

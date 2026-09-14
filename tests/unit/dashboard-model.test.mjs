@@ -129,7 +129,7 @@ test('taskEntry：rate_limited 的 FAILED_BOX 卡片带 rateLimit（type/resets_
   // 卡片那一行文案与详情页、CLI retry 同一条规则（view.mjs::rateLimitPanel）。
   const { rateLimitPanel } = await import('../../conductor/dashboard/static/view.mjs');
   const panel = rateLimitPanel(byId['task-20260910-101'].rateLimit, resetsAt * 1000 - 1);
-  assert.match(panel.label, /^限额 five_hour，重置于 /);
+  assert.match(panel.label, /^Rate limit five_hour, resets at /);
   assert.equal(panel.canResume, false);
   assert.equal(rateLimitPanel(byId['task-20260910-102'].rateLimit), null);
 });
