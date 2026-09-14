@@ -4,7 +4,7 @@
 
 green gate 只证明「测试绿」（`conductor/stages/shared.mjs::runGreenGate` 只认 exit code），verifier 只做静态对照且被禁跑测试（`agents/verifier-agent.md`）。两者合起来仍然证明不了一件事：maker 为 AC 补的测试**真的能区分改前改后**。一个空转（vacuous）测试——mock 掉了变更路径、或者干脆断言了旧行为——在新旧代码上都绿，green gate 与 verifier 都拦不住；更糟的对抗情形是 maker 削弱或删除既有红测试来换绿灯。
 
-本特性引入第二道确定性闸「test gate」：green gate 通过后，conductor 在 `task.json` 的 `baseBranch` 基线上开一个临时 detached git worktree，把任务 worktree 中**被改动的测试文件**叠加过去，复跑同一 `testCommand`。基线上仍然 exit 0 ⇒ 当前测试套件区分不了新旧代码 ⇒ 判 vacuous，不进 VERIFY，走 maker miss 阶梯退回修复。思路来自 session-workflow 的 `test-gate` skill（`skills/test-gate/scripts/probe-ac-tests.mjs`），机械化为 conductor 的整套件口径。
+本特性引入第二道确定性闸「test gate」：green gate 通过后，conductor 在 `task.json` 的 `baseBranch` 基线上开一个临时 detached git worktree，把任务 worktree 中**被改动的测试文件**叠加过去，复跑同一 `testCommand`。基线上仍然 exit 0 ⇒ 当前测试套件区分不了新旧代码 ⇒ 判 vacuous，不进 VERIFY，走 maker miss 阶梯退回修复。思路来自一个 `test-gate` skill（`skills/test-gate/scripts/probe-ac-tests.mjs`），机械化为 conductor 的整套件口径。
 
 ## 关键设计决策（对应立项四问）
 

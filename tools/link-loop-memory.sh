@@ -6,11 +6,11 @@
 # 本脚本用符号链接把记忆库文件装回仓库根——loop 协议按原文件名读写，零改动透明生效。
 #
 # 用法：
-#   ./tools/link-loop-memory.sh /path/to/loop-memory
+#   ./tools/link-loop-memory.sh /path/to/<私有记忆库>
 #
 # 换机冷启动全流程：
 #   git clone <framework-repo> && git clone <private-memory-repo>
-#   cd loop-conductor && ./tools/link-loop-memory.sh ../loop-memory
+#   cd <框架仓库> && ./tools/link-loop-memory.sh ../<私有记忆库>
 #   （记忆的提交/推送在记忆库目录里正常 git 操作即可）
 #
 # 首次建库：把仓库根现有的 fable-loop-STATE.md / fable-loop-ARCHIVE.md 移入记忆库目录，

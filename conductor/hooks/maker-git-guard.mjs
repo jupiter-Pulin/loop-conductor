@@ -2,7 +2,7 @@
 // hooks/maker-git-guard.mjs — maker 的 PreToolUse(Bash) hook：git 破坏性操作护栏。
 // maker 只负责改 worktree 代码；commit/merge/清理由 conductor 负责。放行本地 commit
 // （无害，commitAll 兜底），拦截 push 与不可逆操作（exit 2 阻断，stderr 喂回模型自纠）。
-// 判定逻辑移植自 session-workflow hooks/scripts/git-safety.mjs（去引号防误报、
+// 判定逻辑移植自一个 git-safety hook 脚本（去引号防误报、
 // sh -c 嵌套展开），提示语适配无人值守 loop：没有「交还用户」，只有「不在你的职责内」。
 // stdin：Claude Code hook 输入 JSON { tool_name, tool_input, ... }。
 import fs from 'node:fs';

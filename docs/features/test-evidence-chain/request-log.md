@@ -5,7 +5,7 @@
 按一次性任务 spec（`~/.claude/tmp/2-tech-spec-test-evidence-chain.md`，不入仓库文档体系）落地：
 
 - A 批（prompt / 约定层）：spec 逐 AC 声明验证级别尾注（spec-agent 产出、spec-verifier 审核）；verifier 增加逐 AC 测试证明力审计维度；`buildVerifierPrompt` 嵌入当轮 test gate 探针机械记录。
-- B 批（机械层）：maker 在 worktree 写 `.loop-conductor/ac-tests.json`（AC→测试映射，harness exclude 覆盖）；conductor test gate 探针升级为逐 AC 定向探测（方向感知：`fail_on_baseline` 基线必须红 / `pass_on_baseline` 基线必须绿），映射缺失/非法降级 v1 suite 模式。
+- B 批（机械层）：maker 在 worktree 的 harness 目录写 `ac-tests.json`（AC→测试映射，harness exclude 覆盖）；conductor test gate 探针升级为逐 AC 定向探测（方向感知：`fail_on_baseline` 基线必须红 / `pass_on_baseline` 基线必须绿），映射缺失/非法降级 v1 suite 模式。
 
 Non-goals（未做，按 spec）：无新 agent 角色 / stage / spawn；spec-doc/v1、verifier-verdict/v1 不动；无 coverage/mutation；miss 阶梯语义与 `makerRound` 不变量不动；无映射原地重试通道。
 
@@ -24,7 +24,7 @@ Non-goals（未做，按 spec）：无新 agent 角色 / stage / spawn；spec-do
 | AC-004 | pass | `tests/integration/test-gate.test.mjs`（探针段两形态断言）+ `tests/integration/test-gate-per-ac.test.mjs` | `conductor/stages/shared.mjs::buildVerifierPrompt` | 记录存在 → 固定标题段（去 stdout/stderr tail）；`testGateEnabled=false` → 无该段。 |
 | AC-005 | pass | `git diff` 核对：`conductor/lib/spec-contract.mjs` 零变更；`decisions.mjs` 仅新增纯函数（validateVerifierVerdict 未动）；runtime.json 无新字段；dossier 文件名集合不变 | — | `test-gate-r<n>.json` 仅增量字段（schema_version 保持 1）。 |
 | AC-006 | pass | `node --test tests/unit/test-gate.test.mjs`：合法分支 + 全部非法分支（非对象/schema_version≠1/entries 非数组/ac_id·command 非法/expect 非枚举/ac_id 重复/越界）绝不抛错 | `conductor/lib/test-gate.mjs`（`AC_TESTS_MAPPING_PATH`、`validateAcTestsMapping`）, `tests/unit/test-gate.test.mjs` | 单一裁判，零 IO。 |
-| AC-007 | pass | `tests/integration/test-gate-per-ac.test.mjs`「映射不进 diff 不进 merge」case | `agents/maker-agent.md`, `tests/integration/test-gate-per-ac.test.mjs` | maker prompt 按尾注写映射（回归守卫 → pass_on_baseline，不可自动化 → 不写条目）；断言 diff 无 `.loop-conductor/`、merge 后 target 主分支无该目录。 |
+| AC-007 | pass | `tests/integration/test-gate-per-ac.test.mjs`「映射不进 diff 不进 merge」case | `agents/maker-agent.md`, `tests/integration/test-gate-per-ac.test.mjs` | maker prompt 按尾注写映射（回归守卫 → pass_on_baseline，不可自动化 → 不写条目）；断言 diff 无该 harness 目录、merge 后 target 主分支无该目录。 |
 | AC-008 | pass | 同上 case：`mode='per-ac'`、逐条 exit code、`exit_code=null`（不再跑全量基线复跑） | `conductor/stages/shared.mjs::runTestGateProbe` | 映射有效时在 merge-base detached worktree（含测试 overlay）逐条执行 `entries[].command`。 |
 | AC-009 | pass | per-ac vacuous case（FIXING miss=1 + repair prompt 点名 ac_id）+ 阶梯耗尽 case（FAILED_BOX/maker_misses_exhausted）+ `tests/unit/shared.test.mjs` | `conductor/stages/shared.mjs::buildRepairContext`, `conductor/stages/ready.mjs`, `conductor/stages/fixing.mjs` | `failed_criteria` 精确到 ac_id；fake-claude 日志断言 FIXING prompt 含该 ac_id 与 per_ac 摘要。 |
 | AC-010 | pass | `tests/integration/test-gate.test.mjs`（missing → suite，vacuous 仍按 v1 block）+ per-ac 文件「映射非法」case（invalid + mapping_errors，miss=0） | `conductor/stages/shared.mjs` | 两种降级均不因映射本身 miss++。 |
