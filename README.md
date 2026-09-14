@@ -30,7 +30,7 @@ Loop Conductor is a single-machine orchestrator for Claude CLI agents. A task en
 - **The version rule is the only ground for merging.** With `H` = task-branch HEAD and `B` = base-branch HEAD: a review is needed unless a reviewer record exists with `outcome=ok ∧ head_sha=H`; a pre-commit run is needed unless a record exists with `outcome=ok ∧ head_sha=H ∧ base_sha=B`. Human notes cannot waive either one, and both are recomputed at the moment of approval.
 - **The paper trail is the product.** Every round writes into `dossier/<id>/` — spawn records, execution logs, raw streams, per-round hook settings, pre-commit step results, human gate requests, timeline, and a structured `events.jsonl`. Cost and round counts are recoverable per task after the fact.
 
-There is also a local web dashboard (`npm run dashboard`) for watching the loop and making the human decisions in a browser instead of on the command line. Its interface strings are Chinese; see [Screenshots](#screenshots).
+There is also a local web dashboard (`npm run dashboard`) for watching the loop and making the human decisions in a browser instead of on the command line. Its interface is in English; task data written by the kernel and the agents is shown as written. See [Screenshots](#screenshots).
 
 ## State machine
 
@@ -308,7 +308,7 @@ npm run dashboard   # http://127.0.0.1:4400
 node conductor/dashboard/server.mjs --port 4401 --no-auto-run   # another port, no automatic run after decisions
 ```
 
-The dashboard shows the four-column board (`ROUTING` / `AWAIT_HUMAN` / `FAILED_BOX` / `DONE`), a read-only monitoring drawer per task, a full-screen review page carrying the same buttons as the CLI, and a metrics view. Its interface is in Chinese. By default it starts `run` in the background after each decision it passes to the CLI.
+The dashboard shows the four-column board (`ROUTING` / `AWAIT_HUMAN` / `FAILED_BOX` / `DONE`), a read-only monitoring drawer per task, a full-screen review page carrying the same buttons as the CLI, and a metrics view. By default it starts `run` in the background after each decision it passes to the CLI.
 
 Everything about one task is in `dossier/<id>/`: `timeline.md` for people, `events.jsonl` for tools, `<role>-r<n>.stream.jsonl` for the raw agent streams. Across tasks, `node tools/dossier-stats.mjs` aggregates cost, rounds and gates. `tools/alerts-scan.mjs` and `tools/weekly-report.mjs` can post to Slack using `SLACK_WEBHOOK_URL`, or `SLACK_BOT_TOKEN` with `SLACK_DEFAULT_CHANNEL`, read from `.env` (see `.env.example`); the conductor itself never reads `.env`.
 
