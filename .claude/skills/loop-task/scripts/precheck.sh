@@ -1,10 +1,25 @@
 #!/usr/bin/env bash
-# loop-task 前置自检：node ≥ 24 + claude CLI 可解析。
+# loop-task 前置自检：定位 Loop Conductor 仓库 + node ≥ 24 + claude CLI 可解析。
 # 用法：eval "$(bash <skill目录>/scripts/precheck.sh)"  —— stdout 只输出 export 行；
 # 环境不可用时非零退出，原因在 stderr。
 # 背景（E2E 实测）：green gate 继承 PATH，node v22 会把本仓既有测试跑红（TAP 解析差异）；
 # 非交互 shell 通常没有 claude 在 PATH，conductor spawn 认 CLAUDE_BIN（缺省字面 'claude'）。
 set -euo pipefail
+
+# --- CONDUCTOR_ROOT：本脚本所在的仓库（scripts → loop-task → skills → .claude → 仓库根）。
+# cd -P 先把软链接（例如 ~/.claude/skills/loop-task）解析成真实路径，skill 从哪里加载都能找回仓库。
+here="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root="$(cd -P "$here/../../../.." && pwd)"
+if [ ! -f "$root/conductor/conductor.mjs" ]; then
+  echo "precheck: $root 不是 Loop Conductor 仓库（缺 conductor/conductor.mjs）；skill 要留在仓库的 .claude/skills/ 下，或用软链接指向那里" >&2
+  exit 1
+fi
+# conductor 把 CONDUCTOR_ROOT 当数据根（配置、state、worktrees 都跟着走）；本 skill 在仓库里跑 npm，只支持两者是同一目录。
+if [ -n "${CONDUCTOR_ROOT:-}" ] && [ "$(cd "$CONDUCTOR_ROOT" 2>/dev/null && pwd -P)" != "$root" ]; then
+  echo "precheck: 环境里的 CONDUCTOR_ROOT=$CONDUCTOR_ROOT 与本 skill 所在仓库 $root 不同；本 skill 只支持数据根就是仓库，先 unset CONDUCTOR_ROOT" >&2
+  exit 1
+fi
+echo "export CONDUCTOR_ROOT=\"$root\""
 
 # --- node ≥ 24：当前不达标时，从 nvm 里挑最新的 v24+ 前置到 PATH ---
 major="$(node -v 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/' || echo 0)"
