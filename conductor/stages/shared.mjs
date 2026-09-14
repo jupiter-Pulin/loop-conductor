@@ -22,9 +22,9 @@ export const HARNESS_ARTIFACTS = {
   // 写进 worktree-local .git/info/exclude 的 gitignore pattern。
   // node_modules：testCommand 常 `ln -s` 出一个 node_modules symlink，若不排除会被
   // commitAll 的 `git add -A` 提交进 task 分支，merge 时与目标 working tree 的 node_modules 冲突而中止。
-  patterns: ['/.claude_review_state.json', '/.loop-conductor/', '/.agent/', '/node_modules'],
+  patterns: ['/.claude_review_state.json', '/.agent/', '/node_modules'],
   // ls-files 检测「是否已被目标仓库追踪」用的名字（目录名直接传）。
-  tracked: ['.claude_review_state.json', '.loop-conductor', '.agent', 'node_modules'],
+  tracked: ['.claude_review_state.json', '.agent', 'node_modules'],
 };
 
 export { canStartSpawn };
