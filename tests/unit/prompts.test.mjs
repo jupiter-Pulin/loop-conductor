@@ -240,5 +240,5 @@ test('AC-026: reviewer 无 spec 时按 brief 判，编号 B-001…', () => {
   const p = buildReviewerPrompt(cfg, { id: ID, logPath: REVIEW_LOG, hasSpec: false, acList: '- B-001: …', diff: 'd' });
   assertNoResidual(p, 'reviewer-nospec');
   assert.match(p, /冷读下面的 brief 与 diff/);
-  assert.match(p, /无 spec 时按 brief 的目标与验收线索逐条判，编号 B-001…。/);
+  assert.match(p, /无 spec 时对照 brief 的目标判，编号 B-001…。/);
 });
