@@ -162,6 +162,7 @@ npm run conductor -- retry --rate-limited [--force]               # 批量恢复
 | node 版本警告 | `tests/integration/node-version-warning.test.mjs` |
 | web dashboard（看板聚合 + 详情 review + 同步/异步动作 + SSE） | `tests/integration/dashboard-server.test.mjs` |
 | reviewer 分诊段只在无 spec 时注入，base 分支名与 `diff --stat` 段恒在 | `tests/unit/prompts.test.mjs` |
+| dossier-stats 的 reviewer 分诊聚合（tests/full/未分诊的轮数、成本、时长；测试审后的 precommit 红与 merge 打回） | `tests/unit/dossier-stats.test.mjs` |
 
 ## 索引规则
 

@@ -383,6 +383,88 @@ test('runCli：--task 与 --json 两种模式在 router 任务上都工作（AC-
   assert.equal(JSON.parse(full.stdout).summary.router.tasks, 1);
 });
 
+// ---- reviewer 分诊（无 spec 任务的测试审试行）：summary 首行 mode=tests|full，按模式聚合，并数测试审的后效 ----
+
+/**
+ * 一个无 spec 任务的案卷：r2 测试审 ok → r3 precommit 红（后效 1）→ r4 merge 闸被人打回（后效 1）
+ * → r5 全审 fail → r6 precommit 又红（上一条 review 是 full，不计）。
+ */
+const TRIAGE_DOSSIER = {
+  'router-r1.json': { role: 'router', round: 1, cost_usd: 0.02 },
+  'router-r1.log.json': { role: 'router', outcome: 'ok', action: 'maker', summary: '无 spec，直接实现' },
+  'maker-r1.json': { role: 'maker', round: 1, cost_usd: 2 },
+  'maker-r1.log.json': { role: 'maker', outcome: 'ok', summary: 'B-001..003 done；tests +3；npm test 绿' },
+  'router-r2.json': { role: 'router', round: 2, cost_usd: 0.02 },
+  'router-r2.log.json': { role: 'router', outcome: 'ok', action: 'review', summary: '冷审' },
+  'reviewer-r2.json': { role: 'reviewer', round: 2, cost_usd: 0.3, duration_ms: 120000, head_sha: 'a'.repeat(40) },
+  'reviewer-r2.log.json': {
+    role: 'reviewer', outcome: 'ok', tier: 'unit',
+    summary: 'mode=tests 依据: 3 文件/120 行/tests 有改动\nB-001 pass tests/x.test.mjs:40 钉住；base 上会 fail；无 mock',
+  },
+  'router-r3.json': { role: 'router', round: 3, cost_usd: 0.02 },
+  'router-r3.log.json': { role: 'router', outcome: 'ok', action: 'precommit', tier: 'unit', summary: '跑 unit' },
+  'precommit-r3.json': ROUTER_DOSSIER['precommit-r3.json'],
+  'router-r4.json': { role: 'router', round: 4, cost_usd: 0.02 },
+  'router-r4.log.json': { role: 'router', outcome: 'ok', action: 'merge', summary: '申请合并' },
+  'human-r4.json': {
+    schema_version: 1, kind: 'merge', requested_by: 'kernel', summary: '申请合并', refs: [],
+    requested_at: '2026-09-15T00:00:00.000Z', decision: 'rejected', notes: '还差 B-002',
+  },
+  'router-r5.json': { role: 'router', round: 5, cost_usd: 0.02 },
+  'router-r5.log.json': { role: 'router', outcome: 'ok', action: 'review', summary: '再审' },
+  'reviewer-r5.json': { role: 'reviewer', round: 5, cost_usd: 1.1, duration_ms: 400000, head_sha: 'b'.repeat(40) },
+  'reviewer-r5.log.json': {
+    role: 'reviewer', outcome: 'fail', tier: 'unit',
+    summary: 'mode=full 依据: 4 文件/90 行/改公共接口\nB-002 fail src/y.mjs:8 未处理空输入',
+  },
+  'router-r6.json': { role: 'router', round: 6, cost_usd: 0.02 },
+  'router-r6.log.json': { role: 'router', outcome: 'ok', action: 'precommit', tier: 'unit', summary: '再跑 unit' },
+  'precommit-r6.json': ROUTER_DOSSIER['precommit-r3.json'],
+};
+
+test('collectStats：reviewer 按 summary 首行的 mode 分桶（tests/full/未分诊），并数测试审之后的 precommit 红与 merge 打回', (t) => {
+  const root = makeRoot(t);
+  writeTaskFixture(root, 'queue', 'task-20260915-500', {
+    runtime: { stage: 'ROUTING', spent_usd: 3.5 },
+    dossier: TRIAGE_DOSSIER,
+  });
+  // 旧口径的 reviewer（summary 没有 mode 行）→ 未分诊桶，数字不因新口径而变
+  writeTaskFixture(root, 'queue', 'task-20260915-501', {
+    runtime: { stage: 'ROUTING', spent_usd: 1.96 },
+    dossier: ROUTER_DOSSIER,
+  });
+
+  const { tasks, summary } = collectStats(root);
+  const triaged = tasks.find((x) => x.id === 'task-20260915-500');
+  const reviews = triaged.agent_records.filter((r) => r.role === 'reviewer');
+  assert.deepEqual(reviews.map((r) => [r.round, r.review_mode, r.duration_ms]), [[2, 'tests', 120000], [5, 'full', 400000]]);
+  assert.equal(triaged.agent_records.find((r) => r.role === 'maker').review_mode, null, 'mode 只属于 reviewer');
+  assert.equal(triaged.precommit_fail_after_tests_review, 1, 'r3 红在 r2 测试审之后；r6 红在 r5 全审之后，不计');
+  assert.equal(triaged.merge_rejected_after_tests_review, 1, 'r4 打回时最近一次 review 是 r2 测试审');
+
+  const legacy = tasks.find((x) => x.id === 'task-20260915-501');
+  assert.equal(legacy.agent_records.find((r) => r.role === 'reviewer').review_mode, null);
+  assert.equal(legacy.precommit_fail_after_tests_review, 0, '没有测试审就没有后效');
+
+  const r = summary.router;
+  assert.deepEqual(r.reviewer_by_mode, {
+    tests: { rounds: 1, fails: 0, cost_usd: 0.3, duration_ms: 120000 },
+    full: { rounds: 1, fails: 1, cost_usd: 1.1, duration_ms: 400000 },
+    unset: { rounds: 1, fails: 1, cost_usd: 0.4, duration_ms: 0 },
+  });
+  assert.equal(r.reviewer_rounds, 3, '总轮数口径不变');
+  assert.equal(r.precommit_fail_after_tests_review, 1);
+  assert.equal(r.merge_rejected_after_tests_review, 1);
+
+  const md = renderMarkdown({ tasks, summary });
+  assert.ok(md.includes('- reviewer 分诊：tests×1（$0.3，2 min，fail 0）；full×1（$1.1，6.7 min，fail 1）；未分诊×1（$0.4，0 min，fail 1）；tests 审后 precommit 红 1 次、merge 闸打回 1 次'), md);
+
+  const detail = runCli(['--task', 'task-20260915-500', root]);
+  assert.equal(detail.code, 0, detail.stderr);
+  assert.ok(detail.stdout.includes('reviewer 模式: r2 tests（$0.3，2 min），r5 full（$1.1，6.7 min）'), detail.stdout);
+  assert.ok(detail.stdout.includes('tests 审后: precommit 红 1 / merge 打回 1'), detail.stdout);
+});
+
 test('collectStats：只有旧任务的仓库里 router 小节为空结构，渲染不报错（AC-029）', (t) => {
   const root = makeRoot(t);
   writeTaskFixture(root, 'done', 'task-20260701-011', {

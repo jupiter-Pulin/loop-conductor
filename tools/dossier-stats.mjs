@@ -15,6 +15,8 @@ const TASK_DIR_RE = /^task-\d{8}-\d{3}$/;
 const ROUTER_SPAWN_RE = /^router-r\d+\.json$/;
 const PRECOMMIT_STEPS = ['build', 'service', 'unit', 'integration', 'e2e'];
 const TIERS = ['unit', 'integration', 'e2e'];
+/** reviewer 分诊模式的聚合桶：tests / full 来自 summary 首行，unset = 没有分诊行。 */
+const REVIEW_MODES = ['tests', 'full', 'unset'];
 
 function readJsonIf(p) {
   try {
@@ -141,8 +143,27 @@ export function collectTask(root, box, id) {
   };
 }
 
+/** reviewer 分诊模式：summary 首行 `mode=tests|full …`（无 spec 任务的分诊段约定）；没有 → null（未分诊）。 */
+const REVIEW_MODE_RE = /^mode=(tests|full)\b/;
+function reviewModeOf(rec) {
+  const first = String(rec?.summary ?? '').split('\n')[0].trim();
+  const m = first.match(REVIEW_MODE_RE);
+  return m ? m[1] : null;
+}
+
+/** 某轮之前最近一条 reviewer 记录（按轮次），没有 → null。 */
+function latestReviewerBefore(records, round) {
+  let best = null;
+  for (const r of records) {
+    if (r.role !== 'reviewer' || !(r.round < round)) continue;
+    if (best == null || r.round > best.round) best = r;
+  }
+  return best;
+}
+
 /**
- * 新状态机的逐任务证据（AC-029）：router 轮次、precommit 各步与 tier、各角色成本、人闸。
+ * 新状态机的逐任务证据（AC-029）：router 轮次、precommit 各步与 tier、各角色成本、人闸，
+ * 以及 reviewer 的分诊模式与测试审的后效。
  * 记录合成复用 `conductor/lib/records.mjs::composeRecords`——本工具不另写一套 log 解析。
  * P2b 的工作包字段（包数 / 并行轮数 / plan 次数）先按 0 输出并预留，字段名与后续实现对齐。
  */
@@ -154,6 +175,8 @@ function collectRouterEra(root, id, isRouter) {
     precommit_rounds: [],
     human_gates: [],
     role_cost_usd: {},
+    precommit_fail_after_tests_review: 0,
+    merge_rejected_after_tests_review: 0,
     packages_count: 0,
     parallel_rounds: 0,
     plan_runs: 0,
@@ -171,6 +194,19 @@ function collectRouterEra(root, id, isRouter) {
     roleCost[r.role] = round6((roleCost[r.role] ?? 0) + (r.cost_usd ?? 0));
   }
 
+  // 测试审的后效：一次 mode=tests 的 review 之后 precommit 红了、或 merge 闸被人打回，各计一次——
+  // 两者都是「轻审可能放过了什么」的可观测代理；合并后才发现的问题不进案卷，没有更好的数据源。
+  let precommitFailAfterTests = 0;
+  let mergeRejectedAfterTests = 0;
+  for (const r of records) {
+    const precommitFail = r.role === 'precommit' && r.outcome === 'fail';
+    const mergeRejected = r.role === 'human' && r.kind === 'merge' && r.decision === 'rejected';
+    if (!precommitFail && !mergeRejected) continue;
+    if (reviewModeOf(latestReviewerBefore(records, r.round)) !== 'tests') continue;
+    if (precommitFail) precommitFailAfterTests += 1;
+    else mergeRejectedAfterTests += 1;
+  }
+
   return {
     is_router: true,
     router_rounds: records.filter((r) => r.role === 'router').map((r) => ({
@@ -181,6 +217,8 @@ function collectRouterEra(root, id, isRouter) {
       .map((r) => ({
         round: r.round, role: r.role, package: r.package, mode: r.mode, outcome: r.outcome,
         tier: r.tier, product: r.product, truncated: r.truncated === true, cost_usd: r.cost_usd ?? 0,
+        duration_ms: r.duration_ms ?? null,
+        review_mode: r.role === 'reviewer' ? reviewModeOf(r) : null,
       })),
     precommit_rounds: records.filter((r) => r.role === 'precommit').map((r) => ({
       round: r.round,
@@ -193,6 +231,8 @@ function collectRouterEra(root, id, isRouter) {
       round: r.round, kind: r.kind, decision: r.decision,
     })),
     role_cost_usd: roleCost,
+    precommit_fail_after_tests_review: precommitFailAfterTests,
+    merge_rejected_after_tests_review: mergeRejectedAfterTests,
     // P2b 预留：本阶段 packagesEnabled=false，恒为 0。
     packages_count: 0,
     parallel_rounds: 0,
@@ -292,6 +332,18 @@ function collectRouterSummary(tasks) {
     }
   }
 
+  // reviewer 按分诊模式聚合：轮数 / fail / 成本 / 时长。summary 首行没有 mode 的（有 spec 的任务、
+  // 分诊段落地前的旧案卷）归 unset，旧案卷的数字不因新口径而变。
+  const byMode = Object.fromEntries(REVIEW_MODES.map((m) => [m, { rounds: 0, fails: 0, cost_usd: 0, duration_ms: 0 }]));
+  for (const r of agents) {
+    if (r.role !== 'reviewer') continue;
+    const b = byMode[r.review_mode ?? 'unset'];
+    b.rounds += 1;
+    if (r.outcome === 'fail') b.fails += 1;
+    b.cost_usd = round6(b.cost_usd + (r.cost_usd ?? 0));
+    b.duration_ms += r.duration_ms ?? 0;
+  }
+
   return {
     tasks: routerTasks.length,
     rounds_total: routerRounds.length,
@@ -301,6 +353,9 @@ function collectRouterSummary(tasks) {
     maker_truncated: agents.filter((r) => r.role === 'maker' && r.truncated).length,
     reviewer_fails: agents.filter((r) => r.role === 'reviewer' && r.outcome === 'fail').length,
     reviewer_rounds: agents.filter((r) => r.role === 'reviewer').length,
+    reviewer_by_mode: byMode,
+    precommit_fail_after_tests_review: routerTasks.reduce((s, t) => s + t.precommit_fail_after_tests_review, 0),
+    merge_rejected_after_tests_review: routerTasks.reduce((s, t) => s + t.merge_rejected_after_tests_review, 0),
     precommit: {
       runs: precommits.length,
       ok: precommits.filter((p) => p.outcome === 'ok').length,
@@ -319,6 +374,10 @@ function collectRouterSummary(tasks) {
 
 function round6(n) {
   return Math.round(n * 1e6) / 1e6;
+}
+
+function minutes(ms) {
+  return Math.round(((ms ?? 0) / 60000) * 10) / 10;
 }
 
 function pct(part, total) {
@@ -382,6 +441,11 @@ function renderRouterSection(router) {
   L.push(`- router 任务：${router.tasks}；router 轮次：${router.rounds_total}；动作分布：${actions}`);
   L.push(`- router 失效（product≠ok）：${router.router_product_not_ok}；maker 无交付：${router.maker_product_not_ok}；maker 截断：${router.maker_truncated}`);
   L.push(`- reviewer：${router.reviewer_rounds} 轮（fail ${router.reviewer_fails}）`);
+  const modes = REVIEW_MODES.map((m) => {
+    const b = router.reviewer_by_mode[m];
+    return `${m === 'unset' ? '未分诊' : m}×${b.rounds}（$${b.cost_usd}，${minutes(b.duration_ms)} min，fail ${b.fails}）`;
+  }).join('；');
+  L.push(`- reviewer 分诊：${modes}；tests 审后 precommit 红 ${router.precommit_fail_after_tests_review} 次、merge 闸打回 ${router.merge_rejected_after_tests_review} 次`);
   L.push(`- precommit：${router.precommit.runs} 次（ok ${router.precommit.ok} / fail ${router.precommit.fail}）；tier 分布：${tiers}`);
   L.push(`- precommit 各步：${steps}`);
   L.push(`- 人闸：spec×${router.human_gates.spec}，merge×${router.human_gates.merge}，help×${router.human_gates.help}`);
@@ -456,6 +520,9 @@ export function renderTaskDetail(t) {
     lines.push(`precommit 各步: ${t.precommit_rounds.map((p) => p.steps.map((s) => `${s.step}:${s.status}`).join(',')).join('；') || '-'}`);
     lines.push(`人闸: ${t.human_gates.map((g) => `${g.kind}:${g.decision ?? 'pending'}`).join('，') || '-'}`);
     lines.push(`各角色成本: ${Object.entries(t.role_cost_usd).map(([k, v]) => `${k} $${v}`).join('，') || '-'}`);
+    const reviews = t.agent_records.filter((r) => r.role === 'reviewer');
+    lines.push(`reviewer 模式: ${reviews.map((r) => `r${r.round} ${r.review_mode ?? '未分诊'}（$${r.cost_usd}，${minutes(r.duration_ms)} min）`).join('，') || '-'}`);
+    lines.push(`tests 审后: precommit 红 ${t.precommit_fail_after_tests_review} / merge 打回 ${t.merge_rejected_after_tests_review}`);
     lines.push(`工作包(P2b 预留): 包数 ${t.packages_count} / 并行轮数 ${t.parallel_rounds} / plan 次数 ${t.plan_runs}`);
   }
   lines.push(`成本(spent_usd): ${t.spent_usd}`);
