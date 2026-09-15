@@ -3,10 +3,12 @@
 // reviewer 永远审整份代码与全部 AC（AC-039）：不带包段、不接受 packages、记录无 scope。
 // spawn 记录盖 `head_sha` = 派出时的任务分支 HEAD——版本规则（Invariant 6）就靠这个字段
 // 判断「这次 review 对的是哪一版」，人的 notes 改不了它。
-// 无 spec 的任务把 brief 当契约，reviewer 自编 B-001… 编号（prompt 的 base 段已写死此约定）。
+// 无 spec 的任务把 brief 当契约，reviewer 自编 B-001… 编号（prompt 的 base 段已写死此约定），
+// 并先按注入的 `git diff --stat` 分诊（小改动只审测试是否钉住目标）；分诊是 reviewer 的判断，
+// 内核只负责把 stat 与 base 分支名作为事实给它。
 
 import * as state from '../../lib/state.mjs';
-import { diffAgainstBase, diffNameStatusAgainstBase, ensureWorktree } from '../../lib/git.mjs';
+import { diffAgainstBase, diffNameStatusAgainstBase, diffStatAgainstBase, ensureWorktree } from '../../lib/git.mjs';
 import { buildReviewerPrompt } from '../../lib/prompts.mjs';
 import { logPathFor } from '../../lib/agent-settings.mjs';
 import { HARNESS_ARTIFACTS, rateLimitedToBox, worktreePath } from '../shared.mjs';
@@ -49,6 +51,8 @@ export default async function reviewAction(ts, cfg, { round, records }) {
     acList: acListFor(cfg, id, hasSpec, readBriefText(ts)),
     hasSpec,
     humanNotes: specGateNotes(records),
+    base: ts.task.baseBranch,
+    diffStat: diffStatAgainstBase(wt, ts.task.baseBranch),
     diff: diffSection(wt, ts.task.baseBranch, cfg),
   });
 

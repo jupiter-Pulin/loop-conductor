@@ -640,7 +640,7 @@ E. log summary
 ```text
 冷读下面的 {{spec 或 brief}} 与 diff（整份任务分支相对 base）。不跑测试，不改代码。逐条 AC 判 pass 或 fail，fail 必须带 文件:行号；同时判断测试是否钉住该 AC。声明本次 diff 触及的最高测试层级 tier。
 有工作包接口约定时，另检查包与包之间的协作：调用签名、事件、返回值是否与约定一致，不一致记在相关 AC 的 fail 行，或以 note: 开头的独立行。文件边界不是判据：某包改了别包声明的文件不算问题，只看行为。
-用 Write 增量写 {{log_path}}：判完一条就重写整份 JSON；未判完时 outcome=fail 且 summary 末行写「未判: AC-…」；全部 AC pass 才 ok。
+用 Write 增量写 {{log_path}}：判完一条就重写整份 JSON；未判完时 outcome=fail 且 summary 末行写「未判: AC-…」；全部 AC pass 才 ok。summary 每条一行 ≤ 80 字，note ≤ 3 条，总长 ≤ 2000 字符，超长整份作废。
 {"role":"reviewer","outcome":"ok|fail","tier":"unit|integration|e2e","summary":"AC-001 pass\nAC-002 fail src/x.mjs:40 <原因>\nnote: <协作问题>"}
 无 spec 时对照 brief 的目标判，编号 B-001…。
 ```
@@ -651,6 +651,13 @@ E. log summary
 [人审补充约束] {{spec 闸 human notes 原文}}
 
 [工作包接口约定] {{每包一行：P-xxx title — interfaces}}
+```
+
+无 spec 的任务另注入分诊段（有 spec 时绝不出现；`{{base}}` = 任务的 base 分支名，内核同时把 `git diff --stat` 作为独立段注入每一份 reviewer prompt）。分诊是 reviewer 自己的判断：内核不加字段、不改 log 契约，模式只写在 summary 首行；只能从测试审升为全审，不能反向；试行阈值 6 文件 / 300 行，按 `tools/dossier-stats.mjs` 的分诊统计校准。
+
+```text
+[分诊] 先看下面的 diff --stat。文件 ≤ 6 ∧ 行数 ≤ 300 ∧ 有测试文件改动 → 测试审；否则全审。测试审途中发现改动触及公共接口、数据契约，或删改了既有测试 → 升为全审，不可反向。summary 首行写 mode=tests|full 与依据（文件数/行数/测试改动）。
+测试审：每条 B-xxx 只答两问——哪个测试钉住它（文件:行）；它在 base（{{base}}）上会不会失败、有没有 mock 掉被测行为，用 git show {{base}}:<path> 看旧实现。没有测试钉住的目标判 fail。不追调用链、不审「保持不变」类，但既有测试被删、跳过或削弱仍判 fail。两种模式都必须声明 tier。
 ```
 
 **few-shot**
@@ -736,7 +743,7 @@ G. log summary（增量示例：判到第 3 条时的文件内容）
 **G. 角色、工具、hook、模型**
 
 - AC-025: 各角色的 cwd、`--tools`、PreToolUse 白名单、Stop hook、maxTurns 与 §角色表逐项一致：router 只有 `Write`；reviewer 只读三件 + `Bash(git diff|log|show:*)` + `Write`；spec 写 spec 时白名单为 spec 路径 + packages 路径 + log 路径，方案模式时**仅** packages 路径 + log 路径（对 spec 路径的 Write/Edit 被拒）；reviewer 与 router 的白名单仅 log 路径；maker 沿用 git 护栏。逐轮 `.settings.json` 落盘 dossier。
-- AC-026: `agents/` 只含 `router-agent.md`、`spec-agent.md`、`maker-agent.md`、`reviewer-agent.md` 与 `fewshot/{router,spec,maker,reviewer}.md`；`conductor/lib/prompts.mjs` 拼装后不残留 `{{`；每个 prompt 含对应 log 绝对路径与「用 Write 工具」字样；maker 修复轮 prompt 含最近 reviewer 记录 summary 或 precommit 失败步骤 tail；包 maker prompt 含 `[工作包]` 段（id、title、goal、acs、files、interfaces、并行包声明文件；重做时含整体 review 对本包 AC 的 fail 行与 note 行，或 conflict_files 与旧分支参考语句）；无 spec 时含「先写一个在当前代码上失败的复现测试」段；`plan_active` 时 reviewer prompt 含 `[工作包接口约定]` 段且 AC 清单为全部 AC；方案模式 spec prompt 含冻结 spec 全文、maker 记录 summary 与 `git diff --stat`。
+- AC-026: `agents/` 只含 `router-agent.md`、`spec-agent.md`、`maker-agent.md`、`reviewer-agent.md` 与 `fewshot/{router,spec,maker,reviewer}.md`；`conductor/lib/prompts.mjs` 拼装后不残留 `{{`；每个 prompt 含对应 log 绝对路径与「用 Write 工具」字样；maker 修复轮 prompt 含最近 reviewer 记录 summary 或 precommit 失败步骤 tail；包 maker prompt 含 `[工作包]` 段（id、title、goal、acs、files、interfaces、并行包声明文件；重做时含整体 review 对本包 AC 的 fail 行与 note 行，或 conflict_files 与旧分支参考语句）；无 spec 时含「先写一个在当前代码上失败的复现测试」段；`plan_active` 时 reviewer prompt 含 `[工作包接口约定]` 段且 AC 清单为全部 AC；reviewer prompt 恒含 `diff --stat` 段，无 spec 时另含 `[分诊]` 段且 base 分支名已填入 `git show <base>:<path>`（有 spec 时绝不出现）；方案模式 spec prompt 含冻结 spec 全文、maker 记录 summary 与 `git diff --stat`。
 - AC-027: `loadCfg` 对 §config 列出的每个遗留键打印一次 `legacy config key ignored: <key>` 警告；`models` 缺键回落 `claude-opus-5`；`maxTurns` 含 `plan` 键；`maxParallelPackages` 默认 2、`maxPackages` 默认 12、`packagesEnabled` 默认 false（P3 移除）、`fuseStreak` 默认 3、`precommitStepTimeoutMs` 默认等于 `greenGateTimeoutMs`、`precommitLockTimeoutMs` 默认 1800000。
 
 **H. 删除与兼容**

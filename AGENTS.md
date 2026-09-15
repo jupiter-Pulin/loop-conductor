@@ -52,7 +52,7 @@
 | router | `agents/router-agent.md` | conductor root | `Write` | 只有自己的 log | 4 | 读 brief + 记录 + 内核事实，从闭集选一个动作。永不读 spec 正文、diff、代码。 |
 | spec | `agents/spec-agent.md` | `worktrees/<id>.spec-ro`（一次性 detached @ base） | 只读三件 + `git log/blame/show` + `Write,Edit` | spec 路径 + log | 40 | 把 brief 写成 spec，覆盖全部需求；范围疑问进「待决问题」，不自行裁剪。 |
 | maker | `agents/maker-agent.md` | `worktrees/<id>`（分支 `task/<id>`） | 全部（`Bash` 免审批） | 走 maker-git-guard，不走白名单 | 70 | 实现 AC，让 `testCommand` 全绿；不删不跳既有测试。 |
-| reviewer | `agents/reviewer-agent.md` | `worktrees/<id>` | 只读三件 + `git diff/log/show` + `Write` | 只有自己的 log | 40 | 冷读 spec/brief 与整份 diff，逐条 AC 判 pass/fail，声明 tier。 |
+| reviewer | `agents/reviewer-agent.md` | `worktrees/<id>` | 只读三件 + `git diff/log/show` + `Write` | 只有自己的 log | 40 | 冷读 spec/brief 与整份 diff，逐条 AC 判 pass/fail，声明 tier。无 spec 时先按注入的 `diff --stat` 分诊：≤6 文件 ∧ ≤300 行 ∧ 有测试改动 → 测试审（只判每条目标有没有测试钉住、在 base 上会不会失败），否则全审；只能升不能降；summary 首行 `mode=tests\|full`。 |
 
 判断力靠 `agents/fewshot/*.md` 传，固定上下文越短越好。每个 agent 的唯一交付信号是 `dossier/<id>/<role>-r<n>.log.json`——内核读文件、不推断、不自动重派。
 
@@ -161,6 +161,7 @@ npm run conductor -- retry --rate-limited [--force]               # 批量恢复
 | 遗留任务：配置键警告、未知 stage 跳过、动词一律拒绝、status/spy 并存 | `tests/integration/legacy-compat.test.mjs` |
 | node 版本警告 | `tests/integration/node-version-warning.test.mjs` |
 | web dashboard（看板聚合 + 详情 review + 同步/异步动作 + SSE） | `tests/integration/dashboard-server.test.mjs` |
+| reviewer 分诊段只在无 spec 时注入，base 分支名与 `diff --stat` 段恒在 | `tests/unit/prompts.test.mjs` |
 
 ## 索引规则
 

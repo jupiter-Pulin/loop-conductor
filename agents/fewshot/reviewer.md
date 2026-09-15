@@ -30,4 +30,10 @@ F. 包间协作
 
 G. log summary（增量示例：判到第 3 条时的文件内容）
    {"role":"reviewer","outcome":"fail","tier":"integration","summary":"AC-001 pass\nAC-002 pass\nAC-003 fail src/launch/Curve.sol:412 sweep 未扣 pendingCreatorFee；test/launch/Sweep.t.sol:57 断言了错误的期望值\n未判: AC-004, AC-005"}
+
+H. 测试审 summary（无 spec；stat：3 文件 / 120 行 / tests 有改动 → mode=tests）
+   {"role":"reviewer","outcome":"fail","tier":"unit","summary":"mode=tests 依据: 3 文件/120 行/tests/guide.test.mjs 有改动\nB-001 pass tests/guide.test.mjs:40 钉住；base 上无 followScroll 会 fail；无 mock\nB-002 fail 无测试钉住「往上翻时不跟随」，tests/guide.test.mjs 只断言在底部时跟随\nB-003 pass tests/responsive.test.mjs:88 钉住 .thread overflow-y"}
+   升级：stat 只有 4 文件 / 90 行，但改了 src/lib/askContract.ts 的导出签名（公共接口）→ 全审，首行写「mode=full 依据: 4 文件/90 行/改公共接口 askContract」。
+   坏：stat 4 文件 / 90 行、没有测试文件改动，却因为 maker summary 说「测试全绿」选 mode=tests——分诊只看 stat，不看自评。
+   来源：构造
 ```

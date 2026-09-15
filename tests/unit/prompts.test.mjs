@@ -1,7 +1,8 @@
 // 单元：prompt 拼装（AC-026 的纯函数面）。
 // 三条硬约束：①拼装后不残留 `{{`（漏填占位 = agent 看到花括号乱码）；②每份 prompt 含自己
 // log 的绝对路径与「用 Write 工具」一句（防 Read-before-Write 撞墙）；③条件段按情形出现/不出现
-// ——没有工作包的任务绝不能看到工作包段，无 spec 的任务必须看到「先写复现测试」段。
+// ——没有工作包的任务绝不能看到工作包段，无 spec 的任务必须看到「先写复现测试」段，
+// 有 spec 的任务绝不能看到 reviewer 的分诊段。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -208,18 +209,24 @@ test('AC-026/037: maker 重做轮 —— 附整体 review 的 fail/note 行与 c
 
 const REVIEW_LOG = `/abs/dossier/${ID}/reviewer-r1.log.json`;
 
-test('AC-026/039: reviewer prompt —— 全部 AC + diff；无方案时不含接口约定段', () => {
+test('AC-026/039: reviewer prompt —— 全部 AC + diff --stat + diff；无方案时不含接口约定段，有 spec 时不含分诊段', () => {
   const p = buildReviewerPrompt(cfg, {
     id: ID, logPath: REVIEW_LOG,
     acList: '- AC-001: …\n- AC-002: …',
+    base: 'main',
+    diffStat: ' src/x.mjs | 10 +++++\n 1 file changed, 10 insertions(+)',
     diff: 'diff --git a/src/x.mjs b/src/x.mjs',
   });
   assertNoResidual(p, 'reviewer');
   assertDelivery(p, REVIEW_LOG, 'reviewer');
   assert.match(p, /冷读下面的 spec 与 diff（整份任务分支相对 base）/);
   assert.match(p, /声明本次 diff 触及的最高测试层级 tier/);
+  assert.match(p, /总长 ≤ 2000 字符，超长整份作废/, 'summary 纪律对两种任务都说');
   assert.match(p, /- AC-001: …/);
+  assert.match(p, /# diff --stat（任务分支相对 base main）\n\nsrc\/x\.mjs \| 10/);
+  assert.ok(p.indexOf('# diff --stat') < p.indexOf('# diff（任务分支相对 base）'), 'stat 段在 diff 段之前');
   assert.match(p, /diff --git/);
+  assert.equal(/\[分诊\]/.test(p), false, '有 spec 的任务永远全审，连分诊段都不给它看（few-shot H 仍共用，那是样例不是指令）');
   assert.equal(/\[工作包接口约定\]/.test(p), false);
   assert.equal(/\[人审补充约束\]/.test(p), false);
 });
@@ -236,9 +243,26 @@ test('AC-026: reviewer prompt —— plan_active 时附 [工作包接口约定] 
   assert.match(p, /\[工作包接口约定\] P-001 Factory — 暴露 createToken\(LaunchParams\)/);
 });
 
-test('AC-026: reviewer 无 spec 时按 brief 判，编号 B-001…', () => {
-  const p = buildReviewerPrompt(cfg, { id: ID, logPath: REVIEW_LOG, hasSpec: false, acList: '- B-001: …', diff: 'd' });
+test('AC-026: reviewer 无 spec 时按 brief 判，编号 B-001…，并带 [分诊] 段（base 分支名已填）', () => {
+  const p = buildReviewerPrompt(cfg, {
+    id: ID, logPath: REVIEW_LOG, hasSpec: false, acList: '- B-001: …', base: 'dev',
+    diffStat: ' 3 files changed, 120 insertions(+)', diff: 'd',
+  });
   assertNoResidual(p, 'reviewer-nospec');
   assert.match(p, /冷读下面的 brief 与 diff/);
   assert.match(p, /无 spec 时对照 brief 的目标判，编号 B-001…。/);
+  assert.match(p, /\[分诊\] 先看下面的 diff --stat。文件 ≤ 6 ∧ 行数 ≤ 300 ∧ 有测试文件改动 → 测试审；否则全审/);
+  assert.match(p, /升为全审，不可反向/);
+  assert.match(p, /summary 首行写 mode=tests\|full 与依据/);
+  assert.match(p, /它在 base（dev）上会不会失败/);
+  assert.match(p, /用 git show dev:<path> 看旧实现/, 'base 分支名填进 git show 指令');
+  assert.match(p, /两种模式都必须声明 tier/);
+  assert.match(p, /# diff --stat（任务分支相对 base dev）\n\n3 files changed/);
+  assert.ok(p.indexOf('[分诊]') < p.indexOf('# 裁决样例'), '分诊段属于固定上下文，在 few-shot 之前');
+
+  // base 未知时占位不残留，stat 为空时给明示占位
+  const bare = buildReviewerPrompt(cfg, { id: ID, logPath: REVIEW_LOG, hasSpec: false, acList: '- B-001: …', diff: 'd' });
+  assertNoResidual(bare, 'reviewer-nospec-nobase');
+  assert.match(bare, /git show <base 分支>:<path>/);
+  assert.match(bare, /# diff --stat（任务分支相对 base <base 分支>）\n\n\(空\)/);
 });

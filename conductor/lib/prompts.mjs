@@ -208,8 +208,10 @@ export function buildMakerPrompt(cfg, {
 // ---- reviewer ----
 
 /**
- * reviewer：全部 AC + 人审补充约束 + 各包接口约定（有方案时）+ diff + log 路径。
+ * reviewer：全部 AC + 人审补充约束 + 各包接口约定（有方案时）+ diff --stat + diff + log 路径。
  * 永远是整体复审：AC 清单恒为 spec 全部 AC，不带包段、不接受 packages。
+ * 无 spec 的任务另注入 [分诊] 段（含 base 分支名，供 git show <base>:<path> 看旧实现）：brief 即契约，
+ * 改动小时只审测试是否钉住目标；有 spec 的任务连这段都看不到，永远全审。
  */
 export function buildReviewerPrompt(cfg, {
   id,
@@ -218,12 +220,16 @@ export function buildReviewerPrompt(cfg, {
   hasSpec = true,
   humanNotes = '',
   packageInterfaces = '',
+  base = null,
+  diffStat = '',
   diff = '',
 } = {}) {
   const s = readRolePrompt(cfg, 'reviewer');
+  const baseRef = String(base ?? '').trim() || '<base 分支>';
   const parts = [
     fill(s.get('base') ?? '', { 'spec 或 brief': hasSpec ? 'spec' : 'brief', log_path: logPath }),
   ];
+  if (!hasSpec) parts.push(fill(s.get('triage') ?? '', { base: baseRef }));
   if (String(humanNotes ?? '').trim()) {
     parts.push(fill(s.get('human-notes') ?? '', { 'spec 闸 human notes 原文': humanNotes.trim() }));
   }
@@ -234,6 +240,8 @@ export function buildReviewerPrompt(cfg, {
   }
   parts.push(section('裁决样例', readFewShot(cfg, 'reviewer')));
   parts.push(section(`任务 ${id} 的全部 AC`, acList));
+  // stat 段恒在（分诊段说的「下面的 diff --stat」就是它）；空 diff 也给明示占位，不留空洞。
+  parts.push(section(`diff --stat（任务分支相对 base ${baseRef}）`, String(diffStat ?? '').trim() || '(空)'));
   parts.push(section('diff（任务分支相对 base）', diff));
   parts.push(logDelivery(logPath));
   return assemble(parts);
