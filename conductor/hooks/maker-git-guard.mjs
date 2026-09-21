@@ -1,5 +1,9 @@
 #!/usr/bin/env node
-// hooks/maker-git-guard.mjs — maker 的 PreToolUse(Bash) hook：git 破坏性操作护栏。
+// hooks/maker-git-guard.mjs — 有执行能力的角色（maker / worker:sandbox / worker:write）的
+// PreToolUse(Bash) hook：git 破坏性操作护栏 + 嵌套 claude CLI 护栏。
+// 这是**命令文本**护栏，尽力而为，不是隔离：它拦得住模型顺手敲出来的危险命令，拦不住刻意绕行
+// （脚本里再调、换个解释器）。真正的文件 / 网络 / 进程隔离只能来自宿主运行时的 OS 沙盒
+// （workerSandbox），以及内核每轮执行后的机械核对（lib/integrity.mjs）。
 // maker 只负责改 worktree 代码；commit/merge/清理由 conductor 负责。放行本地 commit
 // （无害，commitAll 兜底），拦截 push 与不可逆操作（exit 2 阻断，stderr 喂回模型自纠）。
 // 判定逻辑移植自一个 git-safety hook 脚本（去引号防误报、
@@ -131,6 +135,24 @@ function extractSubstitutions(command) {
   return results;
 }
 
+/**
+ * 嵌套的 claude CLI：worker 自己再起一个 agent 会话 = 不经内核授权、不入任务成本、不受停止控制的
+ * 子委派。本版不开放递归委派（要再拆任务就回到 router），所以命令词是 claude 的片段一律拦。
+ */
+function nestedAgentInvocation(segment) {
+  const tokens = segment.trim().split(/\s+/).filter((t) => t !== '' && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t));
+  if (tokens.length === 0) return null;
+  // 片段里任何位置出现 claude 这个词（`npx claude`、`npm exec claude`、`pnpm dlx claude`、
+  // `timeout 60 claude`、`/usr/local/bin/claude` …）都算；只读 / 查询类的命令词豁免，
+  // 免得 `echo claude`、`which claude`、`grep claude README` 被误伤。带尾斜杠的 `claude/` 是目录，不算。
+  const harmless = new Set(['echo', 'printf', 'grep', 'rg', 'cat', 'ls', 'cd', 'mkdir', 'which', 'type', 'git', 'find', 'head', 'tail', 'wc', 'sed', 'awk']);
+  if (harmless.has(tokens[0])) return null;
+  const hit = tokens.some((t) => t === 'claude' || t.endsWith('/claude') || t === '@anthropic-ai/claude-code' || t.startsWith('@anthropic-ai/claude-code@'));
+  return hit
+    ? '嵌套调用 claude CLI（不入账、不继承限制的子委派；需要再拆任务请在 log 里说明，由 router 派）'
+    : null;
+}
+
 function findDanger(command) {
   let segments = stripQuoted(command).split(/[;|&\n]+/);
   // sh -c '<payload>' 的引号内容是真要执行的命令，单独展开判定。
@@ -139,6 +161,8 @@ function findDanger(command) {
   }
   segments = segments.concat(extractSubstitutions(command).flatMap((inner) => inner.split(/[;|&\n]+/)));
   for (const segment of segments) {
+    const nested = nestedAgentInvocation(segment);
+    if (nested) return nested;
     const invocation = gitInvocation(segment);
     if (!invocation) continue;
     const danger = judge(invocation);

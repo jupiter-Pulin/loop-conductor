@@ -48,25 +48,29 @@ test('AC-003：merge 在版本规则未满足时被拒', (t) => {
   assert.equal(env.findTask(id).runtime.awaiting.kind, 'help', '被拒后是 router 自己再求助，不是 merge 闸');
 });
 
-test('AC-003：precommit 在当前 HEAD 无 reviewer 记录 / tier 低于声明时被拒', (t) => {
+// precommit 现在可以在 review 之前当「集成检查」跑（router 选层级）；卡层级的地方有两处：
+// reviewer 在当前 HEAD 声明过层级后，低于它的 precommit 动作被拒；merge 资格由 needPrecommit 再卡一次
+// ——review 之前那次较低层级的通过记录，不足以让 merge 闸打开。
+test('AC-003：precommit 可先于 review 当集成检查；低于 reviewer 声明层级的被拒，且之前的低层级通过不足以 merge', (t) => {
   const { env, id } = newRouterEnv(t);
   env.setScenario([
     routerStep('maker'),
     makerStep(),
-    routerStep('precommit', { tier: 'unit', summary: '还没 review 就想跑 precommit' }),
+    routerStep('precommit', { tier: 'unit', summary: 'review 之前先跑一次集成检查' }),
     routerStep('review'),
     reviewerStep({ tier: 'integration', summary: 'B-001 pass' }),
     routerStep('precommit', { tier: 'unit', summary: 'tier 比 reviewer 声明的低' }),
-    routerStep('human', { summary: '停在这里' }),
+    routerStep('merge', { summary: '拿 review 之前那次 unit 通过去申请合并' }),
   ]);
   assert.equal(env.run('run').status, 0);
 
+  assert.equal(env.readJson(env.dossier(id, 'precommit-r2.json')).outcome, 'ok', 'review 之前的集成检查照常执行并留记录');
   const rejected = rejections(env, id);
-  assert.deepEqual(rejected.map((r) => r.action), ['precommit', 'precommit']);
-  assert.match(rejected[0].reason, /没有 reviewer 记录/);
-  assert.match(rejected[1].reason, /低于 reviewer 在当前 HEAD 声明的 integration/);
-  assert.ok(!env.exists(env.dossier(id, 'precommit-r3.json')), '被拒不得留下 precommit 记录');
-  assert.ok(!env.exists(env.dossier(id, 'precommit-r6.json')));
+  assert.deepEqual(rejected.map((r) => r.action), ['precommit', 'merge']);
+  assert.match(rejected[0].reason, /低于 reviewer 在当前 HEAD 声明的 integration/);
+  assert.match(rejected[1].reason, /need_precommit=true/, 'unit 层级的通过记录低于 reviewer 声明的 integration，不算数');
+  assert.ok(!env.exists(env.dossier(id, 'precommit-r4.json')), '被拒不得留下 precommit 记录');
+  assert.equal(env.findTask(id).runtime.awaiting.kind, 'help', '连续两次被拒 → 内核开 help 闸，而不是 merge 闸');
 });
 
 test('AC-003：曾产出 spec 但未批准时，maker 被拒；plan 在阶段闸关时被拒', (t) => {

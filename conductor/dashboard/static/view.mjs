@@ -135,6 +135,73 @@ export function parseRouteHash(hash) {
   return { view: 'board' };
 }
 
+// ---- spec 摘要面板支撑（纯函数）：状态说明 + 引用回原文 ----
+
+/**
+ * 摘要状态 → { className, label, note }。
+ * 除 valid 外一律说清「现在是什么处境、router 实际在读什么」——空摘要绝不画成没事一样。
+ * 状态值域来自 lib/digest-store.mjs::digestStateFor（none / missing / invalid / exhausted / valid）。
+ */
+const DIGEST_STATES = {
+  valid: { className: 'chip-pass', label: 'valid', note: null },
+  missing: {
+    className: 'chip-unknown',
+    label: 'missing',
+    note: 'No digest for this spec version yet — the next run writes one before the router reads the spec.',
+  },
+  invalid: {
+    className: 'chip-fail',
+    label: 'invalid',
+    note: 'The digest on disk fails the mechanical check against this spec version, so it is not handed to the router. The kernel feeds the errors back and retries.',
+  },
+  exhausted: {
+    className: 'chip-fail',
+    label: 'exhausted',
+    note: 'Degraded: the retry budget is used up, so the router reads the spec source directly. Redo it with `conductor digest <id> --force`.',
+  },
+  none: {
+    className: 'chip-unknown',
+    label: 'no spec',
+    note: 'This task has no spec yet (the brief is the contract), so there is nothing to digest.',
+  },
+};
+
+export function digestStateInfo(state) {
+  return DIGEST_STATES[state] ?? { className: 'chip-unknown', label: String(state ?? 'unknown'), note: 'Unknown digest state.' };
+}
+
+/** 引用 { lines:[a,b] } → 展示标签 `L12` / `L12-18`；不成形的引用给 `L?`。 */
+export function refLabel(ref) {
+  const range = Array.isArray(ref?.lines) ? ref.lines : null;
+  if (!range || range.length !== 2 || !Number.isFinite(range[0]) || !Number.isFinite(range[1])) return 'L?';
+  return range[0] === range[1] ? `L${range[0]}` : `L${range[0]}-${range[1]}`;
+}
+
+/** 行数口径与 lib/spec-version.mjs::splitLines 一致：末尾换行不多算一行。 */
+function splitSourceLines(text) {
+  const lines = String(text ?? '').split('\n');
+  if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+  return lines;
+}
+
+/**
+ * 原文 + 引用 → 被引用的那几行（带行号，`  12| 内容`）。
+ * 原文缺失返回 ''；行号越界夹到文档范围内（快照缺失退回当前原文时引用可能已经对不上，
+ * 宁可少给几行也不抛错）。
+ */
+export function refSourceText(source, ref) {
+  const lines = splitSourceLines(source);
+  if (lines.length === 0 || String(source ?? '') === '') return '';
+  const range = Array.isArray(ref?.lines) ? ref.lines : null;
+  if (!range || !Number.isFinite(range[0]) || !Number.isFinite(range[1])) return '';
+  const start = Math.max(1, Math.min(lines.length, Math.trunc(range[0])));
+  const end = Math.max(start, Math.min(lines.length, Math.trunc(range[1])));
+  const width = String(end).length;
+  const out = [];
+  for (let n = start; n <= end; n++) out.push(`${String(n).padStart(width, ' ')}| ${lines[n - 1]}`);
+  return out.join('\n');
+}
+
 /**
  * 限额收箱卡片（AC-023）：runtime.rate_limit → { type, resetsAtMs, resetText, canResume }。
  * `canResume` 是「恢复」按钮的唯一开关，与 CLI `retry` 同一条规则——必须到达重置时刻之后；

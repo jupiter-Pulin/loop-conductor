@@ -15,6 +15,9 @@ import path from 'node:path';
 import * as state from '../../lib/state.mjs';
 import { addDetachedWorktree, removeWorktree } from '../../lib/git.mjs';
 import { validateSpecDoc } from '../../lib/spec-contract.mjs';
+import { currentSpec } from '../../lib/spec-version.mjs';
+import { digestPath } from '../../lib/digest-store.mjs';
+import { ensureDigest } from './digest.mjs';
 import { buildSpecPrompt } from '../../lib/prompts.mjs';
 import { logPathFor } from '../../lib/agent-settings.mjs';
 import { rateLimitedToBox } from '../shared.mjs';
@@ -83,11 +86,17 @@ export default async function specAction(ts, cfg, { round, records }) {
     state.appendTimeline(cfg, id, `spec r${round} 交付不合格（${check.errors.join('; ')}），留在 ROUTING`);
     return { changed: true };
   }
+  // 新 spec 写完即触发摘要（只试一次、失败不拦人审）：人在闸上能同时看到摘要与原文；
+  // 人若在闸上改了草稿，内容哈希一变这份摘要自动过期，批准后回到 ROUTING 会按最终获批内容重做。
+  const draft = currentSpec(cfg, ts);
+  const digest = await ensureDigest(ts, cfg, draft, { boxOnFailure: false });
+  const refs = [relRef(cfg, specPath)];
+  if (digest.state === 'valid' && draft) refs.push(relRef(cfg, digestPath(cfg, id, draft.sha256)));
   return openHumanGate(ts, cfg, {
     kind: 'spec',
     requestedBy: 'kernel',
     summary: `spec 待审：AC×${check.acs.length}（${relRef(cfg, specPath)}）`,
-    refs: [relRef(cfg, specPath)],
+    refs,
     round,
   });
 }

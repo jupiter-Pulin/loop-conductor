@@ -1,26 +1,57 @@
 {
-  "budgetUsd": 100,
+  "budgetUsd": 150,
   "testCommand": "npm test",
   "targetRepo": ".",
   "models": {
     "router": "claude-opus-5",
     "spec": "claude-opus-5",
     "maker": "claude-opus-5",
-    "reviewer": "claude-opus-5"
+    "reviewer": "claude-opus-5",
+    "digest": "claude-haiku-4-5-20251001",
+    "worker": "claude-opus-5"
   },
-  "maxTurns": { "router": 4, "spec": 40, "plan": 25, "maker": 70, "reviewer": 40 },
+  "maxTurns": {
+    "router": 40,
+    "digest": 12,
+    "spec": 40,
+    "plan": 25,
+    "maker": 150,
+    "reviewer": 60,
+    "workerRead": 60,
+    "workerSandbox": 120,
+    "workerWrite": 150
+  },
   "spawnRetries": 6,
-  "spawnBackoffMs": [15000, 30000, 60000],
+  "spawnBackoffMs": [
+    15000,
+    30000,
+    60000
+  ],
   "maxConcurrentTasks": 3,
+  "maxParallelAssignments": 3,
+  "maxConcurrentSpawns": 6,
+  "maxAutoContinues": 2,
   "inactivityTimeoutMs": 600000,
   "spawnWallClockMs": 14400000,
   "greenGateTimeoutMs": 3600000,
   "lockHeartbeatMs": 60000,
   "maxStepsPerTask": 20,
+  "maxRoundsPerTask": 300,
   "runBudgetUsd": null,
   "eventsLogEnabled": true,
   "unknownSpawnCostEstimateEnabled": true,
   "fuseStreak": 3,
+  "fuseStallRounds": 8,
+  "routerRecordWindow": 14,
+  "digestEnabled": true,
+  "digestMaxAttempts": 3,
+  "workerWebAccess": true,
+  "workerSandbox": {
+    "enabled": false,
+    "allowWrite": [],
+    "allowedDomains": [],
+    "denyRead": []
+  },
   "maxParallelPackages": 2,
   "maxPackages": 12,
   "packagesEnabled": false

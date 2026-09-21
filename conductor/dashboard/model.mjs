@@ -8,6 +8,10 @@ import { setupProfilePaths } from '../lib/profile.mjs';
 import { git, branchExists } from '../lib/git.mjs';
 import { composeRecords, renderFacts, renderRecordsForRouter } from '../lib/records.mjs';
 import { needPrecommit, needReview } from '../lib/version-gate.mjs';
+import { buildTaskPhase, buildTaskView } from '../lib/task-view.mjs';
+import { reviewCoverage } from '../lib/review-ledger.mjs';
+import { currentSpec, shortSha } from '../lib/spec-version.mjs';
+import { digestMaxAttempts, digestStateFor, readDigestSource } from '../lib/digest-store.mjs';
 import { buildRoundsView } from './rounds.mjs';
 
 // ---- 新状态机的四列（router conductor）：stage 就是列，不再有派生泳道 ----
@@ -67,6 +71,44 @@ export function isValidTaskId(id) {
   return typeof id === 'string' && TASK_ID_RE.test(id);
 }
 
+// ---- 任务视图（lib/task-view.mjs）：看板与详情共用的「现在怎么样了」唯一口径 ----
+//
+// 阶段、覆盖率、预算一律读 buildTaskView 的结果，dashboard 不自己推导；这里只做两件事：
+// 把中文的 phase.label 换成界面语言的英文标签（reason / next 原样透传），以及把任何异常
+// 降级成 view:null + viewError —— 详情页永远要能开出来，卡片永远要能画出来。
+
+/** phase.code → 英文标签。值域与 lib/task-view.mjs::phaseOf 的七个 code 一一对应。 */
+export const PHASE_LABELS = Object.freeze({
+  running: 'Running',
+  waiting_result: 'Waiting for results',
+  interrupted_recoverable: 'Recoverable interruption',
+  ready: 'Ready to run',
+  waiting_resource: 'Waiting for a resource',
+  waiting_human: 'Waiting for you',
+  terminated: 'Terminated',
+});
+
+/** 未知 code（内核新增了阶段而界面还没跟上）原样回显，绝不静默吞成 'Running'。 */
+export function phaseLabel(code) {
+  if (typeof code !== 'string' || code === '') return 'Unknown';
+  return PHASE_LABELS[code] ?? code;
+}
+
+function viewOf(cfg, ts, routerTask) {
+  if (!routerTask) return { view: null, viewError: null };
+  try {
+    return { view: buildTaskView(cfg, ts), viewError: null };
+  } catch (e) {
+    return { view: null, viewError: String(e?.message ?? e) };
+  }
+}
+
+/** 任务状态 → { view, viewError }：遗留任务/坏目录恒 view:null，异常降级不抛错。 */
+export function safeTaskView(cfg, ts) {
+  if (!ts || ts.error) return { view: null, viewError: ts?.error ?? null };
+  return viewOf(cfg, ts, isRouterTask(cfg, ts));
+}
+
 // ---- board 聚合（AC-005/006/007/008） ----
 
 /** box+stage → { needsHuman, working } 判定（唯一口径，board 与详情抽屉共用）。 */
@@ -79,11 +121,19 @@ function computeWorkingFlags(box, stage) {
   };
 }
 
-function taskEntry(ts) {
+function taskEntry(cfg, ts) {
   const stage = ts.runtime.stage;
   const lane = laneForStage(stage);
   const column = columnForStage(stage);
   const awaitingKind = stage === 'AWAIT_HUMAN' ? (ts.runtime.awaiting?.kind ?? null) : null;
+  // 卡片上的阶段：ROUTING 一列里同时躺着「agent 正在跑」「等执行者交活」「上次 runner 崩了」
+  // 「在等调度槽位」几种完全不同的处境，不能都画成一个长期不变的「运行中」。遗留任务没有这个
+  // 口径（view 恒 null），卡片就不出这一行。
+  // 卡片只要阶段：走 buildTaskPhase（不起 git、不合成记录）——看板每 1.5s 轮询一次且不缓存。
+  let phase = null;
+  if (isRouterTask(cfg, ts)) {
+    try { phase = buildTaskPhase(cfg, ts); } catch { phase = null; }
+  }
   return {
     id: ts.task.id ?? ts.id,
     kind: ts.task.kind ?? '?',
@@ -96,6 +146,7 @@ function taskEntry(ts) {
     // 遗留 stage 名（旧五闸状态机）在新看板里不占列，单独归 legacy 分组（AC-029）。
     legacy: column == null,
     ...computeWorkingFlags(ts.box, stage),
+    phase: phase ? { code: phase.code, label: phaseLabel(phase.code) } : null,
     spentUsd: ts.runtime.spent_usd ?? 0,
     lastFailureType: ts.runtime.last_failure_type ?? null,
     // 限额卡片在列表上就要说清「什么时候能恢复」（spec §限额：FAILED_BOX 卡片显示
@@ -115,7 +166,7 @@ export function buildBoard(cfg) {
   // 不进任何列——那是残留，不是「已完成」，仍按旧口径降级 broken。
   for (const ts of state.listTaskStates(cfg.queueDir, 'queue')) {
     if (ts.error) { broken.push({ box: ts.box, id: ts.id, error: ts.error }); continue; }
-    const entry = taskEntry(ts);
+    const entry = taskEntry(cfg, ts);
     const column = entry.column === 'ROUTING' || entry.column === 'AWAIT_HUMAN' ? entry.column : null;
     if (column != null) columnBuckets.get(column).push(entry);
     else if (entry.lane != null) legacy.push(entry);
@@ -126,7 +177,7 @@ export function buildBoard(cfg) {
   const done = [];
   for (const ts of state.listTaskStates(cfg.doneDir, 'done')) {
     if (ts.error) { broken.push({ box: ts.box, id: ts.id, error: ts.error }); continue; }
-    const entry = taskEntry(ts);
+    const entry = taskEntry(cfg, ts);
     done.push(entry);
     if (entry.column === 'DONE') columnBuckets.get('DONE').push(entry);
   }
@@ -134,7 +185,7 @@ export function buildBoard(cfg) {
   const failed = [];
   for (const ts of state.listTaskStates(cfg.failedDir, 'failed')) {
     if (ts.error) { broken.push({ box: ts.box, id: ts.id, error: ts.error }); continue; }
-    const entry = taskEntry(ts);
+    const entry = taskEntry(cfg, ts);
     failed.push(entry);
     if (entry.column === 'FAILED_BOX') columnBuckets.get('FAILED_BOX').push(entry);
   }
@@ -169,6 +220,11 @@ function findTaskAnyBox(cfg, id) {
 
 function readTimelineText(cfg, id) {
   try { return fs.readFileSync(state.dossierPath(cfg, id, 'timeline.md'), 'utf8'); } catch { return ''; }
+}
+
+/** 人是否按下了暂停（与 conductor.mjs::cmdPause 同一个标记文件）。 */
+function isPaused(ts) {
+  try { return fs.existsSync(path.join(ts.dir, 'PAUSED')); } catch { return false; }
 }
 
 // ---- timeline 原文 → 结构化条目（AC-001） ----
@@ -363,6 +419,15 @@ export function readEvents(cfg, id) {
  * 内核事实（renderFacts 的输入与渲染文本）。git 不可用/分支不存在一律降级为 null，
  * 绝不抛错——详情页永远要能开出来。
  */
+/** 版本门的 review 覆盖：无 spec → undefined（旧口径）；有 spec 但冻结稿读不到 → null（不放行）。 */
+function reviewCoverageFor(cfg, ts, records, head) {
+  if (ts.runtime?.spec_approved !== true) return undefined;
+  const spec = currentSpec(cfg, ts);
+  if (!spec) return null;
+  const acIds = state.enumerateAcceptanceCriteria(spec.text).map((a) => a.ac_id);
+  return reviewCoverage({ dossierDir: state.dossierPath(cfg, ts.id), records, head, specSha: spec.sha256, acIds });
+}
+
 export function buildTaskFacts(cfg, ts, records) {
   const repo = ts.task?.targetRepo ?? cfg.targetRepo;
   const base = ts.task?.baseBranch ?? cfg.baseBranch ?? null;
@@ -382,7 +447,8 @@ export function buildTaskFacts(cfg, ts, records) {
     head,
     base: baseSha,
     baseBranch: base,
-    needReview: needReview(records, head),
+    // 与内核同一口径：有 spec 的任务按判决台账（判全且全 pass）算，不能只看 reviewer 自述 ok。
+    needReview: needReview(records, head, { coverage: reviewCoverageFor(cfg, ts, records, head) }),
     needPrecommit: needPrecommit(records, head, baseSha),
     hasDiff,
     rateLimit: ts.runtime?.rate_limit ?? null,
@@ -550,6 +616,7 @@ export function buildTaskDetail(cfg, id) {
       task: null, runtime: null, box: ts.box, lane: null, column: null, needsHuman: false, working: false,
       timeline, timelineEntries, paths, review: { kind: 'broken', error: ts.error }, rounds,
       records: [], recordsText: '', facts: null, events, isRouterTask: false,
+      view: null, viewError: null, phase: null, paused: false,
     };
   }
   const stage = ts.runtime.stage;
@@ -557,6 +624,7 @@ export function buildTaskDetail(cfg, id) {
   // 合成出来只会是一串 product=missing 的噪音，那类任务继续看 rounds 轮次视图（AC-029）。
   const routerTask = isRouterTask(cfg, ts);
   const records = routerTask ? composeRecords(cfg, id, { planActive: ts.runtime.plan_active === true }) : [];
+  const { view, viewError } = viewOf(cfg, ts, routerTask);
   return {
     task: ts.task,
     runtime: ts.runtime,
@@ -574,7 +642,89 @@ export function buildTaskDetail(cfg, id) {
     recordsText: routerTask ? renderRecordsForRouter(records) : '',
     facts: routerTask ? buildTaskFacts(cfg, ts, records) : null,
     events,
+    // 进度面板的全部内容（阶段 / 目标 / 委派 / 验收门 / 预算）都读这一份视图；遗留任务恒 null。
+    view,
+    viewError,
+    // 与看板卡片同一个 { code, label } 口径：界面语言是英文，view.phase.label 是 CLI 的中文原文。
+    phase: view ? { code: view.phase.code, label: phaseLabel(view.phase.code) } : null,
+    // 暂停标记是任务目录里的 PAUSED 文件（CLI pause/unpause 的唯一开关）。任务视图的 phase
+    // 只把它折进 waiting_human 的中文文案里，按钮要判「现在该给 pause 还是 unpause」得自己看一眼。
+    paused: isPaused(ts),
   };
+}
+
+// ---- spec 摘要只读视图（GET /api/task/:id/digest） ----
+//
+// 摘要的「能不能用」是现算的（lib/digest-store.mjs::digestStateFor 拿盘上的摘要对此刻的原文重跑
+// 机械校验），dashboard 一个字节都不自己判。这里只多做两件展示层的事：
+//   1. 把摘要本体原样带出来（state='valid' 才有；不合格时恒 null——绝不把空摘要画得像没事一样）；
+//   2. 带出那一版 spec 的原文，好让每条 L<a>-<b> 引用能在页面上展开看到被引用的行。
+//      优先用按 sha 命名的快照（引用的坐标系就是它）；快照缺失/被动过时退回当前原文并标明来源。
+
+/** 摘要各尝试的花费（记录里 role='digest' 的那几条；与 lib/task-view.mjs 同一口径）。 */
+function digestCostOf(cfg, ts) {
+  const records = composeRecords(cfg, ts.id, { planActive: ts.runtime?.plan_active === true });
+  const sum = records.filter((r) => r.role === 'digest').reduce((s, r) => s + (r.cost_usd ?? 0), 0);
+  return Math.round(sum * 1e6) / 1e6;
+}
+
+function emptyDigestView(cfg, errors = []) {
+  return {
+    state: 'none',
+    spec: null,
+    digest: null,
+    errors,
+    attempts: 0,
+    maxAttempts: digestMaxAttempts(cfg),
+    model: cfg.models?.digest ?? null,
+    promptSha: null,
+    costUsd: 0,
+    stats: null,
+    path: null,
+    sourcePath: null,
+    source: null,
+    sourceFrom: null,
+  };
+}
+
+/** 任务 id → 摘要面板载荷；任务不存在返回 null（由 server 给 404），其余一切降级为字段，绝不抛错。 */
+export function buildTaskDigest(cfg, id) {
+  const ts = findTaskAnyBox(cfg, id);
+  if (!ts) return null;
+  if (ts.error) return emptyDigestView(cfg, [ts.error]);
+  try {
+    const spec = currentSpec(cfg, ts);
+    if (!spec) return emptyDigestView(cfg);
+    const st = digestStateFor(cfg, id, spec);
+    const snapshot = readDigestSource(cfg, id, spec.sha256);
+    return {
+      state: st.state,
+      spec: {
+        status: spec.status,
+        sha: spec.sha256,
+        short: shortSha(spec.sha256),
+        path: path.relative(cfg.root, spec.path),
+        lines: spec.lines,
+      },
+      // 只有通过机械校验的摘要才交出去：invalid / exhausted 给 null + errors，由前端说清降级了什么。
+      digest: st.state === 'valid' ? (st.digest ?? null) : null,
+      errors: st.errors ?? [],
+      attempts: st.attempts ?? 0,
+      // 上限口径同样只有一处：digestStateFor 判 exhausted 用的就是它。
+      maxAttempts: digestMaxAttempts(cfg),
+      model: st.meta?.model ?? cfg.models?.digest ?? null,
+      promptSha: st.meta?.prompt_sha256 ? shortSha(st.meta.prompt_sha256) : null,
+      costUsd: digestCostOf(cfg, ts),
+      stats: st.stats ?? null,
+      path: st.path ? path.relative(cfg.root, st.path) : null,
+      sourcePath: path.relative(cfg.root, path.join(state.dossierPath(cfg, id), 'digest', `${shortSha(spec.sha256)}.source.md`)),
+      source: snapshot ?? spec.text,
+      // 快照在 = 引用行号与摘要生成时逐字一致；退回当前原文时引用可能已经对不上，界面要说清。
+      sourceFrom: snapshot != null ? 'snapshot' : 'current',
+    };
+  } catch (e) {
+    return emptyDigestView(cfg, [String(e?.message ?? e)]);
+  }
 }
 
 // ---- merge 分文件 diff（AC-001/002/003）：只读 git diff，绝不抛错、绝不 500。 ----
@@ -807,9 +957,10 @@ export function buildStreamTail(cfg, id) {
 /**
  * 同步动作端点对应的 CLI 子命令名与路由 action 一致，直接透传（merge/retry 已 job 化，见 P4）。
  * 新状态机的人闸按钮就是 `approve` / `reject` / `resume`，语义等同 CLI，一个不多一个不少；
- * `abandon` 供 ROUTING 中的任务人工收箱。
+ * `abandon` 供 ROUTING 中的任务人工收箱；`pause` / `unpause` 只写任务目录里的 PAUSED 标记，
+ * 瞬时返回、不改 stage、不花钱，因此和前四个一样走同步路径而不是 job 化。
  */
-export const SYNC_ACTIONS = ['approve', 'reject', 'resume', 'abandon'];
+export const SYNC_ACTIONS = ['approve', 'reject', 'resume', 'abandon', 'pause', 'unpause'];
 
 /** body.notes / body.message → argv 数组（不经 shell）。未知子命令自身会忽略多余 flag。 */
 export function buildSyncActionArgv(action, id, body = {}) {

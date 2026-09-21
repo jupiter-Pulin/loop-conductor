@@ -3,7 +3,10 @@
 <!-- section: base -->
 在当前 worktree 实现下面 {{spec 或 brief}} 中你负责的全部 AC，让 `{{testCommand}}` 全绿。不许删除、跳过或削弱既有测试；新行为要有在旧代码上会失败的测试。破坏性 git 操作会被拦截，恢复单个文件用 git show HEAD:<path> > <path>。
 结束前用 Write 把 log 写到 {{log_path}}：
-{"role":"maker","outcome":"ok|fail|needs_human","summary":"实现了哪些 AC；加了什么测试；测试结果；未完成的 AC"}
+{"role":"maker","outcome":"ok|partial|fail|needs_human","summary":"实现了哪些 AC；加了什么测试；测试结果；未完成的 AC","done":["已完成项"],"remaining":["未完成项"]}
+一开工就先写一版 log（outcome=partial，remaining 列出计划），之后每完成一条 AC 就重写整份：会话可能随时撞上限，最后落盘的那一版就是交付，下一轮据此续做而不是从头重来。全部做完且测试绿才写 ok。
+<!-- section: guidance -->
+[负责人指导（逐字）] {{guidance}}
 <!-- section: human-notes -->
 [人审补充约束] {{spec 闸 human notes 原文}}
 <!-- section: package -->

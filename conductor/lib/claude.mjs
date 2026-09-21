@@ -126,6 +126,26 @@ export function parseClaudeJson(stdout) {
   try { return JSON.parse(line.trim()); } catch { return null; }
 }
 
+// ---- 在飞子进程登记：停止控制要能覆盖每一个派出去的 agent（含并行的 worker） ----
+//
+// claude 子进程是 detached 的独立进程组（kill 时连它起的测试 / 服务一起带走）。代价是 runner 自己
+// 退出时它们不会跟着死——所以 runner 收到停止请求（SIGINT / SIGTERM / `conductor stop`）时必须
+// 主动收割：killAllActive 对每个在飞进程组发 SIGTERM（宽限后 SIGKILL），各自的 runClaudeStream
+// 以 killed='stopped' 正常返回，内核照常留档、提交已有工作，再退出。runner 被 SIGKILL 来不及收割时，
+// 残留进程由下次启动的恢复流程按 spawn 记录里的 pid 身份收割（lib/recovery.mjs）。
+const activeChildren = new Map(); // pid → (reason) => void
+
+export function activeChildPids() {
+  return [...activeChildren.keys()];
+}
+
+export function killAllActive(reason = 'stopped') {
+  for (const kill of [...activeChildren.values()]) {
+    try { kill(reason); } catch { /* 进程可能已退出 */ }
+  }
+  return activeChildren.size;
+}
+
 /**
  * 异步 stream-json spawn 一次 claude（冷启动或 -r 续会话）。
  * 返回 { ok, exitCode, sessionId, costUsd, result, raw, error?, killed? }。
@@ -157,6 +177,10 @@ export function runClaudeStream(opts) {
     child.stdin.on('error', () => { /* 子进程未消费即退出（如启动失败）时忽略 EPIPE */ });
     child.stdin.write(String(opts.prompt ?? ''));
     child.stdin.end();
+    // pid 尽早交给调用方落盘：runner 若在会话中途崩溃，恢复流程靠它找到并收割这个残留进程组。
+    if (typeof opts.onSpawn === 'function' && Number.isInteger(child.pid)) {
+      try { opts.onSpawn({ pid: child.pid }); } catch { /* 留档失败不影响执行 */ }
+    }
 
     const stdoutChunks = [];
     const stderrChunks = [];
@@ -184,6 +208,8 @@ export function runClaudeStream(opts) {
       }, killGraceMs);
       forceTimer.unref?.();
     };
+
+    if (Number.isInteger(child.pid)) activeChildren.set(child.pid, killGroup);
 
     let inactivityTimer = null;
     const resetInactivity = () => {
@@ -232,6 +258,7 @@ export function runClaudeStream(opts) {
 
     child.on('error', (err) => {
       closed = true;
+      activeChildren.delete(child.pid);
       clearTimeout(inactivityTimer);
       clearTimeout(wallTimer);
       if (forceTimer) clearTimeout(forceTimer);
@@ -243,6 +270,7 @@ export function runClaudeStream(opts) {
 
     child.on('close', (code) => {
       closed = true;
+      activeChildren.delete(child.pid);
       clearTimeout(inactivityTimer);
       clearTimeout(wallTimer);
       if (forceTimer) clearTimeout(forceTimer);
@@ -257,7 +285,10 @@ export function runClaudeStream(opts) {
       const exitCode = killed ? null : code ?? -1;
       if (killed && killed === 'stream_parse_error') killed = null;
       if (code !== 0 || raw === null || parseError || costUnknown) {
-        const baseError = parseError ?? (stderr.trim() || `claude exited ${exitCode ?? 'killed'} with no result event`);
+        // 有 result 事件的非零退出（典型：error_max_turns）不是「没有 result」——别让归因文案误导人。
+        const baseError = parseError ?? (stderr.trim() || (resultEvent
+          ? `claude exited ${exitCode ?? 'killed'} (${resultEvent.subtype ?? 'error result'})`
+          : `claude exited ${exitCode ?? 'killed'} with no result event`));
         resolve({
           ok: false,
           exitCode,
@@ -328,6 +359,7 @@ export function isDeterministicSpawnFailure(res) {
  */
 export function isTransientFailure(res) {
   if (res?.spawnError) return !isDeterministicSpawnFailure(res);
+  if (res?.killed === 'stopped') return false; // 人 / runner 要求停下：不是故障，绝不重试
   if (res?.killed) return true;
   if (res?.raw == null && res?.exitCode !== 0) return true;
   return res?.raw?.is_error === true && TRANSIENT_STATUSES.has(res.raw?.api_error_status);
@@ -350,11 +382,25 @@ export async function runClaudeWithRetry(callOpts, {
   let totalCost = 0;
   let anyCostUnknown = false;
   let current = { ...callOpts };
+  const callerResume = Boolean(callOpts.resume); // 调用方要求续会话（区别于下面瞬态重试自己改的 resume）
   let res;
   for (let attempt = 1; ; attempt++) {
     res = await runClaude(current);
     totalCost += res.costUsd ?? 0;
     if (res.costUnknown) anyCostUnknown = true;
+    // 续会话起不来（session 找不到 / 已失效）：不是瞬态，重试同一个 -r 只会白烧退避阶梯。
+    // 立刻带 resumeFailed 返回，由调用方降级为带进度上下文的冷启动。
+    if (callerResume && attempt === 1 && !res.ok && !res.killed
+      && res.rate_limit?.status !== 'rejected' && (res.raw?.num_turns ?? 0) <= 1
+      && res.raw?.subtype !== 'error_max_turns') {
+      attempts.push({
+        attempt, transient: false, api_error_status: res.raw?.api_error_status ?? null,
+        session_id: res.raw?.session_id ?? res.sessionId ?? null, cost_usd: res.costUsd ?? 0,
+        killed: null, cost_unknown: res.costUnknown === true, resume_failed: true,
+      });
+      res = { ...res, ok: false, resumeFailed: true };
+      break;
+    }
     // 限额（rejected rate_limit_event）绝不是瞬态：重试只会烧掉整条退避阶梯而必然再撞同一堵墙。
     // 零重试短路，盖 rate_limited:true 交内核收箱（人在 resets_at 之后 retry）。
     const rateLimited = res.rate_limit?.status === 'rejected';

@@ -7,6 +7,7 @@
 import {
   GAUGE_LANES, BOARD_COLUMNS, awaitingLabel, summarizeBoard, gaugeSegments, escapeHtml, verdictChip,
   groupTimelineByRound, roundGaugeTicks, resolveDrawerFocusTarget, parseRouteHash, rateLimitPanel,
+  digestStateInfo, refLabel, refSourceText,
 } from './view.mjs';
 import {
   barWidths, sortTableRows, formatUsd, formatPercent, formatDurationSeconds, isMetricsEmpty,
@@ -32,6 +33,7 @@ let pendingActionMessage = null;
 let expandedDiffFiles = new Set();
 let drawerTriggerEl = null;
 let lastStreamTail = null;
+let lastDigest = null;
 let currentView = 'board';
 let lastMetrics = null;
 let metricsSort = { key: 'spentUsd', dir: 'desc' };
@@ -121,7 +123,19 @@ function cardSig(entry) {
   return [
     entry.stage, entry.awaitingKind, entry.needsHuman, entry.working, entry.spentUsd, entry.kind, entry.title,
     entry.lastFailureType, entry.rateLimit?.resets_at ?? '',
+    // 阶段也进指纹：ROUTING 一列里从「等执行者交活」变成「可恢复中断」时卡片必须跟着变。
+    entry.phase?.code ?? '',
   ].join('|');
+}
+
+/** 运行中/等结果仍带转圈（确实有事在发生），其余阶段只给静态徽标（转圈会骗人）。 */
+const PHASE_SPINNING = new Set(['running', 'waiting_result']);
+
+function buildPhaseNode(phase) {
+  return el('div', { class: 'phase-line' }, [
+    PHASE_SPINNING.has(phase.code) ? el('span', { class: 'spin', text: '↻' }) : null,
+    el('span', { class: `phase-badge phase-${phase.code}`, text: phase.label }),
+  ]);
 }
 
 function buildGaugeNode(entry) {
@@ -170,6 +184,10 @@ function buildColumnCardNode(entry) {
   if (entry.needsHuman) {
     card.appendChild(el('div', { class: 'needs-you', text: '⚑ needs you' }));
     card.appendChild(el('div', { class: 'review-btn', text: 'Review →' }));
+  } else if (entry.phase) {
+    // 阶段来自内核的任务视图：运行中 / 等结果 / 可恢复中断 / 等资源 / 已终止各有各的样子，
+    // 不再是一个长期不变的「working…」。
+    card.appendChild(buildPhaseNode(entry.phase));
   } else if (entry.working) {
     card.appendChild(workingLabel());
   }
@@ -717,6 +735,7 @@ function resetDetailState() {
   lastDetail = null;
   lastDiff = null;
   lastStreamTail = null;
+  lastDigest = null;
   pendingActionMessage = null;
   expandedDiffFiles = new Set();
 }
@@ -791,9 +810,15 @@ async function refreshDetail() {
   lastDetail = status === 200 ? body : null;
   lastDiff = null;
   lastStreamTail = null;
+  lastDigest = null;
   if (mode === 'page' && needsDiff(lastDetail)) {
     const diffRes = await api(`/api/task/${encodeURIComponent(id)}/diff`);
     if (detailTaskId === id) lastDiff = diffRes.status === 200 ? diffRes.body : null;
+  }
+  // 摘要只对新纪元任务存在；抽屉与审查页都要能看见它的状态（降级了就得说出来）。
+  if (lastDetail && lastDetail.isRouterTask) {
+    const digestRes = await api(`/api/task/${encodeURIComponent(id)}/digest`);
+    if (detailTaskId === id) lastDigest = digestRes.status === 200 ? digestRes.body : null;
   }
   if (lastDetail && lastDetail.working) {
     const tailRes = await api(`/api/task/${encodeURIComponent(id)}/stream-tail`);
@@ -1091,6 +1116,30 @@ function editorRelevant(detail) {
   return ['maker', 'verify', 'merge'].includes(detail.lane) || detail.box === 'failed';
 }
 
+/**
+ * pause / unpause 开关（语义等同 CLI 的同名动词）：只对 queue 里的新纪元任务有意义——
+ * done/failed 已经不动了，遗留任务 CLI 本来就拒绝操作。已在人闸上等着的任务不给 pause
+ * （它本来就没在花钱），但暂停中的任务任何时候都给得出 unpause，否则人会被自己锁住。
+ */
+function buildPauseControl(id, detail) {
+  if (!detail.isRouterTask || detail.box !== 'queue') return null;
+  if (detail.paused) {
+    return el('button', {
+      class: 'btn btn-ghost',
+      text: '▶ Unpause',
+      title: 'conductor unpause — dispatching resumes on the next run',
+      onclick: () => submitAction(id, 'unpause', {}),
+    });
+  }
+  if (detail.needsHuman) return null;
+  return el('button', {
+    class: 'btn btn-ghost',
+    text: '⏸ Pause',
+    title: 'conductor pause — no new work is dispatched from the next step on; agents already in flight finish',
+    onclick: () => submitAction(id, 'pause', {}),
+  });
+}
+
 // ---- verdict / spec-verify 面板 + 分文件 diff（P2） ----
 
 function chipNode(status) {
@@ -1298,6 +1347,7 @@ function renderDrawerPeek(drawer, id, detail) {
       text: needsHuman ? 'Review →' : 'Full details →',
       onclick: () => gotoTask(id),
     }),
+    buildPauseControl(id, detail),
     editorRelevant(detail) ? buildEditorControls(id) : null,
   ]));
 
@@ -1313,12 +1363,18 @@ function renderDrawerPeek(drawer, id, detail) {
     ]));
   }
 
+  // 进度面板在记录之前：人打开抽屉第一眼要看见「现在卡在哪、怎么继续」，而不是一串轮次。
+  const progressNode = buildProgressPanelNode(detail);
+  if (progressNode) drawer.appendChild(progressNode);
+
   if (detail.working) {
     drawer.appendChild(workingLabel());
     drawer.appendChild(buildStreamTailNode(lastStreamTail));
   }
 
   if (detail.isRouterTask) {
+    const digestNode = buildDigestPanelNode(lastDigest);
+    if (digestNode) drawer.appendChild(digestNode);
     const recordsNode = buildRecordsSectionNode(detail.records);
     if (recordsNode) drawer.appendChild(recordsNode);
   } else {
@@ -1332,6 +1388,236 @@ function renderDrawerPeek(drawer, id, detail) {
   scroll.appendChild(buildTimelineListNode(detail.timelineEntries || []));
   timelineWrap.appendChild(scroll);
   drawer.appendChild(timelineWrap);
+}
+
+// ---- 进度面板（新状态机）：阶段 / 目标 / 委派 / 验收门 / 预算 ----
+//
+// 数据全部来自 detail.view（= lib/task-view.mjs::buildTaskView），前端一个判据都不自己推。
+// 阶段标签在服务端就已换成英文（model.mjs::phaseLabel），reason / next / coverage 是内核写给人看的
+// 中文原文，原样透传——那是事实，翻译只会引入第二份口径。
+
+function progressLine(label, value) {
+  if (value == null || value === '') return null;
+  return el('div', { class: 'progress-line' }, [
+    el('span', { class: 'progress-label', text: label }),
+    el('span', { class: 'progress-value', text: value }),
+  ]);
+}
+
+/** 委派台账表：一行一个 key —— 做完了什么、还剩什么、能不能续接、撞了谁。 */
+function buildAssignmentsNode(assignments) {
+  const head = el('tr', {}, ['key', 'title', 'profile', 'intent', 'state', 'outcome', 'flags', 'conflict']
+    .map((h) => el('th', { text: h })));
+  const rows = assignments.map((a) => {
+    const flags = [];
+    if (a.truncated) flags.push('truncated');
+    if (a.interrupted) flags.push('interrupted');
+    if (a.resumable_round) flags.push(`resumable r${a.resumable_round}`);
+    return el('tr', {}, [
+      el('td', { class: 'mono', text: a.key || '-' }),
+      el('td', { class: 'assign-wrap', text: a.title || '' }),
+      el('td', { class: 'mono', text: a.profile || '-' }),
+      el('td', { class: 'mono', text: a.intent || '-' }),
+      el('td', { class: 'mono', text: a.state || '-' }),
+      el('td', { class: 'mono', text: a.outcome || 'unknown' }),
+      el('td', { class: 'mono', text: flags.join(' · ') }),
+      el('td', { class: 'mono assign-wrap', text: (a.conflict_files || []).join(', ') }),
+    ]);
+  });
+  return el('div', { class: 'assign-scroll' }, [
+    el('table', { class: 'assign-table' }, [
+      el('thead', {}, [head]),
+      el('tbody', {}, rows),
+    ]),
+  ]);
+}
+
+function buildReviewGateNode(review) {
+  const gate = el('div', { class: 'progress-block' }, [
+    el('div', { class: 'progress-block-title', text: 'Review gate' }),
+  ]);
+  gate.appendChild(el('div', { class: 'progress-line' }, [
+    el('span', { class: 'progress-label', text: 'need' }),
+    el('span', {
+      class: 'progress-value mono',
+      text: `need_review=${review.need_review} · need_precommit=${review.need_precommit}`
+        + ` · H=${review.head || '-'} B=${review.base || '-'}`,
+    }),
+  ]));
+  const coverage = progressLine('coverage', review.coverage);
+  if (coverage) gate.appendChild(coverage);
+  const remaining = review.remaining || [];
+  if (remaining.length > 0) {
+    const shown = remaining.slice(0, 20).join(', ');
+    gate.appendChild(progressLine('remaining ACs', `${remaining.length}: ${shown}${remaining.length > 20 ? ' …' : ''}`));
+  }
+  if ((review.fails || []).length > 0) gate.appendChild(progressLine('failing ACs', review.fails.join(', ')));
+  return gate;
+}
+
+function buildBudgetNode(budget) {
+  const block = el('div', { class: 'progress-block' }, [
+    el('div', { class: 'progress-block-title', text: 'Budget' }),
+  ]);
+  block.appendChild(progressLine(
+    'task',
+    `spent ${fmtUsd(budget.spent_usd)} / budget ${budget.budget_usd == null ? '(none)' : fmtUsd(budget.budget_usd)}`
+    + `${budget.remaining_usd == null ? '' : ` (remaining ${fmtUsd(budget.remaining_usd)})`}`,
+  ));
+  if (budget.unknown_cost_spawns > 0) {
+    block.appendChild(progressLine(
+      'unknown cost',
+      `${budget.unknown_cost_spawns} spawn(s) reported no cost; ${fmtUsd(budget.estimated_usd)} booked as an estimate`,
+    ));
+  }
+  block.appendChild(progressLine(
+    'rounds',
+    `${budget.rounds_used} / ${budget.max_rounds == null ? '(no cap)' : budget.max_rounds}`
+    + `${budget.stall_rounds > 0 ? ` · ${budget.stall_rounds} round(s) with no hard progress` : ''}`,
+  ));
+  const session = budget.run_session;
+  if (session) {
+    block.appendChild(progressLine(
+      'run session',
+      `spent ${fmtUsd(session.spent_usd)}${session.limit_usd == null ? ' (no runBudgetUsd)' : ` / limit ${fmtUsd(session.limit_usd)}`}`
+      + `${session.ended ? ` · last run ended: ${session.end_reason || '?'}` : ' · not closed cleanly, or still running'}`,
+    ));
+  }
+  return block;
+}
+
+/** 详情页顶部的进度面板；遗留任务（view 恒 null）不出这个面板，只在视图求值失败时给一行说明。 */
+function buildProgressPanelNode(detail) {
+  if (!detail.view) {
+    if (!detail.viewError) return null;
+    return el('div', { class: 'progress-panel' }, [
+      el('h3', { text: 'Progress' }),
+      el('div', { class: 'broken-banner', text: `Task view unavailable: ${detail.viewError}` }),
+    ]);
+  }
+  const view = detail.view;
+  const phase = view.phase || {};
+  const wrap = el('div', { class: 'progress-panel' }, [el('h3', { text: 'Progress' })]);
+
+  wrap.appendChild(el('div', { class: 'phase-row' }, [
+    el('span', { class: `phase-badge phase-${phase.code || 'unknown'}`, text: (detail.phase && detail.phase.label) || phase.code || '?' }),
+    el('span', {
+      class: 'mono phase-stage',
+      text: `stage=${view.stage}${view.awaiting ? `/${view.awaiting.kind}` : ''} · box=${view.box}`,
+    }),
+    detail.paused ? el('span', { class: 'chip chip-unknown', text: 'paused' }) : null,
+  ]));
+  const reason = progressLine('why', phase.reason);
+  if (reason) wrap.appendChild(reason);
+  const next = progressLine('how to continue', phase.next);
+  if (next) wrap.appendChild(next);
+  const retained = progressLine('retained', phase.retained);
+  if (retained) wrap.appendChild(retained);
+
+  const objective = progressLine('objective', view.objective);
+  if (objective) wrap.appendChild(objective);
+  if (view.last_plan_change) {
+    wrap.appendChild(progressLine('last plan change', `r${view.last_plan_change.round} — ${view.last_plan_change.why || ''}`));
+  }
+
+  if ((view.active || []).length > 0) {
+    const block = el('div', { class: 'progress-block' }, [el('div', { class: 'progress-block-title', text: 'Active agents' })]);
+    for (const a of view.active) {
+      block.appendChild(el('div', { class: 'progress-agent mono' }, [
+        el('span', { class: 'record-role', text: a.name }),
+        el('span', { text: a.title ? `「${a.title}」` : '' }),
+        el('span', { text: a.profile ? `profile=${a.profile}` : '' }),
+        el('span', { text: `process=${a.process}` }),
+        el('span', { text: a.started ? `since ${a.started}` : '' }),
+      ]));
+    }
+    wrap.appendChild(block);
+  }
+
+  if ((view.assignments || []).length > 0) {
+    wrap.appendChild(el('div', { class: 'progress-block' }, [
+      el('div', { class: 'progress-block-title', text: `Assignments (${view.assignments.length})` }),
+      buildAssignmentsNode(view.assignments),
+    ]));
+  }
+
+  if (view.review) wrap.appendChild(buildReviewGateNode(view.review));
+  if (view.budget) wrap.appendChild(buildBudgetNode(view.budget));
+  return wrap;
+}
+
+// ---- spec 摘要面板：状态 + 逐条索引 + 每条引用能展开回原文 ----
+
+const DIGEST_SECTIONS = [
+  ['goal', 'Goal', (it) => it.text],
+  ['constraints', 'Constraints', (it) => `(${it.kind}) ${it.text}`],
+  ['acs', 'AC index', (it) => `${it.id}${it.group ? `〔${it.group}〕` : ''} ${it.gist}`],
+  ['modules', 'Modules', (it) => `${it.name}: ${it.text}`],
+  ['open_questions', 'Open questions', (it) => `(${it.status}) ${it.text}${it.safe_default ? ` | safe default: ${it.safe_default}` : ''}`],
+  ['proposed_packages', 'Proposed packages (a proposal in the spec, not an approved plan)',
+    (it) => `${it.id} ${it.title} | ACs: ${(it.acs || []).join(',') || '-'} | depends on: ${(it.depends_on || []).join(',') || '-'}`],
+];
+
+/** 一条引用 = 一个可展开的 `L<a>-<b>`，展开后是原文对应行（带行号）。 */
+function buildDigestRefNode(ref, source) {
+  const quoted = refSourceText(source, ref);
+  return el('details', { class: 'digest-ref' }, [
+    el('summary', { class: 'mono', text: refLabel(ref), title: ref && ref.quote ? ref.quote : null }),
+    el('pre', { class: 'readonly', text: quoted || '(source for this spec version is unavailable)' }),
+  ]);
+}
+
+function buildDigestItemNode(text, refs, source) {
+  return el('div', { class: 'digest-item' }, [
+    el('div', { class: 'digest-text', text }),
+    el('div', { class: 'digest-refs' }, (refs || []).map((r) => buildDigestRefNode(r, source))),
+  ]);
+}
+
+function buildDigestPanelNode(digest) {
+  if (!digest) return null;
+  // 没有 spec 的任务（brief 即契约）本来就没有摘要可看，不用给一个空面板占位。
+  if (digest.state === 'none' && !digest.spec) return null;
+  const info = digestStateInfo(digest.state);
+  const wrap = el('div', { class: 'digest-panel' }, [el('h3', { text: 'Spec digest' })]);
+
+  wrap.appendChild(el('div', { class: 'digest-meta' }, [
+    el('span', { class: `chip ${info.className}`, text: info.label }),
+    digest.spec ? el('span', { class: 'mono', text: `spec ${digest.spec.status} ${digest.spec.short}` }) : null,
+    el('span', { class: 'mono', text: `model=${digest.model || '-'}` }),
+    el('span', {
+      class: 'mono',
+      text: `attempts ${digest.attempts}${digest.maxAttempts ? `/${digest.maxAttempts}` : ''}`,
+    }),
+    el('span', { class: 'mono', text: fmtUsd(digest.costUsd) }),
+    digest.path ? el('span', { class: 'mono digest-path', text: digest.path }) : null,
+  ]));
+
+  if (info.note) wrap.appendChild(el('div', { class: 'digest-note', text: info.note }));
+  if (digest.state !== 'valid' && (digest.errors || []).length > 0) {
+    wrap.appendChild(el('pre', {
+      class: 'readonly',
+      text: digest.errors.slice(0, 5).join('\n') + (digest.errors.length > 5 ? `\n… ${digest.errors.length - 5} more` : ''),
+    }));
+  }
+  if (digest.spec && digest.sourceFrom === 'current') {
+    wrap.appendChild(el('div', {
+      class: 'digest-note',
+      text: 'No source snapshot for this spec version: the quoted lines below come from the spec as it is right now, so line references may not line up.',
+    }));
+  }
+  if (digest.state !== 'valid' || !digest.digest) return wrap;
+
+  for (const [key, label, render] of DIGEST_SECTIONS) {
+    const items = digest.digest[key];
+    if (!Array.isArray(items) || items.length === 0) continue;
+    const section = el('details', { class: 'digest-section', open: key === 'goal' || key === 'acs' ? '' : null }, [
+      el('summary', { text: `${label} · ${items.length}` }),
+    ]);
+    for (const item of items) section.appendChild(buildDigestItemNode(render(item), item.refs, digest.source));
+    wrap.appendChild(section);
+  }
+  return wrap;
 }
 
 // ---- 新状态机：记录列表 / 内核事实 / 事件流 / 通用人闸页 ----
@@ -1348,16 +1634,29 @@ function buildRecordRowNode(rec) {
       rec.notes ? el('div', { class: 'record-summary', text: `notes: ${rec.notes}` }) : null,
     ]);
   }
+  // 标签：worker 的身份是它的委派 key（`worker api-layer`），一轮里可能有好几个并行的。
+  const label = `r${rec.round} ${rec.role}${rec.package ? ` ${rec.package}` : ''}${rec.key ? ` ${rec.key}` : ''}`;
   const fields = [`outcome=${rec.outcome || '-'}`];
+  if (rec.profile) fields.push(`profile=${rec.profile}`);
+  if (rec.intent) fields.push(`intent=${rec.intent}`);
   if (rec.tier) fields.push(`tier=${rec.tier}`);
   if (rec.action) fields.push(`action=${rec.action}`);
   if (rec.head_sha) fields.push(`head=${String(rec.head_sha).slice(0, 6)}`);
   if (rec.base_sha) fields.push(`base=${String(rec.base_sha).slice(0, 6)}`);
-  fields.push(`cost=${fmtUsd(rec.cost_usd)}`);
+  if (rec.spec_sha) fields.push(`spec=${String(rec.spec_sha).slice(0, 6)}`);
+  fields.push(`cost=${fmtUsd(rec.cost_usd)}${rec.cost_unknown ? ' (incl. unknown)' : ''}`);
   fields.push(`truncated=${rec.truncated ? 'yes' : 'no'}`);
+  if (rec.interrupted) fields.push('interrupted=yes');
+  if (rec.resume_of) fields.push(`resume_of=r${rec.resume_of}`);
+  if (rec.progress) fields.push(`progress=${rec.progress}`);
+  if (rec.integration) fields.push(`integration=${rec.integration}`);
+  if (rec.violations?.length) fields.push(`violations=${rec.violations.length}`);
+  // 完整产物就在案卷目录里，按文件名可 Read（与 records.mjs 给 router 的指路行同一份清单）。
+  const artifacts = ['report', 'verdicts', 'salvage'].map((k) => rec.artifacts?.[k]).filter(Boolean);
   return el('div', { class: `record-row${rec.product !== 'ok' ? ' product-bad' : ''}` }, [
     el('div', { class: 'record-head' }, [
-      el('span', { class: 'record-role', text: `r${rec.round} ${rec.role}${rec.package ? ` ${rec.package}` : ''}` }),
+      el('span', { class: 'record-role', text: label }),
+      rec.title ? el('span', { class: 'record-title', text: `「${rec.title}」` }) : null,
       ...fields.map((f) => el('span', { text: f })),
       el('span', {
         class: rec.product === 'ok' ? '' : 'chip chip-fail',
@@ -1368,6 +1667,17 @@ function buildRecordRowNode(rec) {
       ? el('div', { class: 'record-summary', text: rec.product_error.join('; ') })
       : null,
     rec.summary ? el('div', { class: 'record-summary', text: rec.summary }) : null,
+    rec.done?.length ? el('div', { class: 'record-summary', text: `done: ${rec.done.join('; ')}` }) : null,
+    rec.remaining?.length ? el('div', { class: 'record-summary', text: `remaining: ${rec.remaining.join('; ')}` }) : null,
+    rec.violations?.length
+      ? el('div', { class: 'record-summary', text: `violations: ${rec.violations.map((v) => (typeof v === 'string' ? v : JSON.stringify(v))).join('; ')}` })
+      : null,
+    artifacts.length > 0
+      ? el('div', { class: 'record-artifacts' }, [
+        el('span', { class: 'progress-label', text: 'artifacts' }),
+        ...artifacts.map((name) => el('span', { class: 'mono', text: name })),
+      ])
+      : null,
   ]);
 }
 
@@ -1599,6 +1909,7 @@ function renderTaskPage(page, id, detail) {
   wrap.appendChild(el('div', { class: 'task-page-topbar' }, [
     el('button', { class: 'btn btn-ghost', text: '← Board', onclick: gotoBoard }),
     el('div', { class: 'task-topbar-right' }, [
+      buildPauseControl(id, detail),
       buildEditorControls(id),
       typeof runtime?.spent_usd === 'number' ? el('span', { class: 'spent mono', text: fmtUsd(runtime.spent_usd) }) : null,
     ]),
@@ -1626,12 +1937,17 @@ function renderTaskPage(page, id, detail) {
     ]));
   }
 
+  const progressNode = buildProgressPanelNode(detail);
+  if (progressNode) main.appendChild(progressNode);
+
   const { content, actions } = buildReviewMain(id, detail);
   for (const node of content) main.appendChild(node);
 
   if (detail.working) main.appendChild(buildStreamTailNode(lastStreamTail));
   // 新状态机任务看记录 + 内核事实；旧任务继续看四门轮次证据链（AC-029）。
   if (detail.isRouterTask) {
+    const digestNode = buildDigestPanelNode(lastDigest);
+    if (digestNode) main.appendChild(digestNode);
     const recordsNode = buildRecordsSectionNode(detail.records);
     if (recordsNode) main.appendChild(recordsNode);
     const factsNode = buildFactsSectionNode(detail.facts);

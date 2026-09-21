@@ -101,10 +101,11 @@ export function collectTask(root, box, id) {
 
   // committer 提案有效性：优先读结构化事件流（H17，events.jsonl）；legacy 任务（无事件文件
   // 或无 committer 事件）回退 timeline 文案 grep（E8 口径，保持历史 11 任务可比）。
+  const events = readEvents(dossierDir);
   let committerValidAttempt = null;
   let committerDegraded = false;
   let sawCommitterEvents = false;
-  for (const ev of readEvents(dossierDir)) {
+  for (const ev of events) {
     if (ev.type === 'committer_attempt') {
       sawCommitterEvents = true;
       if (ev.outcome === 'valid' && committerValidAttempt === null) committerValidAttempt = ev.attempt ?? null;
@@ -122,7 +123,7 @@ export function collectTask(root, box, id) {
     } catch { /* timeline 缺失 */ }
   }
 
-  const router = collectRouterEra(root, id, isRouter);
+  const router = collectRouterEra(root, id, isRouter, events);
 
   return {
     id,
@@ -161,13 +162,50 @@ function latestReviewerBefore(records, round) {
   return best;
 }
 
+/** 摘要的逐版本元数据（`dossier/<id>/digest/<sha12>.meta.json`，内核写）：尝试次数与当时的校验结果。 */
+function collectDigestMeta(dossierDir) {
+  const dir = path.join(dossierDir, 'digest');
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch { return []; }
+  return names
+    .filter((n) => /^[0-9a-f]{12}\.meta\.json$/.test(n))
+    .sort()
+    .map((n) => {
+      const meta = readJsonIf(path.join(dir, n)) ?? {};
+      return {
+        sha: n.slice(0, 12),
+        attempts: Array.isArray(meta.attempts) ? meta.attempts.length : 0,
+        valid: meta.valid === true,
+      };
+    });
+}
+
+/** 事件流里按 type 计数（本工具只取关心的几类，其余忽略）。 */
+function countEvents(events, types) {
+  const counts = Object.fromEntries(types.map((t) => [t, 0]));
+  for (const ev of events ?? []) {
+    if (Object.hasOwn(counts, ev?.type)) counts[ev.type] += 1;
+  }
+  return counts;
+}
+
+/** 分桶计数：worker 的 profile / outcome 分布都走这一个。 */
+function tally(target, key) {
+  const k = key ?? 'unset';
+  target[k] = (target[k] ?? 0) + 1;
+}
+
 /**
  * 新状态机的逐任务证据（AC-029）：router 轮次、precommit 各步与 tier、各角色成本、人闸，
  * 以及 reviewer 的分诊模式与测试审的后效。
  * 记录合成复用 `conductor/lib/records.mjs::composeRecords`——本工具不另写一套 log 解析。
  * P2b 的工作包字段（包数 / 并行轮数 / plan 次数）先按 0 输出并预留，字段名与后续实现对齐。
+ *
+ * 并行纪元补充：worker（router 派出的委派执行者）与 digest（摘要 agent）两个角色同样进
+ * agent_records 与角色成本；worker 另按权限档分布、截断 / 中断 / 自动续跑单独计数——
+ * 「续跑」的判据是内核盖的 resume_of，不是文案。
  */
-function collectRouterEra(root, id, isRouter) {
+function collectRouterEra(root, id, isRouter, events = []) {
   const empty = {
     is_router: false,
     router_rounds: [],
@@ -180,6 +218,9 @@ function collectRouterEra(root, id, isRouter) {
     packages_count: 0,
     parallel_rounds: 0,
     plan_runs: 0,
+    worker: { rounds: 0, by_profile: {}, outcomes: {}, truncated: 0, interrupted: 0, auto_continue: 0, product_not_ok: 0 },
+    digest: { spawns: 0, cost_usd: 0, versions: 0, valid_versions: 0, attempts: 0, ready: 0, invalid: 0, failed: 0 },
+    event_counts: { boundary_violation: 0, recovered: 0 },
   };
   if (!isRouter) return empty;
 
@@ -207,19 +248,59 @@ function collectRouterEra(root, id, isRouter) {
     else mergeRejectedAfterTests += 1;
   }
 
+  const workerRecords = records.filter((r) => r.role === 'worker');
+  const worker = {
+    rounds: workerRecords.length,
+    by_profile: {},
+    outcomes: {},
+    truncated: workerRecords.filter((r) => r.truncated === true).length,
+    interrupted: workerRecords.filter((r) => r.interrupted === true).length,
+    // 自动续跑 = 内核标了 resume_of 的那一次 spawn（接着上一次会话做，不是重新派工）。
+    auto_continue: workerRecords.filter((r) => r.resume_of != null).length,
+    product_not_ok: workerRecords.filter((r) => r.product !== 'ok').length,
+  };
+  for (const r of workerRecords) {
+    tally(worker.by_profile, r.profile);
+    tally(worker.outcomes, r.outcome);
+  }
+
+  const digestRecords = records.filter((r) => r.role === 'digest');
+  const digestMeta = collectDigestMeta(path.join(root, 'dossier', id));
+  const digestEvents = countEvents(events, ['digest_ready', 'digest_invalid', 'digest_failed']);
+  const digest = {
+    spawns: digestRecords.length,
+    cost_usd: round6(digestRecords.reduce((s, r) => s + (r.cost_usd ?? 0), 0)),
+    versions: digestMeta.length,
+    valid_versions: digestMeta.filter((m) => m.valid).length,
+    attempts: digestMeta.reduce((s, m) => s + m.attempts, 0),
+    ready: digestEvents.digest_ready,
+    invalid: digestEvents.digest_invalid,
+    failed: digestEvents.digest_failed,
+  };
+
   return {
     is_router: true,
     router_rounds: records.filter((r) => r.role === 'router').map((r) => ({
       round: r.round, action: r.action, tier: r.tier, product: r.product, cost_usd: r.cost_usd ?? 0,
     })),
     agent_records: records
-      .filter((r) => r.role === 'spec' || r.role === 'maker' || r.role === 'reviewer')
+      .filter((r) => ['spec', 'maker', 'reviewer', 'worker', 'digest'].includes(r.role))
       .map((r) => ({
         round: r.round, role: r.role, package: r.package, mode: r.mode, outcome: r.outcome,
         tier: r.tier, product: r.product, truncated: r.truncated === true, cost_usd: r.cost_usd ?? 0,
         duration_ms: r.duration_ms ?? null,
         review_mode: r.role === 'reviewer' ? reviewModeOf(r) : null,
+        // worker 专属的内核事实（谁、按什么权限档、做什么、接着谁做、集成了没有）。
+        key: r.key ?? null,
+        profile: r.profile ?? null,
+        intent: r.intent ?? null,
+        interrupted: r.interrupted === true,
+        resume_of: r.resume_of ?? null,
+        integration: r.integration ?? null,
       })),
+    worker,
+    digest,
+    event_counts: countEvents(events, ['boundary_violation', 'recovered']),
     precommit_rounds: records.filter((r) => r.role === 'precommit').map((r) => ({
       round: r.round,
       outcome: r.outcome,
@@ -344,6 +425,24 @@ function collectRouterSummary(tasks) {
     b.duration_ms += r.duration_ms ?? 0;
   }
 
+  // worker / digest / 边界与恢复事件：逐任务已经分好桶，这里只做加法，口径不在两处各写一遍。
+  const worker = { rounds: 0, by_profile: {}, outcomes: {}, truncated: 0, interrupted: 0, auto_continue: 0, product_not_ok: 0 };
+  const digest = { spawns: 0, cost_usd: 0, versions: 0, valid_versions: 0, attempts: 0, ready: 0, invalid: 0, failed: 0 };
+  const eventCounts = { boundary_violation: 0, recovered: 0 };
+  for (const t of routerTasks) {
+    for (const k of ['rounds', 'truncated', 'interrupted', 'auto_continue', 'product_not_ok']) {
+      worker[k] += t.worker?.[k] ?? 0;
+    }
+    for (const [bucket, key] of [['by_profile', 'by_profile'], ['outcomes', 'outcomes']]) {
+      for (const [name, n] of Object.entries(t.worker?.[key] ?? {})) worker[bucket][name] = (worker[bucket][name] ?? 0) + n;
+    }
+    for (const k of ['spawns', 'versions', 'valid_versions', 'attempts', 'ready', 'invalid', 'failed']) {
+      digest[k] += t.digest?.[k] ?? 0;
+    }
+    digest.cost_usd = round6(digest.cost_usd + (t.digest?.cost_usd ?? 0));
+    for (const k of Object.keys(eventCounts)) eventCounts[k] += t.event_counts?.[k] ?? 0;
+  }
+
   return {
     tasks: routerTasks.length,
     rounds_total: routerRounds.length,
@@ -351,6 +450,9 @@ function collectRouterSummary(tasks) {
     router_product_not_ok: routerRounds.filter((r) => r.product !== 'ok').length,
     maker_product_not_ok: agents.filter((r) => r.role === 'maker' && r.product !== 'ok').length,
     maker_truncated: agents.filter((r) => r.role === 'maker' && r.truncated).length,
+    worker,
+    digest,
+    event_counts: eventCounts,
     reviewer_fails: agents.filter((r) => r.role === 'reviewer' && r.outcome === 'fail').length,
     reviewer_rounds: agents.filter((r) => r.role === 'reviewer').length,
     reviewer_by_mode: byMode,
@@ -370,6 +472,27 @@ function collectRouterSummary(tasks) {
     parallel_rounds: routerTasks.reduce((s, t) => s + t.parallel_rounds, 0),
     plan_runs: routerTasks.reduce((s, t) => s + t.plan_runs, 0),
   };
+}
+
+/** `a×2，b×1` 形式的分桶文案（多的在前、同数按名字）；空桶给「（无）」。
+ *  显式排序而不是靠插入顺序：插入顺序取决于记录合成的次序，同一批数据不该渲染出两种文案。 */
+function bucketText(bucket) {
+  const entries = Object.entries(bucket ?? {}).sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]));
+  return entries.length > 0 ? entries.map(([k, v]) => `${k}×${v}`).join('，') : '（无）';
+}
+
+/** worker / 摘要 / 边界与恢复三行（并行纪元的量尺）；没有数据时也照常出现，口径不随数据漂移。 */
+function renderWorkerLines(router) {
+  const w = router.worker ?? { rounds: 0, by_profile: {}, outcomes: {}, truncated: 0, interrupted: 0, auto_continue: 0, product_not_ok: 0 };
+  const d = router.digest ?? { spawns: 0, cost_usd: 0, versions: 0, valid_versions: 0, attempts: 0, ready: 0, invalid: 0, failed: 0 };
+  const e = router.event_counts ?? { boundary_violation: 0, recovered: 0 };
+  return [
+    `- worker：${w.rounds} 轮（权限档：${bucketText(w.by_profile)}；结果：${bucketText(w.outcomes)}）；`
+    + `截断 ${w.truncated}，中断 ${w.interrupted}，自动续跑 ${w.auto_continue}，无交付 ${w.product_not_ok}`,
+    `- 摘要：${d.spawns} 次会话（$${d.cost_usd}）；spec 版本 ${d.versions}（有效 ${d.valid_versions}），尝试 ${d.attempts} 次；`
+    + `事件 ready ${d.ready} / invalid ${d.invalid} / failed ${d.failed}`,
+    `- 边界与恢复：越界改动 ${e.boundary_violation} 次；崩溃后恢复 ${e.recovered} 次`,
+  ];
 }
 
 function round6(n) {
@@ -449,6 +572,7 @@ function renderRouterSection(router) {
   L.push(`- precommit：${router.precommit.runs} 次（ok ${router.precommit.ok} / fail ${router.precommit.fail}）；tier 分布：${tiers}`);
   L.push(`- precommit 各步：${steps}`);
   L.push(`- 人闸：spec×${router.human_gates.spec}，merge×${router.human_gates.merge}，help×${router.human_gates.help}`);
+  L.push(...renderWorkerLines(router));
   L.push(`- 各角色成本：${roles}`);
   L.push(`- 工作包（P2b 预留）：包数 ${router.packages_total}；并行轮数 ${router.parallel_rounds}；plan 次数 ${router.plan_runs}`);
   L.push('');
@@ -519,6 +643,15 @@ export function renderTaskDetail(t) {
     lines.push(`precommit: ${t.precommit_rounds.map((p) => `r${p.round} ${p.tier ?? '?'} ${p.outcome ?? '?'}`).join('；') || '-'}`);
     lines.push(`precommit 各步: ${t.precommit_rounds.map((p) => p.steps.map((s) => `${s.step}:${s.status}`).join(',')).join('；') || '-'}`);
     lines.push(`人闸: ${t.human_gates.map((g) => `${g.kind}:${g.decision ?? 'pending'}`).join('，') || '-'}`);
+    const workers = t.agent_records.filter((r) => r.role === 'worker');
+    lines.push(`worker: ${workers.map((r) => `r${r.round} ${r.key ?? '?'}/${r.profile ?? '?'}/${r.intent ?? '?'} ${r.outcome ?? '未知'}`
+      + `${r.truncated ? ' truncated' : ''}${r.interrupted ? ' interrupted' : ''}${r.resume_of ? ` resume_of:r${r.resume_of}` : ''}`
+      + `${r.integration ? ` integration:${r.integration}` : ''}`).join('；') || '-'}`);
+    lines.push(`worker 汇总: ${t.worker.rounds} 轮（权限档 ${bucketText(t.worker.by_profile)}）；`
+      + `截断 ${t.worker.truncated} / 中断 ${t.worker.interrupted} / 自动续跑 ${t.worker.auto_continue}`);
+    lines.push(`摘要: ${t.digest.spawns} 次会话（$${t.digest.cost_usd}）；版本 ${t.digest.versions}（有效 ${t.digest.valid_versions}）；`
+      + `尝试 ${t.digest.attempts}；事件 ready ${t.digest.ready} / invalid ${t.digest.invalid} / failed ${t.digest.failed}`);
+    lines.push(`边界与恢复: 越界改动 ${t.event_counts.boundary_violation} / 恢复 ${t.event_counts.recovered}`);
     lines.push(`各角色成本: ${Object.entries(t.role_cost_usd).map(([k, v]) => `${k} $${v}`).join('，') || '-'}`);
     const reviews = t.agent_records.filter((r) => r.role === 'reviewer');
     lines.push(`reviewer 模式: ${reviews.map((r) => `r${r.round} ${r.review_mode ?? '未分诊'}（$${r.cost_usd}，${minutes(r.duration_ms)} min）`).join('，') || '-'}`);

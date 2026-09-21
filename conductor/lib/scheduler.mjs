@@ -2,6 +2,7 @@
 import path from 'node:path';
 import * as state from './state.mjs';
 import { withTaskLock } from './task-lock.mjs';
+import { stopRequested, syncRunSessionCost } from './run-session.mjs';
 
 function positiveInt(value, fallback) {
   const n = Number(value);
@@ -20,6 +21,8 @@ function readQueueTask(cfg, id) {
 async function runTaskChain(cfg, id, handlers, { maxStepsPerTask, taskLockRetries, taskLockRetryDelayMs }) {
   let changedInChain = false;
   for (let step = 0; step < maxStepsPerTask; step++) {
+    // 停止请求：步与步之间是干净的边界（上一步的状态已落盘），在这里停不丢任何东西。
+    if (stopRequested(cfg)) return { id, changed: changedInChain, capped: false, stopped: true };
     const result = await withTaskLock(
       cfg,
       id,
@@ -96,6 +99,7 @@ export function addRunCost(cfg, costUsd) {
   if (!cfg.__runBudget) return;
   const cost = Number(costUsd) || 0;
   cfg.__runBudget.spent = Math.round((cfg.__runBudget.spent + cost) * 1e6) / 1e6;
+  syncRunSessionCost(cfg); // 运行账本同步落盘：批次边界、进程重启都不会把已花金额清零
 }
 
 /**

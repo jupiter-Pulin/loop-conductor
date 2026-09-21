@@ -132,3 +132,88 @@ export function diffStatAgainstBase(wtPath, baseBranch) {
   if (r.status === 0) return r.stdout;
   return git(['diff', '--stat', 'HEAD'], wtPath).stdout ?? '';
 }
+
+// ---- 委派（dispatch）用到的几个小件：全部幂等，失败不抛（返回 { ok, error }）除非另有说明 ----
+
+export function headOf(wtOrRepo, ref = 'HEAD') {
+  const r = git(['rev-parse', '--verify', '--quiet', ref], wtOrRepo);
+  return r.status === 0 && r.stdout.trim() !== '' ? r.stdout.trim() : null;
+}
+
+/** ref 指向的 tree 哈希：判断「代码到底变没变」用它，不用 commit 哈希（空提交会变 commit 不变 tree）。 */
+export function treeOf(wtOrRepo, ref = 'HEAD') {
+  return headOf(wtOrRepo, `${ref}^{tree}`);
+}
+
+export function isDirty(wt) {
+  const r = git(['status', '--porcelain'], wt);
+  return r.status === 0 && r.stdout.trim() !== '';
+}
+
+/** 有改动才提交（委派不产生空提交）；返回提交后的 HEAD，没有改动返回 null。 */
+export function commitIfDirty(wt, message) {
+  if (!isDirty(wt)) return null;
+  gitOk(['add', '-A'], wt);
+  const r = git(['commit', '-m', message, '--no-verify'], wt);
+  if (r.status !== 0) throw new Error(`git commit failed (cwd=${wt}): ${(r.stderr || r.stdout || '').trim()}`);
+  return headOf(wt);
+}
+
+/** a 是不是 b 的祖先（含相等）：「这个分支是否已经集成进任务分支」的事实判据，恢复流程靠它避免重复集成。 */
+export function isAncestor(repo, a, b) {
+  if (!a || !b) return false;
+  return git(['merge-base', '--is-ancestor', a, b], repo).status === 0;
+}
+
+export function changedFilesBetween(repo, from, to) {
+  if (!from || !to) return [];
+  const r = git(['diff', '--name-only', `${from}..${to}`], repo);
+  return r.status === 0 ? r.stdout.split('\n').map((l) => l.trim()).filter(Boolean) : [];
+}
+
+/** 是否正卡在一次没做完的 merge 里（runner 崩在集成中途的残留）。 */
+export function mergeInProgress(wt) {
+  return git(['rev-parse', '--verify', '--quiet', 'MERGE_HEAD'], wt).status === 0;
+}
+
+/**
+ * 在 wt（任务 worktree，检出着任务分支）里把 branch 合进来。冲突 → 记下冲突文件、`merge --abort`
+ * 还原现场，返回 { ok:false, conflict_files }；任务分支不留半合并状态。
+ */
+export function mergeInto(wt, branch, message) {
+  if (mergeInProgress(wt)) git(['merge', '--abort'], wt);
+  const r = git(['merge', '--no-ff', '--no-edit', '-m', message, branch], wt);
+  if (r.status === 0) return { ok: true, head: headOf(wt), conflict_files: [] };
+  const u = git(['diff', '--name-only', '--diff-filter=U'], wt);
+  const files = u.status === 0 ? u.stdout.split('\n').map((l) => l.trim()).filter(Boolean) : [];
+  git(['merge', '--abort'], wt);
+  return { ok: false, head: headOf(wt), conflict_files: files, error: (r.stderr || r.stdout || '').trim().slice(0, 400) };
+}
+
+/** 在 commit 上（重）建一个 detached worktree：先清掉同路径的残留。 */
+export function recreateDetachedWorktree(repo, wtPath, commit) {
+  removeWorktree(repo, wtPath);
+  fs.rmSync(wtPath, { recursive: true, force: true });
+  fs.mkdirSync(path.dirname(wtPath), { recursive: true });
+  return addDetachedWorktree(repo, wtPath, commit);
+}
+
+/**
+ * 为一个并行的 write 委派准备独立 worktree：分支 `branch` 从 startPoint 起。
+ * 同名分支已存在时：已经并入任务分支的直接重置到 startPoint；还有没并入的提交（上次冲突留下的）
+ * 先改名归档（`<branch>--r<tag>`）再重建——旧工作留着给人和 router 参考，绝不悄悄丢。
+ */
+export function prepareBranchWorktree(repo, wtPath, branch, startPoint, { excludePatterns = [], archiveTag = 'old', mergedInto = null } = {}) {
+  removeWorktree(repo, wtPath);
+  fs.rmSync(wtPath, { recursive: true, force: true });
+  if (branchExists(repo, branch)) {
+    const tip = headOf(repo, `refs/heads/${branch}`);
+    const merged = mergedInto ? isAncestor(repo, tip, mergedInto) : false;
+    if (!merged) git(['branch', '-M', branch, `${branch}--r${archiveTag}`], repo);
+    else git(['branch', '-D', branch], repo);
+  }
+  fs.mkdirSync(path.dirname(wtPath), { recursive: true });
+  gitOk(['worktree', 'add', '-b', branch, wtPath, startPoint], repo);
+  if (excludePatterns.length > 0) installWorktreeExcludes(wtPath, excludePatterns);
+  return wtPath;
+}

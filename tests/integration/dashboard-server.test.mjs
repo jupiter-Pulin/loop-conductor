@@ -10,9 +10,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { makeEnv, REPO_ROOT, FAKE_CLAUDE } from '../helpers/env.mjs';
-import { makerStep, newRouterEnv, reviewerStep, routerStep, specStep } from '../helpers/router-env.mjs';
+import { bigSpec, makeDigest, makerStep, newRouterEnv, reviewerStep, routerStep, specStep } from '../helpers/router-env.mjs';
 import { FIXED_STATS } from '../helpers/target-fixture.mjs';
 import { loadCfg } from '../../conductor/conductor.mjs';
+import { sha256Of, shortSha } from '../../conductor/lib/spec-version.mjs';
 import { setupProfilePaths } from '../../conductor/lib/profile.mjs';
 import { tryAcquireTaskLock } from '../../conductor/lib/task-lock.mjs';
 
@@ -293,8 +294,9 @@ test('AC-005: GET /api/board 泳道固定顺序、契约字段齐全，每次请
   assert.ok(entry, '新写入的任务应在下一次请求中现读到（无跨请求缓存）');
   assert.deepEqual(
     Object.keys(entry).sort(),
-    ['awaitingKind', 'box', 'column', 'id', 'kind', 'lane', 'lastFailureType', 'legacy', 'needsHuman', 'rateLimit', 'spentUsd', 'stage', 'title', 'working'].sort(),
+    ['awaitingKind', 'box', 'column', 'id', 'kind', 'lane', 'lastFailureType', 'legacy', 'needsHuman', 'phase', 'rateLimit', 'spentUsd', 'stage', 'title', 'working'].sort(),
   );
+  assert.equal(entry.phase, null, '遗留任务没有阶段口径（新纪元任务才有）');
   // 遗留 stage 名的任务不占任何新列，归 legacy 分组（AC-029）
   assert.equal(second.body.columns.every((c) => c.tasks.length === 0), true);
   assert.deepEqual(second.body.legacy.map((tk) => tk.id), [id]);
@@ -1360,4 +1362,135 @@ test('AC-023: dashboard 的 auto-run 不把 FAILED_BOX 任务搬出来（限额�
   assert.equal(detail.body.review.kind, 'failed');
   assert.equal(detail.body.review.lastFailureType, 'rate_limited');
   assert.equal(detail.body.review.rateLimit.resets_at, resetsAt);
+});
+
+// ---- 并行纪元：摘要只读端点 + pause / unpause 往返 ----
+
+/** 直接把摘要产物写进案卷（不起 agent）：<sha12>.json / .meta.json / .source.md，布局同 lib/digest-store.mjs。 */
+function seedDigest(env, id, { specText, digest = null, meta = null, snapshot = true } = {}) {
+  fs.writeFileSync(path.join(env.root, 'specs', `${id}.md`), specText);
+  const sha = sha256Of(specText);
+  const dir = path.join(env.dossier(id), 'digest');
+  fs.mkdirSync(dir, { recursive: true });
+  if (snapshot) fs.writeFileSync(path.join(dir, `${shortSha(sha)}.source.md`), specText);
+  if (digest) fs.writeFileSync(path.join(dir, `${shortSha(sha)}.json`), JSON.stringify(digest, null, 2));
+  if (meta) fs.writeFileSync(path.join(dir, `${shortSha(sha)}.meta.json`), JSON.stringify(meta, null, 2));
+  return sha;
+}
+
+test('GET /api/task/:id/digest: 合格摘要 200 带本体与可回溯原文；缺摘要仍 200 且说清状态；非法 id 400；未知 id 404', async (t) => {
+  const env = makeEnv(t);
+  const specText = bigSpec(3);
+
+  const okId = 'task-20260920-701';
+  env.writeRouterTask(okId);
+  const sha = seedDigest(env, okId, {
+    specText,
+    digest: makeDigest(specText),
+    meta: { schema_version: 1, spec_sha256: sha256Of(specText), attempts: [{ n: 1 }], valid: true, model: 'claude-haiku-4-5-20251001' },
+  });
+
+  const missingId = 'task-20260920-702';
+  env.writeRouterTask(missingId);
+  seedDigest(env, missingId, { specText });
+
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+
+  const ok = await getJson(srv.baseUrl, `/api/task/${okId}/digest`);
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.state, 'valid');
+  assert.equal(ok.body.spec.sha, sha);
+  assert.equal(ok.body.spec.short, shortSha(sha));
+  assert.equal(ok.body.model, 'claude-haiku-4-5-20251001');
+  assert.equal(ok.body.attempts, 1);
+  assert.equal(ok.body.digest.schema, 'spec-digest/v1');
+  assert.deepEqual(ok.body.digest.acs.map((a) => a.id), ['AC-001', 'AC-002', 'AC-003']);
+  // 每条引用都能在返回的原文里落到实处（面板据此展开被引用的行）
+  assert.equal(ok.body.sourceFrom, 'snapshot');
+  const sourceLines = ok.body.source.split('\n');
+  for (const item of ok.body.digest.acs) {
+    for (const ref of item.refs) {
+      const [start, end] = ref.lines;
+      assert.ok(sourceLines.slice(start - 1, end).some((l) => l.includes(ref.quote)), `${item.id} 的引用落不到原文`);
+    }
+  }
+
+  const missing = await getJson(srv.baseUrl, `/api/task/${missingId}/digest`);
+  assert.equal(missing.status, 200);
+  assert.equal(missing.body.state, 'missing');
+  assert.equal(missing.body.digest, null, '没有摘要就是没有，不得给一个空壳当有效摘要');
+  assert.equal(missing.body.spec.sha, sha256Of(specText));
+  assert.ok(typeof missing.body.source === 'string' && missing.body.source.length > 0, '原文照常给：router 降级时读的就是它');
+
+  const badId = await getJson(srv.baseUrl, '/api/task/not-a-task-id/digest');
+  assert.equal(badId.status, 400);
+  const unknown = await getJson(srv.baseUrl, '/api/task/task-20260920-799/digest');
+  assert.equal(unknown.status, 404);
+});
+
+test('GET /api/task/:id/digest: 摘要对当前原文不合格时 200 + state=invalid + 原因，绝不 500', async (t) => {
+  const env = makeEnv(t);
+  const specText = bigSpec(3);
+  const id = 'task-20260920-703';
+  env.writeRouterTask(id);
+  // 人在闸上改了 spec：盘上的摘要绑的是旧版本 → 现算判定 invalid
+  seedDigest(env, id, { specText, digest: makeDigest(specText, (d) => { d.source_sha256 = 'f'.repeat(64); }) });
+
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+  const res = await getJson(srv.baseUrl, `/api/task/${id}/digest`);
+  assert.equal(res.status, 200);
+  assert.equal(res.body.state, 'invalid');
+  assert.equal(res.body.digest, null);
+  assert.ok(res.body.errors.length > 0);
+  assert.match(res.body.errors.join('\n'), /source_sha256/);
+});
+
+test('pause / unpause: 同步动作往返写/删 PAUSED 标记，详情载荷的 paused 与阶段跟着变；遗留任务被拒', async (t) => {
+  const env = makeEnv(t);
+  const id = 'task-20260920-710';
+  env.writeRouterTask(id);
+  const legacyId = 'task-20260713-711';
+  env.writeTask(legacyId, { stage: 'READY' });
+  const marker = path.join(env.root, 'state', 'queue', id, 'PAUSED');
+
+  const srv = await startDashboard(t, env, ['--port', '0', '--no-auto-run']);
+
+  const before = await getJson(srv.baseUrl, `/api/task/${id}`);
+  assert.equal(before.body.paused, false);
+  assert.equal(before.body.phase.code, 'ready');
+
+  const paused = await postJson(srv.baseUrl, `/api/task/${id}/pause`, { notes: '先停一下，等我看完 diff' });
+  assert.equal(paused.status, 200);
+  assert.equal(paused.body.ok, true, paused.body.message);
+  assert.ok(fs.existsSync(marker), 'pause 必须落 PAUSED 标记');
+  assert.equal(JSON.parse(fs.readFileSync(marker, 'utf8')).notes, '先停一下，等我看完 diff');
+
+  const during = await getJson(srv.baseUrl, `/api/task/${id}`);
+  assert.equal(during.body.paused, true);
+  assert.equal(during.body.phase.code, 'waiting_human');
+  assert.equal(during.body.phase.label, 'Waiting for you');
+  assert.match(during.body.view.phase.next, /unpause/);
+  // 暂停不改 stage、不动箱
+  assert.equal(during.body.runtime.stage, 'ROUTING');
+  assert.equal(during.body.box, 'queue');
+  assert.deepEqual(env.events(id).filter((e) => e.type === 'paused').length, 1);
+
+  const board = await getJson(srv.baseUrl, '/api/board');
+  const card = board.body.columns.find((c) => c.column === 'ROUTING').tasks.find((e) => e.id === id);
+  assert.deepEqual(card.phase, { code: 'waiting_human', label: 'Waiting for you' });
+
+  const resumed = await postJson(srv.baseUrl, `/api/task/${id}/unpause`, {});
+  assert.equal(resumed.body.ok, true, resumed.body.message);
+  assert.equal(fs.existsSync(marker), false);
+  const after = await getJson(srv.baseUrl, `/api/task/${id}`);
+  assert.equal(after.body.paused, false);
+  assert.equal(after.body.phase.code, 'ready');
+  assert.equal(env.events(id).filter((e) => e.type === 'unpaused').length, 1);
+
+  // 遗留任务：按钮不给，硬 POST 也只得到 200 + ok:false，状态零变化
+  const legacy = await postJson(srv.baseUrl, `/api/task/${legacyId}/pause`, {});
+  assert.equal(legacy.status, 200);
+  assert.equal(legacy.body.ok, false);
+  assert.match(legacy.body.message, /legacy task/);
+  assert.equal(fs.existsSync(path.join(env.root, 'state', 'queue', legacyId, 'PAUSED')), false);
 });

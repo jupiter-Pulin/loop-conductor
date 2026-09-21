@@ -70,9 +70,16 @@ test('AC-006：提到「git push」的文件必须在白名单内', () => {
   );
 });
 
+// router 现在读得懂内容（摘要、spec 原文、产物、diff），工具集从 ['Write'] 扩到只读三件 + Write。
+// 但「读」不扩大执行权限：它仍然一个 Bash 都没有，所以不可能执行 git，更不可能 push。
+// worker 的 read 档同理——那是无执行能力那一档的定义，混进 Bash 就等于多了一条 push 通道。
 test('AC-006：router 的工具集不含 Bash，maker 的 git 护栏仍拦 push', async () => {
-  const { ROLE_TOOLS } = await import('../../conductor/lib/agent-settings.mjs');
-  assert.deepEqual([...ROLE_TOOLS.router], ['Write']);
+  const { ROLE_TOOLS, WORKER_TOOLS } = await import('../../conductor/lib/agent-settings.mjs');
+  assert.deepEqual([...ROLE_TOOLS.router], ['Read', 'Grep', 'Glob', 'Write']);
+  // 连 `Bash(git …:*)` 这种窄白名单都不给：有 Bash 前缀就有命令行，push 只是少打几个字的事。
+  assert.equal(ROLE_TOOLS.router.some((t) => t.startsWith('Bash')), false, 'router 不得有任何形式的 Bash');
+  assert.equal(WORKER_TOOLS.read.some((t) => t.startsWith('Bash')), false, 'worker:read 不得有任何形式的 Bash');
+  assert.deepEqual([...ROLE_TOOLS.digest], ['Write'], 'digest 连读盘都没有，更没有 Bash');
   for (const role of ['spec', 'reviewer']) {
     assert.ok(!ROLE_TOOLS[role].includes('Bash'), `${role} 不得有裸 Bash`);
   }

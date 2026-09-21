@@ -38,4 +38,4 @@ brief 全文不超过 100 字。
 
    目标仓须已有 `target-profiles/<repo>/setup-profile.json` 的 `precommit` 段；缺了 `new` 会拒绝并打印样例，把样例贴给用户填，不替他猜命令。
 
-4. 起 run：`npm run conductor -- run`（后台）。回报 task id 与 dashboard `http://127.0.0.1:4401`（未起则 `node conductor/dashboard/server.mjs --port 4401 --no-auto-run`）
+4. 起 run：`npm run conductor -- run --continuous`（后台；批次接批次跑到需要人或做完为止，崩溃后再跑同一条命令会先恢复再继续）。回报 task id 与 dashboard `http://127.0.0.1:4401`（未起则 `node conductor/dashboard/server.mjs --port 4401 --no-auto-run`）

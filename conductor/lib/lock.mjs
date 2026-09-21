@@ -2,6 +2,7 @@
 // 获锁失败直接退出（由调用方决定）；mtime 超 30 分钟仅打印 stale 告警，demo 阶段人工删除。
 import fs from 'node:fs';
 import path from 'node:path';
+import { processState, selfIdentity } from './proc.mjs';
 
 export const STALE_MS = 30 * 60 * 1000;
 
@@ -50,7 +51,10 @@ export function acquireLock(stateDir, { onSelfHeal = null, name = '.lock' } = {}
     if (err.code !== 'EEXIST') throw err;
     let info = null;
     try { info = JSON.parse(fs.readFileSync(path.join(lockDir, 'info.json'), 'utf8')); } catch { /* 锁内无 info 也算占用 */ }
-    if (info?.pid != null && !isPidAlive(Number(info.pid))) {
+    // 持锁进程的身份 = pid + 启动时刻（lib/proc.mjs）：pid 已死、或 pid 被系统复用给了别的进程，
+    // 都是残锁；pid 活着且身份对得上（或旧格式无法确认身份）一律按活锁处理，绝不抢。
+    const holder = info?.pid != null ? processState({ pid: Number(info.pid), pid_started: info.pid_started ?? null }) : 'unknown';
+    if (info?.pid != null && (holder === 'dead' || holder === 'reused')) {
       fs.rmSync(lockDir, { recursive: true, force: true });
       if (onSelfHeal) onSelfHeal(info);
       try {
@@ -62,7 +66,7 @@ export function acquireLock(stateDir, { onSelfHeal = null, name = '.lock' } = {}
         return { acquired: false, stale: isStaleLock(lockDir), info: retryInfo };
       }
       writeJsonAtomic(path.join(lockDir, 'info.json'), {
-        pid: process.pid,
+        ...selfIdentity(),
         acquired_at: new Date().toISOString(),
         self_healed_from_pid: info.pid,
       });
@@ -70,7 +74,7 @@ export function acquireLock(stateDir, { onSelfHeal = null, name = '.lock' } = {}
     }
     return { acquired: false, stale: isStaleLock(lockDir), info };
   }
-  writeJsonAtomic(path.join(lockDir, 'info.json'), { pid: process.pid, acquired_at: new Date().toISOString() });
+  writeJsonAtomic(path.join(lockDir, 'info.json'), { ...selfIdentity(), acquired_at: new Date().toISOString() });
   return { acquired: true };
 }
 

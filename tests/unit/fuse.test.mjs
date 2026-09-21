@@ -1,6 +1,8 @@
 // 单元：保险丝签名与连击判定（AC-024）。
 // 这根丝的唯一职责是「原地打转就停手」：同因失败三次收箱，事实一变就重新计数。
 // 反过来的红线同样重要——正经工作（改了别的 AC、挂了别的用例、换了 tier）绝不能被它误杀。
+// 角色 / outcome 空间后来变大了（worker、digest；partial / blocked）：这根丝只收编
+// precommit / reviewer / maker，新加的记录字段也一律不得渗进签名（否则加字段 = 悄悄重置连击）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { signatureOf, checkFuse, FUSE_ROLES } from '../../conductor/lib/fuse.mjs';
@@ -29,6 +31,17 @@ const maker = (over = {}) => ({
   round: 1, role: 'maker', package: null, outcome: 'ok',
   summary: 'AC-001..004 done；npm test 41/41 绿',
   ...over,
+});
+
+// 后加的两个角色：worker 是 dispatch 派出的委派（带 key / profile），digest 是内核的摘要轮。
+const worker = (over = {}) => ({
+  round: 1, role: 'worker', package: null, key: 'curve-fix', profile: 'write',
+  outcome: 'fail', summary: 'Curve.sol:412 还是编译不过', progress: 'none', integration: 'done',
+  ...over,
+});
+
+const digest = (over = {}) => ({
+  round: 1, role: 'digest', package: null, outcome: 'fail', summary: '摘要没过机械校验：AC-007 缺行号', ...over,
 });
 
 // ---- 签名 ----
@@ -128,6 +141,85 @@ test('router / spec / human 记录不参与保险丝', () => {
   assert.equal(signatureOf('not a record'), null);
 });
 
+test('worker / digest 记录不参与保险丝：角色空间变大了，FUSE_ROLES 没跟着变', () => {
+  assert.equal(FUSE_ROLES.includes('worker'), false, '要收编 worker 得显式改名单，不许靠默认分支漂移');
+  assert.equal(FUSE_ROLES.includes('digest'), false);
+  // worker 的五种 outcome 一个都不产生签名：委派的失败面是报告与 diff，不是这根「同一条失败记录
+  // 反复出现」的丝能比的。反复派同一件事由 router-kernel 的停滞保险丝（checkStallAndBox：指纹含
+  // 任务分支 tree / review 覆盖 / 人的裁决条数）兜底 —— 换个 key 重派也改不了那份指纹。
+  for (const outcome of ['ok', 'partial', 'blocked', 'fail', 'needs_human']) {
+    assert.equal(signatureOf(worker({ outcome })), null, `worker outcome=${outcome} 不该有签名`);
+  }
+  assert.equal(signatureOf(worker({ outcome: null, summary: null })), null, 'log 缺失的 worker 同样不参与');
+  // digest 的重试上限由 digest 动作自己管（digestMaxAttempts，用尽即降级读原文），不进保险丝。
+  assert.equal(signatureOf(digest()), null);
+  assert.equal(signatureOf(digest({ outcome: 'ok' })), null);
+});
+
+test('maker 的新 outcome：partial / needs_human 各自成签名，结论变了就是有进展', () => {
+  const sigs = ['ok', 'partial', 'fail', 'needs_human'].map((outcome) => signatureOf(maker({ outcome })));
+  assert.equal(new Set(sigs).size, 4, 'outcome 进签名式：四种结论必须两两不同');
+  assert.match(signatureOf(maker({ outcome: 'partial' })), /^maker\|-\|partial\|[0-9a-f]{16}$/);
+  assert.match(signatureOf(maker({ outcome: 'needs_human', package: 'P-003' })), /^maker\|P-003\|needs_human\|/);
+
+  // done / remaining 是后加的结构化进度清单，**不**进签名（spec 的签名式只有 package + outcome +
+  // summary 首行）。所以「有进展」必须写进首行：这正是 agent 契约要求首行写结论的原因。
+  assert.equal(
+    signatureOf(maker({ outcome: 'partial', done: ['AC-001'] })),
+    signatureOf(maker({ outcome: 'partial', done: ['AC-001', 'AC-002'], remaining: ['AC-003'] })),
+    'done 变长但首行没变 → 同签名',
+  );
+  assert.notEqual(
+    signatureOf(maker({ outcome: 'partial', summary: 'AC-001..002 done；余 AC-003' })),
+    signatureOf(maker({ outcome: 'partial', summary: 'AC-001..004 done；余 AC-005' })),
+    '首行写清进展就断连',
+  );
+});
+
+test('reviewer 的 partial 照样参与：fail 集合 / tier 一变就是有进展', () => {
+  const twoFails = reviewer({
+    outcome: 'partial',
+    summary: 'AC-001 pass\nAC-002 fail src/x.mjs:40 未扣手续费\nAC-004 fail src/y.mjs:9 越界\n未判: AC-005',
+  });
+  const base = signatureOf(twoFails);
+  assert.match(base, /^reviewer\|integration\|[0-9a-f]{16}$/, 'partial 不是「没失败」，它带着 fail 行照常参与');
+
+  // 修好一条、只剩另一条 → 不同签名。这是最该保住的红线：真修了东西不能被当成打转。
+  assert.notEqual(
+    signatureOf(reviewer({ outcome: 'partial', summary: 'AC-001 pass\nAC-004 fail src/y.mjs:9 越界\n未判: AC-005' })),
+    base,
+  );
+  assert.notEqual(signatureOf(reviewer({ ...twoFails, tier: 'e2e' })), base, 'tier 上台阶也是进展');
+  // 未判清单变长变短都不算：签名只由 fail 行构成。
+  assert.equal(
+    signatureOf(reviewer({ outcome: 'partial', summary: `${twoFails.summary}, AC-006, AC-007` })),
+    base,
+  );
+});
+
+test('新记录字段（key / profile / progress / integration …）不得渗进签名', () => {
+  // records.mjs 这一版给记录加了一堆内核事实。它们若进了签名，每加一个字段就会把**活着的**
+  // 连击悄悄清零——一个已经打转两轮的任务凭空多拿三轮预算，而且没人看得出来。
+  const kernelFacts = {
+    key: 'curve-fix', profile: 'write', intent: 'implement', title: '扣手续费', isolation: 'hooks-only',
+    resume_of: 2, progress: 'changed', integration: 'integrated', violations: ['branch_moved:refs/heads/x'],
+    spec_sha: 'a'.repeat(64), head_sha: 'b'.repeat(40), base_sha: 'c'.repeat(40),
+    done: ['AC-001'], remaining: ['AC-002'], guidance: '先补用例', assignments: null,
+    artifacts: { report: 'maker-r1.report.md', log: 'maker-r1.log.json' },
+    cost_usd: 8.1, cost_unknown: true, truncated: true, interrupted: true, duration_ms: 123,
+    session_id: 's-1', product: 'ok', product_error: null, written_at: '2026-08-30T00:00:00.000Z',
+  };
+  assert.equal(signatureOf(maker({ ...kernelFacts })), signatureOf(maker()));
+  assert.equal(signatureOf(reviewer({ ...kernelFacts })), signatureOf(reviewer()));
+  assert.equal(
+    signatureOf(precommit({ ...kernelFacts, steps: precommit().steps })),
+    signatureOf(precommit()),
+  );
+  // 同一条记录反复算也必须一模一样（纯函数，零 IO）。
+  const rec = maker({ outcome: 'partial' });
+  assert.equal(signatureOf(rec), signatureOf(rec));
+});
+
 // ---- 连击 ----
 
 test('连续 3 条同签名 → 触发；2 条不触发', () => {
@@ -205,4 +297,42 @@ test('空输入与缺失字段不抛错', () => {
   assert.equal(checkFuse([], 3), null);
   assert.equal(checkFuse(null, 3), null);
   assert.equal(checkFuse([null, undefined, {}], 3), null);
+});
+
+test('连击里的新角色：maker partial 照数；worker / digest 既不计数也不打断别人的连击', () => {
+  // 委派轮反复失败不由这根丝收箱（见上面的角色边界）：连五轮一模一样也不触发。
+  assert.equal(checkFuse([1, 2, 3, 4, 5].map((round) => worker({ round })), 3), null);
+  assert.equal(checkFuse([1, 2, 3].map((round) => digest({ round })), 3), null);
+
+  // maker 自述 partial 而整体一直不绿，正是要拦的那种打转：partial 与 ok 一样参与计数。
+  const stuck = (round) => maker({ round, outcome: 'partial', summary: '还在接 sweep 的回归用例' });
+  const tripped = checkFuse([stuck(1), stuck(2), stuck(3)], 3);
+  assert.deepEqual({ role: tripped.role, package: tripped.package }, { role: 'maker', package: null });
+  assert.equal(checkFuse([stuck(1), stuck(2), maker({ round: 3, outcome: 'fail', summary: '还在接 sweep 的回归用例' })], 3), null,
+    'partial → fail：结论变了就是新事实，连击归零');
+
+  // worker / digest 记录对签名丝根本不存在：夹在中间既不算一条，也不会把 maker 的尾部连击切断。
+  // （夹着的那一轮真做了事，任务分支会变 —— 那由停滞保险丝的指纹去认，不是这里的职责。）
+  const across = checkFuse([stuck(1), worker({ round: 2 }), digest({ round: 3 }), stuck(4), stuck(5)], 3);
+  assert.deepEqual({ role: across.role, package: across.package }, { role: 'maker', package: null });
+});
+
+test('reviewer partial 且没有 fail 行：是在续审、不是同因失败——无签名，连判三轮也不触发保险丝', () => {
+  // reviewer 的 partial = 「还有 AC 没判完」（分轮续审）。它的 summary 只写统计与 fail 原因，所以
+  // 「判到第 4 / 9 / 14 条、全 pass」三轮的 fail 集合都是空的；若照样出签名，三轮真进展会被当成打转收箱。
+  // 续审原地打转（覆盖率不涨）由停滞保险丝管——review 覆盖在它的硬进展指纹里，不归这根保险丝。
+  const partial = (round, judged) => reviewer({
+    round, outcome: 'partial', summary: `已判 ${judged}/19，全 pass；未判: AC-${String(judged + 1).padStart(3, '0')}..AC-019`,
+  });
+  assert.equal(signatureOf(partial(1, 4)), null);
+  assert.equal(checkFuse([partial(1, 4), partial(2, 9), partial(3, 14)], 3), null, '三轮各多判 5 条 AC：不是无进展');
+
+  // 对照：partial 里带**独占一行**的 fail（fail 行的抽取是行首锚定的）→ 有签名；同一条 fail 连续三轮 → 触发。
+  const withFail = (round) => reviewer({ round, outcome: 'partial', summary: '已判 9/19\nAC-006 fail src/x.mjs:12 漏了退款\n未判: AC-010..AC-019' });
+  assert.notEqual(signatureOf(withFail(2)), null);
+  assert.equal(checkFuse([partial(1, 4), withFail(2), partial(3, 14)], 3), null, '无签名的记录出现即断连');
+  assert.equal(checkFuse([withFail(1), withFail(2), withFail(3)], 3)?.role, 'reviewer', '同一条 fail 连续三轮仍然收箱');
+  // fail 写在别的文字后面（不在行首）抽不出来 → 等同于零 fail → 无签名。
+  const inlineFail = reviewer({ round: 2, outcome: 'partial', summary: '已判 9/19；AC-006 fail src/x.mjs:12 漏了退款' });
+  assert.equal(signatureOf(inlineFail), null);
 });

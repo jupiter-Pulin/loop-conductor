@@ -11,7 +11,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { loadCfg, resolveRoot } from '../conductor.mjs';
 import {
-  isValidTaskId, buildBoard, buildTaskDetail, buildTaskDiff, formatCliMessage,
+  isValidTaskId, buildBoard, buildTaskDetail, buildTaskDiff, buildTaskDigest, formatCliMessage,
   buildSyncActionArgv, SYNC_ACTIONS, parseNewTaskId, buildNewTaskArgv,
   listActiveSpawns, buildStreamTail,
 } from './model.mjs';
@@ -255,6 +255,9 @@ function handleAsyncAction(cfg, id, action, res, changeBus, autoRun) {
   sendJson(res, 202, { jobId: job.id });
 }
 
+/** 成功后不替人点 run 的动作：pause 的语义就是「别再推它了」，接着起一个 runner 自相矛盾。 */
+const NO_AUTO_RUN_ACTIONS = new Set(['pause']);
+
 async function handleSyncAction(cfg, id, action, req, res, autoRun) {
   const raw = await readBody(req);
   const parsed = parseJsonBody(raw);
@@ -262,7 +265,7 @@ async function handleSyncAction(cfg, id, action, req, res, autoRun) {
   const argv = buildSyncActionArgv(action, id, parsed.body);
   const result = await runConductor(argv);
   const ok = result.exitCode === 0;
-  if (ok && autoRun) spawnDetachedConductor(['run']);
+  if (ok && autoRun && !NO_AUTO_RUN_ACTIONS.has(action)) spawnDetachedConductor(['run']);
   sendJson(res, 200, { ok, exitCode: result.exitCode, message: formatCliMessage(result) });
 }
 
@@ -419,6 +422,15 @@ export function createDashboardServer(cfg, { autoRun = true, forceScan = false }
         const diff = buildTaskDiff(cfg, id);
         if (!diff) { sendJson(res, 404, { error: `task not found: ${id}` }); return; }
         sendJson(res, 200, diff);
+        return;
+      }
+
+      if (parts[0] === 'api' && parts[1] === 'task' && parts.length === 4 && parts[3] === 'digest' && req.method === 'GET') {
+        const id = parts[2];
+        if (!isValidTaskId(id)) { sendJson(res, 400, { error: 'invalid task id' }); return; }
+        const digest = buildTaskDigest(cfg, id);
+        if (!digest) { sendJson(res, 404, { error: `task not found: ${id}` }); return; }
+        sendJson(res, 200, digest);
         return;
       }
 

@@ -6,6 +6,13 @@
 用 Write 增量写 {{log_path}}：判完一条就重写整份 JSON；未判完时 outcome=fail 且 summary 末行写「未判: AC-…」；全部 AC pass 才 ok。summary 每条一行 ≤ 80 字，note ≤ 3 条，总长 ≤ 2000 字符，超长整份作废。
 {"role":"reviewer","outcome":"ok|fail","tier":"unit|integration|e2e","summary":"AC-001 pass\nAC-002 fail src/x.mjs:40 <原因>\nnote: <协作问题>"}
 无 spec 时对照 brief 的目标判，编号 B-001…。
+<!-- section: ledger -->
+[判决台账] AC 多、diff 大时一份 summary 写不下，一次会话也可能判不完。逐条判决写进 {{verdicts_path}}（用 Write；判完一条就重写整份 JSON；这份文件不受 2000 字符限制）：
+{"verdicts":[{"ac":"AC-001","verdict":"pass|fail","evidence":"pass：钉住它的测试或实现的 文件:行；fail：文件:行 + 原因","note":"可省"}]}
+本轮要判：{{todo}}
+{{carried}}
+内核按这份台账对照 spec 的全部 AC 计算覆盖率：没写进台账的 AC 就是没判，outcome 写 ok 也不会放行；不许为了省篇幅跳过任何一条。此时 log 的 summary 只写统计与要点（已判 N/M；fail 的编号各一句原因；未判的编号），不要逐条再抄一遍。outcome：本轮之后全部 AC 都有判决且全 pass → ok；有 fail → fail；还有没判的 → partial。
+验收依据永远是 spec 原文（{{spec_path}}），不是任何摘要，也不是 maker / worker 的自述。{{patch_hint}}
 <!-- section: triage -->
 [分诊] 先看下面的 diff --stat。文件 ≤ 6 ∧ 行数 ≤ 300 ∧ 有测试文件改动 → 测试审；否则全审。测试审途中发现改动触及公共接口、数据契约，或删改了既有测试 → 升为全审，不可反向。summary 首行写 mode=tests|full 与依据（文件数/行数/测试改动）。
 测试审：每条 B-xxx 只答两问——哪个测试钉住它（文件:行）；它在 base（{{base}}）上会不会失败、有没有 mock 掉被测行为，用 git show {{base}}:<path> 看旧实现。没有测试钉住的目标判 fail。不追调用链、不审「保持不变」类，但既有测试被删、跳过或削弱仍判 fail。两种模式都必须声明 tier。

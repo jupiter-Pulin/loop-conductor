@@ -465,6 +465,204 @@ test('collectStats：reviewer 按 summary 首行的 mode 分桶（tests/full/未
   assert.ok(detail.stdout.includes('tests 审后: precommit 红 1 / merge 打回 1'), detail.stdout);
 });
 
+// ---- 并行纪元：worker / digest 进成本与轮次聚合，边界违规与恢复计数 ----
+//
+// 量尺的新维度：一轮派出去几个 worker、按什么权限档、截断/中断/自动续跑各多少、摘要做了几次
+// 是否有效、有没有越界改动与崩溃后恢复。口径同样由测试钉死，否则后续实验对照会失真。
+
+/**
+ * 一个并行案卷：r1 摘要（两次尝试，第二次有效）→ r2 dispatch 出三个 worker（两个 write 一个 read）
+ * → r3 自动续跑其中一个（resume_of=2）。另有一次越界改动与一次崩溃恢复事件。
+ */
+/** dispatch 的 assignments 走内核契约（lib/assignment-contract.mjs）：少一个字段整份 log 就是 invalid。 */
+function assignment(key, title, intent, profile, paths) {
+  return {
+    key, profile, intent, title,
+    purpose: `${title}：本轮目的`, inputs: ['specs/task.md'], scope: '只碰声明范围',
+    deliverables: '产物与结论', done_when: '完成条件写清',
+    ...(profile === 'write' ? { paths } : {}),
+  };
+}
+
+const PARALLEL_DOSSIER = {
+  'digest-r1.json': { role: 'digest', round: 1, cost_usd: 0.008 },
+  'digest-r1.log.json': { role: 'digest', outcome: 'ok', summary: '摘要已写：目标 1 / AC 2' },
+  'router-r2.json': { role: 'router', round: 2, cost_usd: 0.02 },
+  'router-r2.log.json': {
+    role: 'router', outcome: 'ok', action: 'dispatch', summary: '并行三个包',
+    assignments: [
+      assignment('api-layer', '实现 API 层', 'implement', 'write', ['lib/api']),
+      assignment('docs', '更新文档', 'implement', 'write', ['docs']),
+      assignment('probe', '调查现状', 'investigate', 'read'),
+    ],
+  },
+  'worker-api-layer-r2.json': {
+    role: 'worker', round: 2, key: 'api-layer', profile: 'write', intent: 'implement',
+    title: '实现 API 层', cost_usd: 1.2, integration: 'integrated',
+  },
+  'worker-api-layer-r2.log.json': { role: 'worker', outcome: 'ok', summary: 'AC-001 done', done: ['AC-001'], remaining: [] },
+  'worker-docs-r2.json': {
+    role: 'worker', round: 2, key: 'docs', profile: 'write', intent: 'implement',
+    title: '更新文档', cost_usd: 0.4, truncated: true,
+  },
+  'worker-docs-r2.log.json': { role: 'worker', outcome: 'partial', summary: '写了一半', done: [], remaining: ['README'] },
+  'worker-probe-r2.json': {
+    role: 'worker', round: 2, key: 'probe', profile: 'read', intent: 'investigate',
+    title: '调查现状', cost_usd: 0.1, interrupted: true,
+  },
+  // 调查 worker 被中断，没写 log → product=missing（无交付），不是失败也不是成功
+  'worker-docs-r3.json': {
+    role: 'worker', round: 3, key: 'docs', profile: 'write', intent: 'implement',
+    title: '更新文档', cost_usd: 0.3, resume_of: 2,
+  },
+  'worker-docs-r3.log.json': { role: 'worker', outcome: 'ok', summary: '补完', done: ['README'], remaining: [] },
+  'dispatch-r2.json': {
+    schema_version: 1, round: 2, base_head: 'a'.repeat(40), spec_sha: null,
+    created_at: '2026-09-20T00:00:00.000Z', closed: true, closed_at: '2026-09-20T01:00:00.000Z', recovered: true,
+    assignments: [
+      { key: 'api-layer', title: '实现 API 层', profile: 'write', intent: 'implement', state: 'integrated', spawns: [{ round: 2, outcome: 'ok' }] },
+      { key: 'docs', title: '更新文档', profile: 'write', intent: 'implement', state: 'running', spawns: [{ round: 2, outcome: 'partial', truncated: true, session_id: 's-2' }] },
+      { key: 'probe', title: '调查现状', profile: 'read', intent: 'investigate', state: 'skipped', spawns: [{ round: 2, outcome: null, interrupted: true }] },
+    ],
+  },
+};
+
+/** 摘要的逐版本 meta（内核写）：本例是同一版 spec 做了两次尝试，最终有效。 */
+const DIGEST_META = {
+  schema_version: 1, spec_sha256: 'a'.repeat(64),
+  attempts: [{ n: 1, valid: false }, { n: 2, valid: true }], valid: true, model: 'claude-haiku-4-5-20251001',
+};
+
+function writeDigestMeta(root, id, sha12, meta) {
+  const dir = path.join(root, 'dossier', id, 'digest');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${sha12}.meta.json`), JSON.stringify(meta));
+}
+
+test('collectStats：worker / digest 进角色成本与轮次聚合；截断、中断、自动续跑与权限档分布各自计数', (t) => {
+  const root = makeRoot(t);
+  const id = 'task-20260920-600';
+  writeTaskFixture(root, 'queue', id, {
+    runtime: { stage: 'ROUTING', spent_usd: 2.028 },
+    dossier: PARALLEL_DOSSIER,
+  });
+  writeDigestMeta(root, id, 'aaaaaaaaaaaa', DIGEST_META);
+  writeEvents(root, id, [
+    { ts: 't1', type: 'digest_invalid', attempt: 1 },
+    { ts: 't2', type: 'digest_ready', attempt: 2 },
+    { ts: 't3', type: 'boundary_violation', key: 'docs', files: ['lib/api/x.mjs'] },
+    { ts: 't4', type: 'recovered', what: 'worker-probe-r2' },
+    { ts: 't5', type: 'router_decision', action: 'dispatch' },
+  ]);
+
+  const { tasks, summary } = collectStats(root);
+  const task = tasks.find((x) => x.id === id);
+
+  // 逐任务：worker 分桶
+  assert.equal(task.worker.rounds, 4, '四条 worker 记录（r2 三个并行 + r3 续跑）');
+  assert.deepEqual(task.worker.by_profile, { write: 3, read: 1 });
+  assert.deepEqual(task.worker.outcomes, { ok: 2, partial: 1, unset: 1 });
+  assert.equal(task.worker.truncated, 1);
+  assert.equal(task.worker.interrupted, 1);
+  assert.equal(task.worker.auto_continue, 1, '自动续跑按内核盖的 resume_of 计数');
+  assert.equal(task.worker.product_not_ok, 1, '被中断没写 log 的那条是无交付');
+
+  // 逐任务：摘要与事件
+  assert.equal(task.digest.spawns, 1);
+  assert.equal(task.digest.cost_usd, 0.008);
+  assert.deepEqual(
+    [task.digest.versions, task.digest.valid_versions, task.digest.attempts],
+    [1, 1, 2],
+  );
+  assert.deepEqual([task.digest.ready, task.digest.invalid, task.digest.failed], [1, 1, 0]);
+  assert.deepEqual(task.event_counts, { boundary_violation: 1, recovered: 1 });
+
+  // 角色成本：worker / digest 与既有角色同一张表
+  assert.equal(task.role_cost_usd.worker, 2);
+  assert.equal(task.role_cost_usd.digest, 0.008);
+  assert.equal(task.role_cost_usd.router, 0.02);
+
+  // worker / digest 也进 agent_records（带 key/profile/intent/续接关系）
+  const workers = task.agent_records.filter((r) => r.role === 'worker');
+  // 同轮内的次序由记录合成按 log 写入时刻排（没写 log 的排在前），这里只钉集合与逐条事实。
+  assert.deepEqual(workers.map((r) => `r${r.round}:${r.key}`).sort(), ['r2:api-layer', 'r2:docs', 'r2:probe', 'r3:docs']);
+  const byKeyRound = Object.fromEntries(workers.map((r) => [`r${r.round}:${r.key}`, r]));
+  assert.equal(byKeyRound['r3:docs'].resume_of, 2);
+  assert.equal(byKeyRound['r2:api-layer'].integration, 'integrated');
+  assert.equal(byKeyRound['r2:probe'].profile, 'read');
+  assert.equal(byKeyRound['r2:probe'].product, 'missing', '被中断没写 log：只是记录里的一个字段');
+  assert.equal(task.agent_records.filter((r) => r.role === 'digest').length, 1);
+  // 既有口径不被新角色污染
+  assert.equal(summary.router.maker_truncated, 0, 'worker 的截断不算进 maker 截断');
+  assert.equal(summary.router.reviewer_rounds, 0);
+  assert.deepEqual(summary.router.actions, { dispatch: 1 }, 'dispatch 的 log 要真的合契约，否则测的是 invalid');
+  assert.equal(summary.router.router_product_not_ok, 0);
+
+  // 系统级：逐任务分桶相加
+  const r = summary.router;
+  assert.equal(r.worker.rounds, 4);
+  assert.deepEqual(r.worker.by_profile, { write: 3, read: 1 });
+  assert.equal(r.worker.auto_continue, 1);
+  assert.equal(r.digest.attempts, 2);
+  assert.equal(r.digest.valid_versions, 1);
+  assert.deepEqual(r.event_counts, { boundary_violation: 1, recovered: 1 });
+
+  const md = renderMarkdown({ tasks, summary });
+  assert.ok(md.includes('- worker：4 轮（权限档：write×3，read×1'), md);
+  assert.ok(md.includes('截断 1，中断 1，自动续跑 1，无交付 1'), md);
+  assert.ok(md.includes('spec 版本 1（有效 1），尝试 2 次'), md);
+  assert.ok(md.includes('- 边界与恢复：越界改动 1 次；崩溃后恢复 1 次'), md);
+
+  const detail = runCli(['--task', id, root]);
+  assert.equal(detail.code, 0, detail.stderr);
+  assert.ok(detail.stdout.includes('worker 汇总: 4 轮（权限档 write×3，read×1）'), detail.stdout);
+  assert.ok(detail.stdout.includes('自动续跑 1'), detail.stdout);
+  assert.ok(detail.stdout.includes('r3 docs/write/implement ok resume_of:r2'), detail.stdout);
+  assert.ok(detail.stdout.includes('边界与恢复: 越界改动 1 / 恢复 1'), detail.stdout);
+
+  const json = runCli(['--task', id, '--json', root]);
+  assert.equal(json.code, 0, json.stderr);
+  const parsed = JSON.parse(json.stdout);
+  assert.equal(parsed.worker.auto_continue, 1);
+  assert.equal(parsed.digest.versions, 1);
+});
+
+test('collectStats：没有 worker / 摘要 / 事件的 router 任务，新字段是零而不是缺失（输出形状稳定）', (t) => {
+  const root = makeRoot(t);
+  writeTaskFixture(root, 'queue', 'task-20260920-601', {
+    runtime: { stage: 'ROUTING', spent_usd: 1.96 },
+    dossier: ROUTER_DOSSIER,
+  });
+  const { tasks, summary } = collectStats(root);
+  const task = tasks.find((x) => x.id === 'task-20260920-601');
+  assert.deepEqual(task.worker, { rounds: 0, by_profile: {}, outcomes: {}, truncated: 0, interrupted: 0, auto_continue: 0, product_not_ok: 0 });
+  assert.deepEqual(task.digest, { spawns: 0, cost_usd: 0, versions: 0, valid_versions: 0, attempts: 0, ready: 0, invalid: 0, failed: 0 });
+  assert.deepEqual(task.event_counts, { boundary_violation: 0, recovered: 0 });
+
+  // 既有字段一个不少（新增只做加法）
+  for (const field of ['is_router', 'router_rounds', 'agent_records', 'precommit_rounds', 'human_gates', 'role_cost_usd']) {
+    assert.ok(Object.hasOwn(task, field), `既有字段 ${field} 不得消失`);
+  }
+  const md = renderMarkdown({ tasks, summary });
+  assert.ok(md.includes('- worker：0 轮（权限档：（无）'), md);
+  assert.ok(md.includes('- 边界与恢复：越界改动 0 次；崩溃后恢复 0 次'), md);
+});
+
+test('collectStats：遗留任务不带新纪元字段的假数据（worker/摘要恒 0，不进 router 小节）', (t) => {
+  const root = makeRoot(t);
+  writeTaskFixture(root, 'done', 'task-20260701-020', {
+    dossier: { 'maker-r1.json': { round: 1, ok: true, cost_usd: 1, raw: { subtype: 'success' } } },
+  });
+  const { tasks, summary } = collectStats(root);
+  const legacy = tasks.find((x) => x.id === 'task-20260701-020');
+  assert.equal(legacy.is_router, false);
+  assert.equal(legacy.worker.rounds, 0);
+  assert.equal(legacy.digest.spawns, 0);
+  assert.deepEqual(legacy.event_counts, { boundary_violation: 0, recovered: 0 });
+  assert.equal(summary.router.tasks, 0);
+  assert.equal(summary.maker.rounds_total, 1, '旧口径不受影响');
+});
+
 test('collectStats：只有旧任务的仓库里 router 小节为空结构，渲染不报错（AC-029）', (t) => {
   const root = makeRoot(t);
   writeTaskFixture(root, 'done', 'task-20260701-011', {

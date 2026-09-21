@@ -6,6 +6,7 @@ import path from 'node:path';
 import {
   buildClaudeArgs, parseClaudeJson, claudeBin, probeManagedClaudeBin, runClaudeStream,
   isTransientFailure, runClaudeWithRetry, setSleepFn, parseRateLimitEvent, isRateLimited,
+  activeChildPids, killAllActive,
 } from '../../conductor/lib/claude.mjs';
 import { loadCfg } from '../../conductor/conductor.mjs';
 import { FAKE_CLAUDE } from '../helpers/env.mjs';
@@ -30,6 +31,19 @@ function makeFakeClaudeDir(t, steps) {
     fs.rmSync(dir, { recursive: true, force: true });
   });
   return dir;
+}
+
+/**
+ * 打开 fake-claude 的调用日志（makeFakeClaudeDir 默认把它关掉）并返回读取函数。
+ * 「没有重试」这类否定命题只能靠真实 spawn 次数坐实——光看 attempts 数组是自证。
+ * 环境变量由 makeFakeClaudeDir 的 t.after 统一还原，这里不另加钩子。
+ */
+function captureCalls(dir) {
+  const logPath = path.join(dir, 'calls.jsonl');
+  process.env.FAKE_CLAUDE_LOG = logPath;
+  return () => (fs.existsSync(logPath)
+    ? fs.readFileSync(logPath, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l))
+    : []);
 }
 
 test('buildClaudeArgs：冷启动（prompt 不进 argv，走 stdin）', () => {
@@ -388,4 +402,139 @@ test('AC-020: loadCfg 默认 spawnBackoffMs 为三档 15/30/60', (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-cfg-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   assert.deepEqual(loadCfg(root).spawnBackoffMs, [15000, 30000, 60000]);
+});
+
+// ---- 停止控制：`conductor stop` / SIGINT 收割在飞 agent，绝不当故障重试 ----
+
+test('停止: isTransientFailure — killed=stopped 判非瞬态（人要求停下不是网络抖动）', () => {
+  assert.equal(isTransientFailure({ killed: 'stopped' }), false);
+  // 真实停止形态：被杀没有退出码（exitCode=null）、也来不及有 result 事件（raw=null）。
+  // 这恰好命中「不透明退出失败」的形状（raw==null 且 exitCode!==0），必须被 stopped 分支先截住——
+  // 否则 killAllActive 收割完，重试逻辑会把每个 agent 原地再拉起来一次，停止等于没停。
+  assert.equal(isTransientFailure({ ok: false, killed: 'stopped', raw: null, exitCode: null, costUnknown: true }), false);
+  // 对照：同样是被杀，但原因是卡死/超时 → 仍是瞬态，该重试
+  assert.equal(isTransientFailure({ ok: false, killed: 'inactivity', raw: null, exitCode: null }), true);
+  assert.equal(isTransientFailure({ ok: false, killed: 'wall_clock', raw: null, exitCode: null }), true);
+});
+
+test('停止: activeChildPids 登记在飞子进程，killAllActive 收割并在 close 后注销（不泄漏）', async (t) => {
+  const dir = makeFakeClaudeDir(t, [{ hang: true }]); // 只读 stdin 然后永远挂住：模拟正在干活的 agent
+  assert.deepEqual(activeChildPids(), [], '本用例开始前登记表必须是空的（前面的用例都已收干净）');
+
+  let spawnedPid = null;
+  // killGraceMs 调小：detached 子进程 setsid 与父进程发信号之间有微小竞态窗口，
+  // 万一首发 SIGTERM 撞上空进程组，宽限期后的 SIGKILL 兜底，不拖慢用例。
+  const pending = runClaudeStream({
+    prompt: 'x', cwd: dir, maxTurns: 5, killGraceMs: 150,
+    onSpawn: ({ pid }) => { spawnedPid = pid; },
+  });
+  t.after(() => { // 兜底：收割逻辑若失灵，绝不把 fake-claude 留在机器上
+    if (!Number.isInteger(spawnedPid)) return;
+    try { process.kill(-spawnedPid, 'SIGKILL'); } catch { /* 已退出 */ }
+    try { process.kill(spawnedPid, 'SIGKILL'); } catch { /* 已退出 */ }
+  });
+
+  assert.equal(Number.isInteger(spawnedPid), true, 'onSpawn 同步交出 pid（崩溃恢复靠它找回残留进程组）');
+  const inflight = activeChildPids();
+  assert.deepEqual(inflight, [spawnedPid], '在飞进程必须登记，否则 stop 收割不到它，它会活过 runner');
+
+  assert.equal(killAllActive('stopped'), inflight.length, 'killAllActive 返回收割的进程数');
+
+  const res = await pending;
+  assert.equal(res.ok, false);
+  assert.equal(res.killed, 'stopped', '被收割的子进程以 killed=stopped 正常返回，内核照常留档');
+  assert.equal(res.exitCode, null, '被杀没有退出码');
+  assert.equal(res.costUnknown, true, '没有 result 事件 → 花费未知，不得按 0 入账');
+  assert.equal(isTransientFailure(res), false, '端到端：收割结果不得被重试');
+  assert.deepEqual(activeChildPids(), [], 'close 之后必须从登记表注销，否则下一次 stop 会对死 pid 发信号');
+  assert.equal(killAllActive('stopped'), 0, '空表收割返回 0 且不抛错');
+});
+
+// ---- resume 失效：死 session 重试 N 次只会白烧预算，必须一次就交回调用方降级冷启动 ----
+
+test('resume: 调用方续会话首次失败且 num_turns<=1 → resumeFailed 且零重试（真实 spawn 次数为证）', async (t) => {
+  const dir = makeFakeClaudeDir(t, [
+    // 死 session 的真实形态：CLI 直接非零退出，连一条 result 事件都没有（raw=null → num_turns 读作 0）
+    { exitCode: 1, stderr: 'No conversation found with session ID: dead-session' },
+    { session_id: 's-never', cost: 0.01, result: '不应被调用到' }, // 误重试会消费到这一步
+  ]);
+  const calls = captureCalls(dir);
+  const retryLog = [];
+  setSleepFn(() => { throw new Error('resume 失效不得触发退避 sleep'); });
+  t.after(() => setSleepFn(null));
+
+  const res = await runClaudeWithRetry({ prompt: 'x', cwd: dir, maxTurns: 5, resume: 'dead-session' }, {
+    retries: 6,
+    backoffMs: [0],
+    onRetry: (info) => retryLog.push(info),
+  });
+
+  assert.equal(res.ok, false);
+  assert.equal(res.resumeFailed, true, '交回调用方降级冷启动，而不是原地重试同一个死 session');
+  assert.equal(res.retriesExhausted, undefined, 'resume 失效不是瞬态耗尽，不该按耗尽收箱');
+  assert.equal(res.rate_limited, undefined);
+  assert.match(String(res.error), /No conversation found/, 'CLI 的原因要保留到 error，人才看得懂为什么降级');
+  assert.deepEqual(res.attempts, [{
+    attempt: 1, transient: false, api_error_status: null, session_id: null,
+    cost_usd: 0, killed: null, cost_unknown: true, resume_failed: true,
+  }], '只记一次尝试，且明确标 resume_failed（dossier-stats 按它统计 cold-degraded）');
+  assert.equal(retryLog.length, 0, '不得触发 onRetry');
+
+  // 「没有重试」由真实 spawn 次数坐实：retries=6 的预算一次都不许花在死 session 上
+  const log = calls();
+  assert.equal(log.length, 1, '死 session 只许 spawn 一次');
+  assert.deepEqual(log[0].argv.slice(0, 2), ['-r', 'dead-session']);
+});
+
+test('resume 边界: 首次失败但 num_turns>1（会话已有实质进展）→ 不是 resumeFailed，照常瞬态重试续会话', async (t) => {
+  const dir = makeFakeClaudeDir(t, [
+    // 有进展的失败：result 事件带 num_turns=5 + 可重试状态码 503
+    { session_id: 'sess-live', cost: 0.01, extra: { is_error: true, api_error_status: 503, num_turns: 5 } },
+    { session_id: 'sess-live', cost: 0.02, result: 'done' },
+  ]);
+  const calls = captureCalls(dir);
+  setSleepFn(() => {});
+  t.after(() => setSleepFn(null));
+
+  const res = await runClaudeWithRetry({ prompt: 'x', cwd: dir, maxTurns: 5, resume: 'sess-orig' }, {
+    retries: 3, backoffMs: [0],
+  });
+
+  assert.equal(res.ok, true, res.error);
+  assert.equal(res.resumeFailed, undefined, '有进展 ≠ session 失效：降级冷启动会白扔掉这 5 轮工作');
+  assert.equal(res.attempts.length, 2);
+  assert.equal(res.attempts[0].transient, true);
+  assert.equal(res.attempts[0].api_error_status, 503);
+  assert.equal(res.costUsd, 0.03, '两次尝试的花费都要累计入账');
+
+  const log = calls();
+  assert.equal(log.length, 2);
+  assert.deepEqual(log[0].argv.slice(0, 2), ['-r', 'sess-orig'], '第一次续调用方给的 session');
+  assert.deepEqual(log[1].argv.slice(0, 2), ['-r', 'sess-live'], '重试续最近一次失败的 session');
+  assert.match(log[1].prompt, /从中断处继续/, '续接提示词换成「从中断处继续」，不重发原 prompt');
+});
+
+test('resume 边界: 首次撞限额（num_turns=1）→ 记 rate_limited 而非 resumeFailed', async (t) => {
+  const dir = makeFakeClaudeDir(t, [
+    // 限额的 result 事件 num_turns=1，形状与死 session 极像：若少了 rate_limit 判定就会被误标成
+    // resume 失效 → 调用方降级冷启动 → 冷启动再撞同一堵墙，白烧一整轮上下文。
+    { actions: [{ type: 'rateLimit', resets_at: 1788068400, rate_limit_type: 'five_hour' }] },
+    { session_id: 's-never', cost: 0.01, result: '不应被调用到' },
+  ]);
+  const calls = captureCalls(dir);
+  setSleepFn(() => { throw new Error('限额不得触发退避 sleep'); });
+  t.after(() => setSleepFn(null));
+
+  const res = await runClaudeWithRetry({ prompt: 'x', cwd: dir, maxTurns: 5, resume: 'sess-limited' }, {
+    retries: 6, backoffMs: [0],
+  });
+
+  assert.equal(res.ok, false);
+  assert.equal(res.rate_limited, true);
+  assert.equal(res.resumeFailed, undefined, '限额不是 session 失效，session 本身还好好的');
+  assert.deepEqual(res.rate_limit, { type: 'five_hour', resets_at: 1788068400, status: 'rejected' });
+  assert.equal(res.attempts.length, 1);
+  assert.equal(res.attempts[0].rate_limited, true);
+  assert.equal(res.attempts[0].resume_failed, undefined);
+  assert.equal(calls().length, 1, '限额同样一次即返回');
 });

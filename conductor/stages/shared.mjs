@@ -81,7 +81,10 @@ export function addCost(ts, costUsd, cfg = null) {
 export function estimateRoleCost(cfg, role) {
   let ids = [];
   try { ids = fs.readdirSync(cfg.dossierDir); } catch { return { avg: 0, samples: 0 }; }
-  const re = new RegExp(`^${role}-r\\d+\\.json$`);
+  // worker 的产物基名带委派 key（worker-<key>）：估价样本按「全部 worker」取，不按单个 key 取。
+  const re = String(role).startsWith('worker-')
+    ? /^worker-.+-r\d+\.json$/
+    : new RegExp(`^${role}-r\\d+\\.json$`);
   const costs = [];
   for (const id of ids) {
     let names = [];
@@ -108,14 +111,27 @@ export function estimateRoleCost(cfg, role) {
  * 例外：spawn 报确定性系统错误（ENOENT/EACCES/ENOTDIR 类，与 isTransientFailure 同源判定）
  * 时进程从未起来、零 API 消费，不落入估计分支（task-20260718-001：曾被虚增 $1.9 成本）。
  */
-export function accountSpawnCost(ts, cfg, role, round, res) {
+export function accountSpawnCost(ts, cfg, role, round, res, rec = null) {
+  // 入账金额同时写回 spawn 记录（accounted_usd / estimated_cost_usd）：案卷才是成本的账本，
+  // runtime.spent_usd 只是它的缓存。runner 崩在「记录已写、runtime 未落盘」之间时，
+  // reconcileSpent 按案卷把账补回来——已确认的成本不丢，也不会被重复计算。
+  const stamp = (accounted, estimated = 0) => {
+    if (!rec) return;
+    rec.record.accounted_usd = Math.round((accounted + estimated) * 1e6) / 1e6;
+    if (estimated > 0) rec.record.estimated_cost_usd = estimated;
+    state.writeJson(rec.path, rec.record);
+  };
   if (!res.costUnknown) {
     addCost(ts, res.costUsd, cfg);
+    stamp(res.costUsd ?? 0);
     return;
   }
-  addCost(ts, res.costUsd, cfg); // unknown 时 costUsd 恒 0：保持字面等价（no-op）
+  addCost(ts, res.costUsd, cfg); // unknown 时已知部分照常入账（瞬态重试里成功计费的那几次）
+  ts.runtime.unknown_cost_spawns = (ts.runtime.unknown_cost_spawns ?? 0) + 1; // 未知费用显式计数，绝不当成确定免费
   if (isDeterministicSpawnFailure(res)) {
+    ts.runtime.unknown_cost_spawns -= 1; // 进程从未起来：零消费是确定的，不算未知
     state.appendTimeline(cfg, ts.id, `${role} r${round} spawn 确定性失败（${res.error ?? 'unknown'}），不做历史均价估计入账`);
+    stamp(res.costUsd ?? 0);
     return;
   }
   if (cfg.unknownSpawnCostEstimateEnabled === true) {
@@ -124,12 +140,45 @@ export function accountSpawnCost(ts, cfg, role, round, res) {
       addCost(ts, est.avg, cfg);
       ts.runtime.estimated_cost_usd = Math.round(((ts.runtime.estimated_cost_usd ?? 0) + est.avg) * 1e6) / 1e6;
       state.appendTimeline(cfg, ts.id, `${role} r${round} cost unknown → 按历史均价 $${est.avg} 估计入账（n=${est.samples}，estimated）`);
+      stamp(res.costUsd ?? 0, est.avg);
       return;
     }
     state.appendTimeline(cfg, ts.id, `${role} r${round} cost unknown → 无历史样本可估计，spent_usd uses lower-bound accounting`);
+    stamp(res.costUsd ?? 0);
     return;
   }
   state.appendTimeline(cfg, ts.id, `${role} r${round} cost unknown; spent_usd uses lower-bound accounting`);
+  stamp(res.costUsd ?? 0);
+}
+
+/** 案卷里全部 spawn 记录的已入账金额之和（含同轮被顶替的旧记录）。 */
+export function sumAccountedCost(cfg, id) {
+  const dir = state.dossierPath(cfg, id);
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch { return 0; }
+  let sum = 0;
+  const costOf = (r) => (Number.isFinite(r?.accounted_usd) ? r.accounted_usd : (Number.isFinite(r?.cost_usd) ? r.cost_usd : 0));
+  for (const n of names) {
+    if (!/-r\d+\.json$/.test(n) || /^(?:precommit|human|dispatch)-r\d+\.json$/.test(n)) continue;
+    const rec = state.readJsonIf(path.join(dir, n));
+    if (!rec || rec.started == null) continue;
+    sum += costOf(rec);
+    for (const old of rec.superseded ?? []) sum += costOf(old);
+  }
+  return Math.round(sum * 1e6) / 1e6;
+}
+
+/**
+ * 恢复时对账：runtime.spent_usd 低于案卷合计 → 补到案卷合计（崩在入账与落盘之间的那一笔）。
+ * 只升不降：案卷之外还有被归档的旧轮次，runtime 里多出来的部分是真花过的钱。
+ */
+export function reconcileSpent(ts, cfg) {
+  const ledger = sumAccountedCost(cfg, ts.id);
+  const spent = ts.runtime.spent_usd ?? 0;
+  if (ledger <= spent + 1e-9) return null;
+  ts.runtime.spent_usd = ledger;
+  state.appendTimeline(cfg, ts.id, `成本对账：runtime.spent_usd $${spent} < 案卷合计 $${ledger}，已补齐（上次运行崩在入账落盘之前）`);
+  return { from: spent, to: ledger };
 }
 
 export function budgetExceeded(ts, cfg) {

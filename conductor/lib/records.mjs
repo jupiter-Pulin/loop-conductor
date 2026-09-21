@@ -16,13 +16,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { validateLog } from './log-contract.mjs';
 
-/** 内核派出的 spawn 记录文件名：`<base>[-P-xxx]-r<n>.json`。 */
-const SPAWN_FILE_RE = /^(router|spec-plan|spec|maker|reviewer)(?:-(P-\d{3}))?-r(\d+)\.json$/;
+/** 内核派出的 spawn 记录文件名：`<base>[-P-xxx]-r<n>.json`；worker 是 `worker-<key>-r<n>.json`。 */
+const SPAWN_FILE_RE = /^(router|spec-plan|spec|maker|reviewer|digest)(?:-(P-\d{3}))?-r(\d+)\.json$/;
+const WORKER_FILE_RE = /^worker-([a-z][a-z0-9]*(?:-[a-z0-9]+)*)-r(\d+)\.json$/;
 const PRECOMMIT_FILE_RE = /^precommit-r(\d+)\.json$/;
 const HUMAN_FILE_RE = /^human-r(\d+)\.json$/;
 
 /** 渲染时的角色列序（同轮内先 spec/human 再 maker，最后 reviewer/precommit，与 few-shot 例子一致）。 */
-const ROLE_ORDER = { router: 0, spec: 1, human: 2, maker: 3, reviewer: 4, precommit: 5 };
+const ROLE_ORDER = { router: 0, spec: 1, digest: 2, human: 3, maker: 4, worker: 4, reviewer: 5, precommit: 6 };
 
 function readJsonIf(p) {
   try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; }
@@ -58,8 +59,8 @@ function truncatedOf(rec) {
  * product ≠ ok 时契约字段一律 null——不合契约的 log 不携带契约级语义（版本规则、tier 下界、
  * 动作闭集都读这些字段，绝不能被一份非法 log 蒙混）；summary 仍按原样带出，供 router 读。
  */
-function composeAgentRecord(dir, fileName, base, pkg, round, planActive) {
-  const role = roleOfBase(base);
+function composeAgentRecord(dir, fileName, base, pkg, round, planActive, key = null) {
+  const role = key != null ? 'worker' : roleOfBase(base);
   const spawn = readJsonIf(path.join(dir, fileName)) ?? {};
   const logName = fileName.replace(/\.json$/, '.log.json');
   const logPath = path.join(dir, logName);
@@ -96,15 +97,47 @@ function composeAgentRecord(dir, fileName, base, pkg, round, planActive) {
     tier: product === 'ok' ? (log.tier ?? null) : null,
     action: product === 'ok' ? (log.action ?? null) : null,
     packages: product === 'ok' ? (log.packages ?? null) : null,
+    assignments: product === 'ok' && Array.isArray(log.assignments) ? log.assignments : null,
+    guidance: product === 'ok' ? (log.guidance ?? null) : null,
+    done: product === 'ok' && Array.isArray(log.done) ? log.done : null,
+    remaining: product === 'ok' && Array.isArray(log.remaining) ? log.remaining : null,
     head_sha: spawn.head_sha ?? null,
     base_sha: spawn.base_sha ?? null,
+    spec_sha: spawn.spec_sha ?? null,
     summary: typeof log?.summary === 'string' ? log.summary : null,
     cost_usd: Number.isFinite(spawn.cost_usd) ? spawn.cost_usd : 0,
+    cost_unknown: spawn.cost_unknown === true,
     truncated: truncatedOf(spawn),
+    // interrupted = 会话没有正常收尾（被杀 / runner 崩溃后由恢复流程补记）。它和 truncated 一样
+    // 只是执行事实：已落盘的工作保留，outcome 照 log 原样（没有 log 就是未知，绝不当成功）。
+    interrupted: spawn.interrupted === true || (spawn.killed != null && spawn.killed !== false && spawn.killed !== ''),
     duration_ms: durationOf(spawn),
     session_id: spawn.session_id ?? null,
+    // worker 专属的内核事实（委派身份、权限档、实际隔离级别、续接关系、进度证据）。
+    key: spawn.key ?? key ?? null,
+    profile: spawn.profile ?? null,
+    intent: spawn.intent ?? null,
+    title: spawn.title ?? null,
+    isolation: spawn.isolation ?? null,
+    resume_of: spawn.resume_of ?? null,
+    progress: spawn.progress ?? null,
+    integration: spawn.integration ?? null,
+    violations: Array.isArray(spawn.violations) && spawn.violations.length > 0 ? spawn.violations : null,
+    artifacts: artifactsOf(dir, fileName),
     written_at: exists ? mtimeIso(logPath) : null,
+    // 排序用：没有 log 的记录（被中断 / 撞上限）按它实际结束的时刻排，别因为 written_at 为空就排到同轮最前。
+    sort_at: (exists ? mtimeIso(logPath) : null) ?? spawn.done ?? spawn.started ?? null,
   };
+}
+
+/** 该轮留下的完整产物（相对案卷目录的文件名）：report / verdicts / salvage。只列存在的。 */
+function artifactsOf(dir, fileName) {
+  const stem = fileName.replace(/\.json$/, '');
+  const out = {};
+  for (const [k, suffix] of [['report', '.report.md'], ['verdicts', '.verdicts.json'], ['salvage', '.salvage.json'], ['log', '.log.json']]) {
+    if (fs.existsSync(path.join(dir, `${stem}${suffix}`))) out[k] = `${stem}${suffix}`;
+  }
+  return out;
 }
 
 /** precommit 没有 agent：内核跑完三步自己合成同构的一条，用 role="precommit" 走同一契约。 */
@@ -184,7 +217,7 @@ function composeHumanRecord(dir, fileName, round, voidedRounds) {
 }
 
 function sortKey(rec) {
-  return [rec.round ?? 0, ROLE_ORDER[rec.role] ?? 9, rec.written_at ?? '', rec.package ?? ''];
+  return [rec.round ?? 0, ROLE_ORDER[rec.role] ?? 9, rec.sort_at ?? rec.written_at ?? '', rec.package ?? rec.key ?? ''];
 }
 
 /**
@@ -202,6 +235,11 @@ export function composeRecords(cfg, id, { planActive = false } = {}) {
     const spawn = name.match(SPAWN_FILE_RE);
     if (spawn) {
       records.push(composeAgentRecord(dir, name, spawn[1], spawn[2] ?? null, Number(spawn[3]), planActive));
+      continue;
+    }
+    const worker = name.match(WORKER_FILE_RE);
+    if (worker) {
+      records.push(composeAgentRecord(dir, name, 'worker', null, Number(worker[2]), planActive, worker[1]));
       continue;
     }
     const pre = name.match(PRECOMMIT_FILE_RE);
@@ -235,22 +273,45 @@ function money(n) {
 }
 
 function labelOf(rec) {
-  const base = `r${rec.round} ${rec.role}${rec.package ? ` ${rec.package}` : ''}`;
+  const base = `r${rec.round} ${rec.role}${rec.package ? ` ${rec.package}` : ''}${rec.key ? ` ${rec.key}` : ''}`;
   return base.length >= LABEL_WIDTH ? `${base} ` : base.padEnd(LABEL_WIDTH, ' ');
 }
 
 function agentFields(rec) {
   const fields = [`outcome=${rec.outcome ?? '-'}`];
+  if (rec.profile) fields.push(`profile=${rec.profile}`);
+  if (rec.intent) fields.push(`intent=${rec.intent}`);
   if (rec.tier) fields.push(`tier=${rec.tier}`);
   if (rec.action) fields.push(`action=${rec.action}`);
   if (rec.packages?.length) fields.push(`packages=${rec.packages.join(',')}`);
+  if (rec.assignments?.length) fields.push(`assignments=${rec.assignments.map((a) => a.key).join(',')}`);
   if (rec.head_sha) fields.push(`head=${shortSha(rec.head_sha)}`);
   if (rec.base_sha) fields.push(`base=${shortSha(rec.base_sha)}`);
-  fields.push(`cost=${money(rec.cost_usd)}`);
+  if (rec.spec_sha) fields.push(`spec=${shortSha(rec.spec_sha)}`);
+  fields.push(`cost=${money(rec.cost_usd)}${rec.cost_unknown ? '(含未知)' : ''}`);
   fields.push(`truncated=${rec.truncated ? 'yes' : 'no'}`);
+  if (rec.interrupted) fields.push('interrupted=yes');
+  if (rec.resume_of) fields.push(`resume_of=r${rec.resume_of}`);
+  if (rec.progress) fields.push(`progress=${rec.progress}`);
+  if (rec.integration) fields.push(`integration=${rec.integration}`);
+  if (rec.violations) fields.push(`violations=${rec.violations.length}`);
   fields.push(`product=${rec.product}`);
   if (rec.product_error?.length) fields.push(`product_error=${rec.product_error.join('; ')}`);
   return fields.join('  ');
+}
+
+/** 完整产物的指路行：router 需要细节时按文件名 Read（它的 cwd 就是案卷目录）。 */
+function artifactHint(rec) {
+  const a = rec.artifacts ?? {};
+  const names = ['report', 'verdicts', 'salvage'].map((k) => a[k]).filter(Boolean);
+  return names.length > 0 ? `   ↳ 完整产物：${names.join('  ')}` : null;
+}
+
+function progressLines(rec) {
+  const lines = [];
+  if (rec.done?.length) lines.push(`   done: ${rec.done.join('；')}`);
+  if (rec.remaining?.length) lines.push(`   remaining: ${rec.remaining.join('；')}`);
+  return lines;
 }
 
 function humanFields(rec) {
@@ -266,18 +327,28 @@ function humanFields(rec) {
  * 记录列表 → router prompt 的紧凑文本：一条两行（人的裁决只有一行）。
  * summary 的换行整体缩进 3 空格，reviewer 的逐条 AC 判决因此仍逐行可读。
  */
-export function renderRecordsForRouter(records) {
+export function renderRecordsForRouter(records, { window = null } = {}) {
+  const all = records ?? [];
+  // 上下文不随轮数无限增长：只有最近 window 条记录带 summary 全文；更早的压成一行索引。
+  // 压缩的只是 prompt，不是案卷——每条旧记录的原始 log / 完整产物都还在盘上，文件名就在索引行里。
+  // 人的裁决永远逐字保留（已裁决事项另在事实段渲染一遍），不进压缩。
+  const cut = Number.isInteger(window) && window > 0 && all.length > window ? all.length - window : 0;
   const lines = [];
-  for (const rec of records ?? []) {
+  if (cut > 0) lines.push(`（更早的 ${cut} 条记录只列索引；要看原文就 Read 对应的 <名字>.log.json / .report.md）`);
+  all.forEach((rec, i) => {
     if (rec.role === 'human') {
       lines.push(`${labelOf(rec)}${humanFields(rec)}`);
-      continue;
+      return;
     }
     lines.push(`${labelOf(rec)}${agentFields(rec)}`);
+    if (i < cut) return;
     if (rec.summary) {
       for (const l of String(rec.summary).split('\n')) lines.push(`   ${l}`);
     }
-  }
+    lines.push(...progressLines(rec));
+    const hint = artifactHint(rec);
+    if (hint) lines.push(hint);
+  });
   return lines.join('\n');
 }
 

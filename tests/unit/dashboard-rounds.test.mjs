@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { buildRoundsView } from '../../conductor/dashboard/rounds.mjs';
+import { buildRoundsView, groupRecordsByRound } from '../../conductor/dashboard/rounds.mjs';
 
 function mkroot(prefix = 'dashboard-rounds-test-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -278,6 +278,101 @@ test('buildRoundsView：有 router 轮次的任务给出 records 与按轮分组
   assert.deepEqual(view.routerRounds[0].agents.map((a) => a.role), ['maker']);
   assert.equal(view.routerRounds[1].agents[0].outcome, 'fail');
   assert.equal(view.routerRounds[1].agents[0].tier, 'unit');
+});
+
+// ---- 并行纪元：一轮里多个 worker、以及没有 router 记录的轮次（自动续跑 / 摘要轮） ----
+
+test('groupRecordsByRound：一轮里并行的多个 worker 全部进 agents，顺序与记录一致', () => {
+  const rec = (round, role, over = {}) => ({ round, role, ...over });
+  const groups = groupRecordsByRound([
+    rec(2, 'router', { action: 'dispatch' }),
+    rec(2, 'worker', { key: 'api-layer', profile: 'write' }),
+    rec(2, 'worker', { key: 'docs', profile: 'write' }),
+    rec(2, 'worker', { key: 'tests', profile: 'write' }),
+  ]);
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].router.action, 'dispatch');
+  assert.deepEqual(groups[0].agents.map((a) => a.key), ['api-layer', 'docs', 'tests']);
+  assert.equal(groups[0].precommit, null);
+  assert.equal(groups[0].human, null);
+});
+
+test('groupRecordsByRound：没有 router 记录的轮次照样成组（自动续跑 / 摘要轮），router 恒 null', () => {
+  const groups = groupRecordsByRound([
+    { round: 1, role: 'digest' },
+    { round: 3, role: 'worker', key: 'api-layer', resume_of: 2 },
+    { round: 3, role: 'precommit' },
+    { round: 2, role: 'router', action: 'dispatch' },
+  ]);
+  assert.deepEqual(groups.map((g) => g.round), [1, 2, 3], '按轮号升序，缺 router 的轮次不被丢掉');
+  assert.equal(groups[0].router, null);
+  assert.deepEqual(groups[0].agents.map((a) => a.role), ['digest']);
+  assert.equal(groups[2].router, null);
+  assert.equal(groups[2].agents[0].resume_of, 2);
+  assert.ok(groups[2].precommit, 'precommit 不进 agents，占自己的槽');
+});
+
+test('buildRoundsView：并行 worker 与 digest 的案卷合成出带 key/profile/续接关系的记录', (t) => {
+  const root = mkroot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cfg = baseCfg(root);
+  const id = 'task-20260920-300';
+  const dir = path.join(cfg.dossierDir, id);
+  fs.mkdirSync(dir, { recursive: true });
+  const w = (name, obj) => fs.writeFileSync(path.join(dir, name), JSON.stringify(obj));
+  w('digest-r1.json', { role: 'digest', round: 1, cost_usd: 0.01 });
+  w('digest-r1.log.json', { role: 'digest', outcome: 'ok', summary: '摘要已写' });
+  w('router-r2.json', { role: 'router', round: 2, cost_usd: 0.02 });
+  // dispatch 的 assignments 走内核契约（lib/assignment-contract.mjs），字段少一个 log 就是 invalid
+  const assignment = (key, title, intent, paths) => ({
+    key, profile: 'write', intent, title,
+    purpose: `${title}：本轮目的`, inputs: [`specs/${id}.md`], scope: '只改声明的 paths',
+    deliverables: '代码改动与测试', done_when: '相关 AC 有测试钉住', paths,
+  });
+  w('router-r2.log.json', {
+    role: 'router', outcome: 'ok', action: 'dispatch', summary: '并行两个包',
+    assignments: [
+      assignment('api-layer', '实现 API 层', 'implement', ['lib/api']),
+      assignment('docs', '更新文档', 'implement', ['docs']),
+    ],
+  });
+  w('worker-api-layer-r2.json', {
+    role: 'worker', round: 2, key: 'api-layer', profile: 'write', intent: 'implement',
+    title: '实现 API 层', cost_usd: 1.2, integration: 'integrated',
+  });
+  w('worker-api-layer-r2.log.json', {
+    role: 'worker', outcome: 'ok', summary: 'AC-001 done', done: ['AC-001'], remaining: [],
+  });
+  w('worker-docs-r2.json', {
+    role: 'worker', round: 2, key: 'docs', profile: 'write', intent: 'implement',
+    title: '更新文档', cost_usd: 0.4, truncated: true,
+  });
+  w('worker-docs-r2.log.json', { role: 'worker', outcome: 'partial', summary: '写了一半', done: [], remaining: ['README'] });
+  w('worker-docs-r3.json', {
+    role: 'worker', round: 3, key: 'docs', profile: 'write', intent: 'implement',
+    title: '更新文档', cost_usd: 0.3, resume_of: 2,
+  });
+  w('worker-docs-r3.log.json', { role: 'worker', outcome: 'ok', summary: '补完', done: ['README'], remaining: [] });
+
+  const view = buildRoundsView(cfg, id);
+  assert.deepEqual(view.routerRounds.map((r) => r.round), [1, 2, 3]);
+  assert.equal(view.routerRounds[0].router, null, '摘要轮没有 router 记录');
+  assert.deepEqual(view.routerRounds[0].agents.map((a) => a.role), ['digest']);
+
+  const r2 = view.routerRounds[1];
+  assert.equal(r2.router.action, 'dispatch');
+  assert.deepEqual(r2.agents.map((a) => a.key), ['api-layer', 'docs']);
+  assert.equal(r2.agents[0].role, 'worker');
+  assert.equal(r2.agents[0].profile, 'write');
+  assert.equal(r2.agents[0].intent, 'implement');
+  assert.equal(r2.agents[0].integration, 'integrated');
+  assert.deepEqual(r2.agents[0].done, ['AC-001']);
+  assert.equal(r2.agents[1].truncated, true);
+
+  const r3 = view.routerRounds[2];
+  assert.equal(r3.router, null, '自动续跑的轮次没有 router 记录，但必须成组');
+  assert.equal(r3.agents[0].resume_of, 2);
+  assert.equal(r3.agents[0].outcome, 'ok');
 });
 
 test('buildRoundsView：旧任务不合成 records（同名 maker-r<n>.json 不当新契约看），四门口径不变（AC-029）', (t) => {

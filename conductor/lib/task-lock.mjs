@@ -1,6 +1,7 @@
 // lib/task-lock.mjs — 单任务写锁。路径在 dossier/<id> 下，跨 state box rename 稳定。
 import fs from 'node:fs';
 import path from 'node:path';
+import { processState, selfIdentity } from './proc.mjs';
 
 export class TaskLockBusyError extends Error {
   constructor(id, lockDir) {
@@ -17,7 +18,7 @@ export function taskLockDir(cfg, id) {
 
 function writeInfo(lockDir) {
   const tmp = path.join(lockDir, `.info.json.${process.pid}.${Date.now()}.tmp`);
-  fs.writeFileSync(tmp, `${JSON.stringify({ pid: process.pid, acquired_at: new Date().toISOString() }, null, 2)}\n`);
+  fs.writeFileSync(tmp, `${JSON.stringify({ ...selfIdentity(), acquired_at: new Date().toISOString() }, null, 2)}\n`);
   fs.renameSync(tmp, path.join(lockDir, 'info.json'));
 }
 
@@ -39,7 +40,11 @@ function pidAlive(pid) {
 function isStaleLock(lockDir) {
   try {
     const info = JSON.parse(fs.readFileSync(path.join(lockDir, 'info.json'), 'utf8'));
-    return !pidAlive(info.pid);
+    // pid 缺失或不是整数 = info 不可信：按活锁处理（与 info.json 缺失同一口径），宁可 busy 也不抢。
+    if (!Number.isInteger(info?.pid)) return false;
+    if (!pidAlive(info.pid)) return true;
+    // pid 活着但启动时刻对不上 = pid 被复用，原持锁进程早已不在：也是残锁。
+    return processState({ pid: info.pid, pid_started: info.pid_started ?? null }) === 'reused';
   } catch {
     return false;
   }

@@ -12,8 +12,12 @@ import path from 'node:path';
 import * as state from '../lib/state.mjs';
 import { git, removeWorktree, deleteBranch } from '../lib/git.mjs';
 import { runClaudeWithRetry } from '../lib/claude.mjs';
-import { buildAgentSpawnSpec, writeAgentSettings } from '../lib/agent-settings.mjs';
+import { buildAgentSpawnSpec, isExecSpawn, writeAgentSettings } from '../lib/agent-settings.mjs';
 import { checkFuse } from '../lib/fuse.mjs';
+import { pidStartTime } from '../lib/proc.mjs';
+import { currentSpec } from '../lib/spec-version.mjs';
+import { reviewCoverage } from '../lib/review-ledger.mjs';
+import { stopRequested } from '../lib/run-session.mjs';
 import { accountSpawnCost, canStartSpawn, failToBox, finishSpawnRecord, startSpawnRecord } from './shared.mjs';
 
 /**
@@ -58,6 +62,8 @@ const EMPTY_ROUTER_STATE = Object.freeze({
   failures: [], // 连续失效原因（router product≠ok 或动作被拒），成功决策清零
   last_action_rejected: null, // 最近一次被拒原因，渲染进下一轮事实段
   fuse_reset_round: 0, // 人 retry 后的复位轮次，checkFuse 的 sinceRound
+  progress: null, // 停滞保险丝：上一轮的硬进展指纹 + 连续无进展轮数（checkStallAndBox）
+  notes_error: null, // 上一轮工作记忆写坏了的原因（已还原），渲染进下一轮事实段
 });
 
 export function readRouterState(cfg, id) {
@@ -115,69 +121,150 @@ export function spawnSkipped(res) {
 }
 
 /**
+ * 分配一个新的轮次号并立刻落盘。轮次号是案卷文件名的一部分（`<base>-r<n>.*`），先落盘再派出
+ * 才能保证：spawn 中途崩溃、自动续接、并行 worker 各自续接，都不会覆盖任何一轮的案卷。
+ * 单线程事件循环里这是原子的（读-加-写之间没有 await）。
+ */
+export function allocateRound(ts) {
+  const round = (ts.runtime.current_round ?? 0) + 1;
+  ts.runtime.current_round = round;
+  state.saveRuntime(ts);
+  return round;
+}
+
+/**
+ * OS 沙盒参数（宿主运行时保证的那一层）。只对有执行能力的派出生效，且只在 cfg.workerSandbox.enabled
+ * 时打开。沙盒管的是 **Bash**：可写范围 = cwd 与系统临时目录（CLI 默认）+ 人在配置里点名的工具链缓存目录。
+ * 整个案卷目录、spec、state、内核代码与配置一律显式 denyWrite——受控真实执行里核对过：denyWrite 优先，
+ * 即使目标落在默认可写的临时目录里也写不进去。agent 的 log / report 走的是 Write 工具（不经沙盒，
+ * 由 `Edit(//绝对路径)` 权限规则精确放行），所以把整个案卷对 Bash 封死不影响交付。
+ */
+export function sandboxFor(cfg, id, { logPath, reportPath = null }) {
+  const sb = cfg.workerSandbox;
+  if (!sb || sb.enabled !== true) return null;
+  void logPath; void reportPath; // 交付文件不需要、也不应该对 Bash 放行
+  return {
+    enabled: true,
+    allowWrite: [...(Array.isArray(sb.allowWrite) ? sb.allowWrite : [])],
+    denyWrite: [
+      cfg.dossierDir, cfg.specsDir, cfg.stateDir, path.join(cfg.root, 'conductor'), path.join(cfg.root, 'agents'),
+      path.join(cfg.root, 'conductor.config.json'), cfg.targetProfilesDir,
+    ],
+    denyRead: Array.isArray(sb.denyRead) ? sb.denyRead : [],
+    allowedDomains: Array.isArray(sb.allowedDomains) ? sb.allowedDomains : [],
+  };
+}
+
+/** 全进程的并发 spawn 上限（多个任务 × 每任务多个并行 worker 共用一组槽位）。 */
+async function acquireSpawnSlot(cfg) {
+  const max = Number.isInteger(cfg.maxConcurrentSpawns) && cfg.maxConcurrentSpawns > 0 ? cfg.maxConcurrentSpawns : Infinity;
+  cfg.__spawnSlots ??= { active: 0, waiters: [] };
+  const slots = cfg.__spawnSlots;
+  if (slots.active >= max) await new Promise((resolve) => slots.waiters.push(resolve));
+  slots.active += 1;
+  return () => {
+    slots.active -= 1;
+    const next = slots.waiters.shift();
+    if (next) next();
+  };
+}
+
+/**
  * 派一个 agent 并留档。返回 lib/claude.mjs 的原始结果（限额/失败都原样交回调用方判断）。
- * 落盘顺序：settings → started 标记 → spawn → done 标记 + 成本入账 + runtime 落盘。
- * 内核绝不改 agent 写的 log；log 的读取一律走 lib/records.mjs。
+ * 落盘顺序：settings → started 标记（含 pid 身份，供崩溃恢复收割）→ spawn → done 标记 + 成本入账
+ * + runtime 落盘。内核绝不改 agent 写的 log；log 的读取一律走 lib/records.mjs。
  *
- * **run 级闸门在这里复查**（AC-021）：`canStartSpawn` 是本次 run 的限额 / runBudget 总闸。
- * ROUTING 只在派 router 前查过一次，而动作侧（maker / reviewer / spec）的 spawn 发生在那之后
- * ——`maxConcurrentTasks > 1` 时任务 A 命中限额，同一轮里任务 B 的动作 spawn 仍会发出去，
- * 违反「本次 run 内不再发起任何新 spawn」。闸门是全体 spawn 的唯一入口，复查也就放在这里。
- * 被拦时零副作用：不写 settings、不留 spawn 记录、不入账、不改 stage，只由 canStartSpawn
- * 记一行 `<role> spawn skipped: …`，调用方返回 changed:false 让本任务本轮停住。
+ * **run 级闸门在这里复查**（AC-021）：`canStartSpawn` 是本次 run 的限额 / runBudget 总闸，
+ * 也是停止请求的总闸。ROUTING 只在派 router 前查过一次，而动作侧的 spawn（maker / reviewer /
+ * spec / digest / 每一个 worker 及其自动续接）都发生在那之后——闸门是全体 spawn 的唯一入口，
+ * 复查也就放在这里：新角色、重试、续跑、子委派没有一个能绕过。
+ * 被拦时零副作用：不写 settings、不留 spawn 记录、不入账、不改 stage。
+ *
+ * resume：续接一个已有会话（`claude -r <session_id>`）。续不上（session 失效）时返回
+ * `resumeFailed: true`，由调用方降级为带进度上下文的冷启动——两次的花费都已入账。
  */
 export async function spawnAgentRound(ts, cfg, {
   role,
   round,
   mode = null,
   pkg = null,
+  key = null,
+  profile = null,
   prompt,
   cwd = null,
+  resume = null,
   planActive = false,
   packagesEnabled = false,
+  readRoots = [],
+  digest = null,
   extraRecord = {},
 }) {
   const id = ts.id;
-  const opts = { mode, pkg, planActive, packagesEnabled };
-  const spec = buildAgentSpawnSpec(cfg, id, role, round, opts); // 纯函数：拿 log 名给闸门用
-  const base = path.basename(spec.logPath).replace(/-r\d+\.log\.json$/, '');
-  if (!canStartSpawn(ts, cfg, base)) return { ok: false, skipped: true, costUsd: 0, error: 'spawn_blocked' };
-  writeAgentSettings(cfg, id, role, round, opts);
-  const streamFile = state.dossierPath(cfg, id, `${base}-r${round}.stream.jsonl`);
-  const rec = startSpawnRecord(cfg, id, base, round, {
-    role,
-    mode,
-    package: pkg,
-    stream_file: path.relative(cfg.root, streamFile),
-    ...extraRecord,
-  });
-  const res = await runClaudeWithRetry({
-    cwd: cwd ?? spec.cwd,
-    prompt,
-    maxTurns: spec.maxTurns,
-    model: cfg.models?.[role] ?? null,
-    tools: spec.tools,
-    allowedTools: spec.allowedTools,
-    permissionMode: spec.permissionMode,
-    settings: spec.settingsPath,
-    streamFile,
-    inactivityTimeoutMs: cfg.inactivityTimeoutMs,
-    wallClockMs: cfg.spawnWallClockMs,
-  }, {
-    retries: cfg.spawnRetries,
-    backoffMs: cfg.spawnBackoffMs,
-    onRetry: ({ attempt, status }) =>
-      state.appendTimeline(cfg, id, `${base} r${round} transient retry attempt ${attempt} (status=${status ?? 'spawn-error'})`),
-  });
-  finishSpawnRecord(rec, res);
-  accountSpawnCost(ts, cfg, base, round, res);
-  state.saveRuntime(ts); // 成本先落盘：spawn 花的钱不因后续分支而丢账
-  if (!res.ok) {
-    // 基建失败不是异常路径：log 缺失会以 product: "missing" 出现在记录里，交 router 判断，
-    // 内核不自动重派（契约第三条）。这里只留一行人读的归因。
-    state.appendTimeline(cfg, id, `${base} r${round} spawn 未正常结束（${res.error ?? 'unknown'}），交由记录与 router 处置`);
+  const baseOpts = { mode, pkg, key, profile, planActive, packagesEnabled, readRoots, digest };
+  const probe = buildAgentSpawnSpec(cfg, id, role, round, baseOpts); // 纯函数：拿 log 名给闸门用
+  const base = path.basename(probe.logPath).replace(/-r\d+\.log\.json$/, '');
+  if (stopRequested(cfg)) {
+    state.appendTimeline(cfg, id, `${base} spawn skipped: 收到停止请求`);
+    return { ok: false, skipped: true, costUsd: 0, error: 'stop_requested' };
   }
-  return res;
+  if (!canStartSpawn(ts, cfg, base)) return { ok: false, skipped: true, costUsd: 0, error: 'spawn_blocked' };
+  const sandbox = isExecSpawn(role, profile) ? sandboxFor(cfg, id, { logPath: probe.logPath, reportPath: probe.reportPath }) : null;
+  const opts = { ...baseOpts, sandbox };
+  const spec = buildAgentSpawnSpec(cfg, id, role, round, opts);
+  const release = await acquireSpawnSlot(cfg);
+  try {
+    writeAgentSettings(cfg, id, role, round, opts);
+    const streamFile = state.dossierPath(cfg, id, `${base}-r${round}.stream.jsonl`);
+    const rec = startSpawnRecord(cfg, id, base, round, {
+      role,
+      mode,
+      package: pkg,
+      key,
+      profile,
+      isolation: spec.isolation,
+      model: cfg.models?.[role] ?? null,
+      max_turns: spec.maxTurns,
+      cwd: cwd ?? spec.cwd,
+      resume_session: resume,
+      stream_file: path.relative(cfg.root, streamFile),
+      ...extraRecord,
+    });
+    const res = await runClaudeWithRetry({
+      cwd: cwd ?? spec.cwd,
+      prompt,
+      resume,
+      maxTurns: spec.maxTurns,
+      model: cfg.models?.[role] ?? null,
+      tools: spec.tools,
+      allowedTools: spec.allowedTools,
+      permissionMode: spec.permissionMode,
+      settings: spec.settingsPath,
+      streamFile,
+      inactivityTimeoutMs: cfg.inactivityTimeoutMs,
+      wallClockMs: cfg.spawnWallClockMs,
+      onSpawn: ({ pid }) => {
+        rec.record.pid = pid;
+        rec.record.pid_started = pidStartTime(pid);
+        state.writeJson(rec.path, rec.record);
+      },
+    }, {
+      retries: cfg.spawnRetries,
+      backoffMs: cfg.spawnBackoffMs,
+      onRetry: ({ attempt, status }) =>
+        state.appendTimeline(cfg, id, `${base} r${round} transient retry attempt ${attempt} (status=${status ?? 'spawn-error'})`),
+    });
+    if (res.killed === 'stopped') rec.record.interrupted = true;
+    finishSpawnRecord(rec, res);
+    accountSpawnCost(ts, cfg, base, round, res, rec);
+    state.saveRuntime(ts); // 成本先落盘：spawn 花的钱不因后续分支而丢账
+    if (!res.ok) {
+      // 基建失败不是异常路径：log 缺失会以 product: "missing" 出现在记录里，交 router 判断。
+      state.appendTimeline(cfg, id, `${base} r${round} spawn 未正常结束（${res.killed ? `killed=${res.killed}` : (res.error ?? 'unknown')}），交由记录与 router 处置`);
+    }
+    return res;
+  } finally {
+    release();
+  }
 }
 
 // ---- 保险丝与预算 ----
@@ -200,12 +287,66 @@ export function checkFuseAndBox(ts, cfg, records) {
   );
 }
 
+/**
+ * 停滞保险丝：数「硬进展」，不数轮数，也不看任务叫什么名字、摘要怎么写。
+ * 硬进展指纹 = 任务分支的 tree（代码真的变了）+ 当前版本的 review 覆盖（多判了几条 / fail 变了）
+ *            + 最近一次 precommit 的结论 + 人的裁决条数 + 获批 spec 版本。
+ * 每个 ROUTING 轮开头算一次：和上一轮一样 → 连续无进展 +1；不一样 → 清零。连续
+ * `fuseStallRounds` 轮（默认 8，0 = 关）没有任何硬进展 → FAILED_BOX(fuse_no_progress)。
+ * 于是：一个 40 轮、每轮都在推进的大任务不会被误杀；而反复派同一件事、给委派换个 key、
+ * 让 worker 改写一遍报告，都改变不了指纹，拖不过这根保险丝。调查 / 实验只产出报告、不改指纹，
+ * 所以纯调研最多连续这么多轮——够把未知查清楚，不够无限打转。人 retry 后从零重新数。
+ */
+export function checkStallAndBox(ts, cfg, fingerprint) {
+  const limit = Number.isInteger(cfg.fuseStallRounds) ? cfg.fuseStallRounds : 8;
+  const st = readRouterState(cfg, ts.id);
+  const prev = st.progress ?? null;
+  const same = prev != null && prev.fingerprint === fingerprint;
+  const stall = same ? (prev.stall_rounds ?? 0) + 1 : 0;
+  writeRouterState(cfg, ts.id, { progress: { fingerprint, stall_rounds: stall } });
+  if (!(limit > 0) || stall < limit) return { boxed: null, stall };
+  state.appendEventAlways(cfg, ts.id, 'fuse_tripped', { role: 'task', package: null, signature: `stall|${stall}` });
+  writeRouterState(cfg, ts.id, { progress: null });
+  return {
+    boxed: failToBox(
+      ts, cfg,
+      `保险丝：连续 ${stall} 轮没有任何硬进展（代码 tree、review 覆盖、precommit 结论、人的裁决、spec 版本都没变），停止`,
+      'fuse_no_progress',
+    ),
+    stall,
+  };
+}
+
+/** 整任务的轮次硬上限：单次执行有上限，整个任务也有。达到即收箱，人调高 maxRoundsPerTask 后 retry。 */
+export function checkRoundCapAndBox(ts, cfg) {
+  const cap = Number.isInteger(cfg.maxRoundsPerTask) && cfg.maxRoundsPerTask > 0 ? cfg.maxRoundsPerTask : null;
+  if (cap == null || (ts.runtime.current_round ?? 0) < cap) return null;
+  state.appendEventAlways(cfg, ts.id, 'round_cap_reached', { current_round: ts.runtime.current_round, max_rounds: cap });
+  return failToBox(ts, cfg, `轮次上限：已用 ${ts.runtime.current_round} 轮 >= maxRoundsPerTask=${cap}，停止`, 'round_cap');
+}
+
 /** 预算闸（每次 spawn 前）：超出 → 事件 + FAILED_BOX(budget_exhausted)，返回结果；否则 null。 */
 export function checkBudgetAndBox(ts, cfg) {
   const spent = ts.runtime.spent_usd ?? 0;
   if (!(spent >= cfg.budgetUsd)) return null;
   state.appendEventAlways(cfg, ts.id, 'budget_exhausted', { spent_usd: spent, budget_usd: cfg.budgetUsd });
   return failToBox(ts, cfg, `budget exhausted: $${spent} >= $${cfg.budgetUsd}，拒绝 spawn`, 'budget_exhausted');
+}
+
+// ---- 整体 review 的版本状态 ----
+
+/**
+ * 当前 (H, 获批 spec 版本) 上的 review 状态，三处共用（ROUTING 事实段 / 动作前置 / merge 批准复算）。
+ * 无 spec 的任务 coverage 为 undefined（版本门走旧口径）；有 spec 但冻结稿读不到 → coverage=null
+ * （版本门按「没有任何有效 review」处理，绝不放行）。
+ */
+export function reviewStateFor(ts, cfg, records, head) {
+  if (ts.runtime?.spec_approved !== true) return { coverage: undefined, acIds: [], spec: null };
+  const spec = currentSpec(cfg, ts);
+  if (!spec) return { coverage: null, acIds: [], spec: null };
+  const acIds = state.enumerateAcceptanceCriteria(spec.text).map((a) => a.ac_id);
+  const coverage = reviewCoverage({ dossierDir: state.dossierPath(cfg, ts.id), records, head, specSha: spec.sha256, acIds });
+  return { coverage, acIds, spec };
 }
 
 // ---- 契约面读取 ----

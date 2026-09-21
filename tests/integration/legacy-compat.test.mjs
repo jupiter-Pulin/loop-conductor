@@ -61,7 +61,9 @@ test('AC-027：遗留键被忽略而不是被读进 cfg；models 的遗留角色
   const cfg = loadCfg(env.root);
   assert.equal('testGateEnabled' in cfg, false);
   assert.equal('specMaxAcs' in cfg, false);
-  assert.deepEqual(Object.keys(cfg.models).sort(), ['maker', 'reviewer', 'router', 'spec']);
+  // 状态机认识的模型键现在是六个：四个老角色 + digest（摘要，默认快速模型）+ worker（受委派的执行者）。
+  assert.deepEqual(Object.keys(cfg.models).sort(), ['digest', 'maker', 'reviewer', 'router', 'spec', 'worker']);
+  assert.equal(cfg.models.digest, 'claude-haiku-4-5-20251001', '摘要缺省用快速模型');
   assert.equal(Object.values(cfg.models).includes('ghost-model'), false);
 });
 
@@ -74,8 +76,10 @@ test('AC-027：legacy 标量 maxTurns 警告一次并只落到 maker，其余角
   const { loadCfg } = await import('../../conductor/conductor.mjs');
   const cfg = loadCfg(env.root);
   assert.equal(cfg.maxTurns.maker, 12);
-  assert.equal(cfg.maxTurns.router, 4, 'router 不被标量压低');
-  assert.equal(cfg.maxTurns.reviewer, 40);
+  // 其余角色不被标量压低，仍是各自的默认值（router 现在要读摘要 / 原文 / 产物，默认 40）。
+  assert.equal(cfg.maxTurns.router, 40, 'router 不被标量压低');
+  assert.equal(cfg.maxTurns.reviewer, 60);
+  assert.equal(cfg.maxTurns.workerWrite, 150);
 });
 
 test('AC-001：queue 里的遗留 stage 名被跳过并打印警告，不抛错；同一次 run 里新任务照跑', (t) => {

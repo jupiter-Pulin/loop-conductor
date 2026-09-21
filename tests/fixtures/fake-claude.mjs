@@ -10,6 +10,17 @@
 //                                                 路径（*.log.json；path 可显式覆盖）
 //            [{type:'truncateAfterWrite'}]        发 subtype=error_max_turns 的 result 后 exit 1，
 //                                                 模拟「写完 log 就撞轮次上限」（reviewer 增量协议）
+//            [{type:'writeReport', content}]      写到 prompt 里注入的 *.report.md 绝对路径
+//            [{type:'writeVerdicts', content}]    写到 prompt 里注入的 *.verdicts.json 绝对路径
+//            [{type:'writeDigest', content}]      写到 prompt 里注入的摘要路径（…/digest/<sha12>.json）
+//            [{type:'writeNotes', content}]       写到 prompt 里注入的 router-notes.json 绝对路径
+//            [{type:'writeAbs', path, content}]   写任意绝对路径（越权写入场景：模拟 Bash 绕过 hook）
+//            [{type:'git', args:[…]}]             在 cwd 里跑一条 git（越权移动分支等场景）
+//   keyed 剧本（FAKE_CLAUDE_KEYED，{ "<log 基名>": [step…] }）：并行 worker 的调用顺序不确定，
+//            按 prompt 里 log 的基名（如 worker-a1）各走各的队列与计数器；没有对应 key 的调用
+//            仍按调用序消费 FAKE_CLAUDE_SCRIPT。
+//   init: true        先发一条 system/init（带 session_id），与真实 CLI 一致——崩溃恢复靠它从原始流里找回会话。
+//                     默认不发：既有用例里「零事件的非零退出 = 不透明失败」的瞬态判定依赖 stream 为空。
 //   exitCode: 非零则报错退出（模拟 CLI 失败 / resume 失效）
 //   exitCodeAfterResult: 先照常发 result 事件再以该码退出（模拟 error_max_turns：CLI 留下
 //                        subtype=error_max_turns 的 result 事件后 exit 1）
@@ -38,22 +49,36 @@ if (!scriptPath) {
 }
 // prompt 正文不再经 argv 传入（MAX_ARG_STRLEN 红线），改从 stdin 读（对齐 lib/claude.mjs::runClaudeStream）。
 const prompt = fs.readFileSync(0, 'utf8');
-const counterPath = `${scriptPath}.counter`;
-const scenario = JSON.parse(fs.readFileSync(scriptPath, 'utf8'));
+/** prompt 里注入的 log 绝对路径（取最后一个 *.log.json，即交付段那一条）。 */
+function logPathFromPrompt(text) {
+  const matches = String(text ?? '').match(/\/[^\s"'`]*\.log\.json/g);
+  return matches && matches.length > 0 ? matches[matches.length - 1] : null;
+}
+
+/** prompt 里第一个匹配的绝对路径（report / verdicts / digest / notes 各有固定后缀）。 */
+function pathFromPrompt(text, re) {
+  const m = String(text ?? '').match(re);
+  return m ? m[m.length - 1] : null;
+}
+
+// keyed 剧本优先：log 基名（worker-a1 / maker / reviewer …）在 keyed 表里有队列就走它自己的计数器。
+const keyedPath = process.env.FAKE_CLAUDE_KEYED;
+const logBase = (logPathFromPrompt(prompt) ?? '').split('/').pop().replace(/-r\d+\.log\.json$/, '');
+let keyedSteps = null;
+if (keyedPath && fs.existsSync(keyedPath) && logBase) {
+  const keyed = JSON.parse(fs.readFileSync(keyedPath, 'utf8'));
+  if (Array.isArray(keyed[logBase])) keyedSteps = keyed[logBase];
+}
+const counterPath = keyedSteps ? `${keyedPath}.${logBase}.counter` : `${scriptPath}.counter`;
+const scenario = keyedSteps ?? JSON.parse(fs.readFileSync(scriptPath, 'utf8'));
 const n = fs.existsSync(counterPath) ? Number(fs.readFileSync(counterPath, 'utf8')) : 0;
 fs.writeFileSync(counterPath, String(n + 1));
 
 if (process.env.FAKE_CLAUDE_LOG) {
   fs.appendFileSync(
     process.env.FAKE_CLAUDE_LOG,
-    `${JSON.stringify({ call: n, argv: process.argv.slice(2), prompt, cwd: process.cwd(), started_at_ms: Date.now() })}\n`,
+    `${JSON.stringify({ call: n, key: keyedSteps ? logBase : null, argv: process.argv.slice(2), prompt, cwd: process.cwd(), pid: process.pid, started_at_ms: Date.now() })}\n`,
   );
-}
-
-/** prompt 里注入的 log 绝对路径（取最后一个 *.log.json，即交付段那一条）。 */
-function logPathFromPrompt(text) {
-  const matches = String(text ?? '').match(/\/[^\s"'`]*\.log\.json/g);
-  return matches && matches.length > 0 ? matches[matches.length - 1] : null;
 }
 
 // 并发计数探针（P2b 的并行 spawn 用；本阶段只实现 + 单测）。append 对小行是原子的，
@@ -70,8 +95,23 @@ if (inflightLog) {
 
 const step = scenario[n];
 if (!step) {
-  console.error(`fake-claude: scenario has no step #${n}（多余的 spawn？）`);
+  console.error(`fake-claude: scenario has no step #${n}${keyedSteps ? `（key=${logBase}）` : ''}（多余的 spawn？）`);
   process.exit(2);
+}
+
+// 真实 CLI 的第一条事件：system/init 带 session_id。runner 中途崩溃时，恢复流程从已落盘的原始流里
+// 找回这个 session_id，之后才可能续会话。
+if (process.argv.includes('stream-json') && step.init === true) {
+  process.stdout.write(`${JSON.stringify({ type: 'system', subtype: 'init', session_id: step.session_id ?? `fake-sess-${keyedSteps ? `${logBase}-` : ''}${n}`, cwd: process.cwd() })}\n`);
+}
+
+function writeTo(target, content, what) {
+  if (!target) {
+    console.error(`fake-claude: ${what} 找不到目标路径（prompt 未注入？）`);
+    process.exit(2);
+  }
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, typeof content === 'string' ? content : `${JSON.stringify(content, null, 2)}\n`);
 }
 
 for (const a of step.actions ?? []) {
@@ -91,6 +131,21 @@ for (const a of step.actions ?? []) {
     }
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(target, typeof a.content === 'string' ? a.content : `${JSON.stringify(a.content, null, 2)}\n`);
+  } else if (a.type === 'writeReport') {
+    writeTo(pathFromPrompt(prompt, /\/[^\s"'`]*\.report\.md/g), a.content, 'writeReport');
+  } else if (a.type === 'writeVerdicts') {
+    writeTo(pathFromPrompt(prompt, /\/[^\s"'`]*\.verdicts\.json/g), a.content, 'writeVerdicts');
+  } else if (a.type === 'writeDigest') {
+    writeTo(pathFromPrompt(prompt, /\/[^\s"'`]*\/digest\/[0-9a-f]{12}\.json/g), a.content, 'writeDigest');
+  } else if (a.type === 'writeNotes') {
+    writeTo(pathFromPrompt(prompt, /\/[^\s"'`]*\/router-notes\.json/g), a.content, 'writeNotes');
+  } else if (a.type === 'writeAbs') {
+    writeTo(a.path, a.content, 'writeAbs');
+  } else if (a.type === 'git') {
+    const { spawnSync } = await import('node:child_process');
+    spawnSync('git', a.args, { cwd: process.cwd(), stdio: 'ignore' });
+  } else if (a.type === 'sleep') {
+    await sleep(a.ms ?? 0);
   } else if (a.type === 'truncateAfterWrite') {
     // 撞 max-turns：CLI 留下 subtype=error_max_turns 的 result 事件后非零退出。
     await writeEvent({
@@ -98,7 +153,7 @@ for (const a of step.actions ?? []) {
       subtype: 'error_max_turns',
       is_error: true,
       num_turns: step.num_turns ?? 30,
-      session_id: step.session_id ?? `fake-sess-${n}`,
+      session_id: step.session_id ?? `fake-sess-${keyedSteps ? `${logBase}-` : ''}${n}`,
       total_cost_usd: step.cost ?? 0.01,
       result: '',
     });
@@ -176,7 +231,7 @@ if (step.hang) {
 const resultEvent = {
   type: 'result',
   subtype: 'success',
-  session_id: step.session_id ?? `fake-sess-${n}`,
+  session_id: step.session_id ?? `fake-sess-${keyedSteps ? `${logBase}-` : ''}${n}`,
   total_cost_usd: step.cost ?? 0.01,
   result: step.result ?? '',
   ...(step.extra ?? {}), // 透传额外 raw 字段（如 is_error / api_error_status / num_turns）

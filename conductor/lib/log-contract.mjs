@@ -7,9 +7,14 @@
 //   - 四个通用字段由 agent 写（role / outcome / summary，加角色专属的 tier / action / packages）；
 //     cost_usd、truncated、head_sha 等由内核在读取时盖章，**不在 agent log 里**，出现即非法。
 //   - precommit 没有 agent：内核跑完三步自己合成一条同构记录，用 role="precommit" 走同一入口。
+//   - 短 log 只是「交付信号 + 一段摘要」：summary 上限 2000 字符不放宽。长诊断、逐条 AC 判决、
+//     调查结论走各自的完整产物（worker 的 `.report.md`、reviewer 的 `.verdicts.json`），
+//     log 里只留结论与指路——证据不因长度限制而丢，也不必每轮整份重放。
 
-export const LOG_ROLES = Object.freeze(['router', 'spec', 'maker', 'reviewer']);
-export const ACTIONS = Object.freeze(['spec', 'plan', 'maker', 'review', 'precommit', 'human', 'merge', 'abandon']);
+import { validateAssignments } from './assignment-contract.mjs';
+
+export const LOG_ROLES = Object.freeze(['router', 'spec', 'maker', 'reviewer', 'digest', 'worker']);
+export const ACTIONS = Object.freeze(['spec', 'plan', 'maker', 'dispatch', 'review', 'precommit', 'human', 'merge', 'abandon']);
 export const TIERS = Object.freeze(['unit', 'integration', 'e2e']);
 export const PACKAGE_ID_RE = /^P-\d{3}$/;
 export const SUMMARY_MAX = 2000;
@@ -18,13 +23,26 @@ export const SUMMARY_MAX = 2000;
 export const OUTCOMES_BY_ROLE = Object.freeze({
   router: Object.freeze(['ok']),
   spec: Object.freeze(['ok', 'needs_human']),
-  maker: Object.freeze(['ok', 'fail', 'needs_human']),
-  reviewer: Object.freeze(['ok', 'fail']),
+  // partial = 有进展但没做完（撞上限前增量写下的那一版）；内核不把它当完成，也不把它当失败。
+  maker: Object.freeze(['ok', 'partial', 'fail', 'needs_human']),
+  // reviewer 的 partial = 还有 AC 没判完；能不能放行由内核按判决台账重算，不看这个自述。
+  reviewer: Object.freeze(['ok', 'partial', 'fail']),
+  digest: Object.freeze(['ok', 'fail']),
+  // blocked = 依赖失效 / 约束冲突，需要 router 调整计划；needs_human = 需要产品裁决。
+  worker: Object.freeze(['ok', 'partial', 'blocked', 'fail', 'needs_human']),
   precommit: Object.freeze(['ok', 'fail']),
 });
 
 /** agent 写的 log 允许出现的字段（未知字段一律非法：防内核字段被 agent 自己盖章）。 */
-const AGENT_FIELDS = Object.freeze(['role', 'outcome', 'tier', 'action', 'packages', 'summary']);
+const AGENT_FIELDS = Object.freeze([
+  'role', 'outcome', 'tier', 'action', 'packages', 'summary',
+  'assignments', 'guidance', // router：dispatch 的委派清单 / maker 动作的具体指导
+  'done', 'remaining', // maker / worker：已完成项与未完成项（撞上限后下一轮据此续做）
+]);
+
+export const GUIDANCE_MAX = 4000;
+export const PROGRESS_ITEMS_MAX = 60;
+export const PROGRESS_ITEM_MAX = 300;
 
 /** precommit 记录（内核合成）允许出现的字段。 */
 const PRECOMMIT_FIELDS = Object.freeze([
@@ -183,6 +201,36 @@ export function validateLog(obj, role, ctx = {}) {
     if (role !== 'router') errors.push(`packages 是 router 专属字段，${role} 不得出现`);
     else if (ctx.planActive !== true) errors.push('无生效方案的任务不得出现 packages');
     else errors.push(`packages 只在 action=maker 时合法，action=${JSON.stringify(obj.action)} 不得出现`);
+  }
+
+  // ---- assignments：router 专属，dispatch 必填，其余动作不得出现 ----
+  const hasAssignments = Object.hasOwn(obj, 'assignments');
+  if (role === 'router' && obj.action === 'dispatch') {
+    errors.push(...validateAssignments(obj.assignments));
+  } else if (hasAssignments) {
+    errors.push(role === 'router'
+      ? `assignments 只在 action=dispatch 时合法，action=${JSON.stringify(obj.action)} 不得出现`
+      : `assignments 是 router 专属字段，${role} 不得出现`);
+  }
+
+  // ---- guidance：router 选 maker 时可选的具体指导（逐字进 maker 的 prompt） ----
+  if (Object.hasOwn(obj, 'guidance')) {
+    if (role !== 'router' || obj.action !== 'maker') {
+      errors.push('guidance 只在 router 的 action=maker 时合法（多任务委派用 dispatch 的 assignments）');
+    } else if (typeof obj.guidance !== 'string' || obj.guidance.trim() === '' || obj.guidance.length > GUIDANCE_MAX) {
+      errors.push(`guidance 须为非空字符串，≤ ${GUIDANCE_MAX} 字符`);
+    }
+  }
+
+  // ---- done / remaining：maker / worker 的进度清单 ----
+  for (const f of ['done', 'remaining']) {
+    if (!Object.hasOwn(obj, f)) continue;
+    if (role !== 'maker' && role !== 'worker') {
+      errors.push(`${f} 是 maker / worker 专属字段，${role} 不得出现`);
+    } else if (!Array.isArray(obj[f]) || obj[f].length > PROGRESS_ITEMS_MAX
+      || obj[f].some((x) => typeof x !== 'string' || x.trim() === '' || x.length > PROGRESS_ITEM_MAX)) {
+      errors.push(`${f} 须为字符串数组（≤ ${PROGRESS_ITEMS_MAX} 项，每项 ≤ ${PROGRESS_ITEM_MAX} 字符）`);
+    }
   }
 
   checkUnknownFields(obj, AGENT_FIELDS, errors);

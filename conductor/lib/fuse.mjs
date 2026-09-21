@@ -68,6 +68,10 @@ function precommitSignature(rec) {
 function reviewerSignature(rec) {
   if (rec.outcome === 'ok') return null; // 全 pass 无 fail 行，签名无内容
   const fails = reviewerFailLines(rec.summary);
+  // partial = 还没判完（分轮续审）。没有任何 fail 行的 partial 是「在推进」，不是「同因失败」：
+  // 判了 4 条、9 条、14 条的三轮 summary 都没有 fail 行，签名会一模一样——那样正在续审的大任务
+  // 会被这根保险丝误杀。续审原地打转（覆盖率不涨）由停滞保险丝管：review 覆盖在它的硬进展指纹里。
+  if (rec.outcome === 'partial' && fails.length === 0) return null;
   return `reviewer|${rec.tier ?? '-'}|${hash16([rec.tier ?? null, fails])}`;
 }
 

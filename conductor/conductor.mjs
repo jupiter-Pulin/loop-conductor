@@ -1,13 +1,26 @@
 #!/usr/bin/env node
 // conductor.mjs — CLI 入口 + drain 循环。确定性、可重入、幂等：conductor 是脚本，不是 agent。
-// 子命令：run / new / approve / reject / resume / abandon / retry / status / spy。
+// 子命令：run [--continuous|--watch] / stop / new / approve / reject / resume / abandon / retry /
+//         pause / unpause / digest / recover / show / status / spy。
 // 人只在两道闸出现（spec 与 merge），外加 router 或内核发起的 help；其余去向一律由 router 决定。
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as state from './lib/state.mjs';
 import { acquireLock, releaseLock, lockDirPath, STALE_MS, startLockHeartbeat } from './lib/lock.mjs';
-import { runScheduler, initRunBudget } from './lib/scheduler.mjs';
+import { runRateLimited, runScheduler } from './lib/scheduler.mjs';
+import {
+  clearStopRequest, closeRunSession, noteBatch, openRunSession, readRunSession, readStopRequest, requestStop, stopRequested,
+} from './lib/run-session.mjs';
+import { killAllActive } from './lib/claude.mjs';
+import { processState } from './lib/proc.mjs';
+import { clearMergeIntent, mergedButNotArchived, unfinishedSpawns, writeMergeIntent } from './lib/recovery.mjs';
+import { currentSpec, sha256Of, shortSha, verifyApprovedSpec } from './lib/spec-version.mjs';
+import { digestStateFor, resetDigest } from './lib/digest-store.mjs';
+import { latestAssignments, listLedgers, resumableSpawn } from './lib/dispatch-ledger.mjs';
+import { renderCoverage } from './lib/review-ledger.mjs';
+import { ensureDigest } from './stages/actions/digest.mjs';
+import { buildTaskPhase, buildTaskView, renderTaskView } from './lib/task-view.mjs';
 import { withTaskLock, TaskLockBusyError } from './lib/task-lock.mjs';
 import { currentBranch, mergeBranch } from './lib/git.mjs';
 import { validateSpecDoc } from './lib/spec-contract.mjs';
@@ -17,10 +30,11 @@ import { collectModelIds, probeModels } from './lib/model-probe.mjs';
 import { PRECOMMIT_PROFILE_SAMPLE, setupProfilePaths, validatePrecommitProfile } from './lib/profile.mjs';
 import { DEFAULT_MAX_TURNS } from './lib/agent-settings.mjs';
 import { STAGES } from './stages/decisions.mjs';
-import routingHandler from './stages/routing.mjs';
+import routingHandler, { recoveryDeps } from './stages/routing.mjs';
+import { recoverTask } from './lib/recovery.mjs';
 import awaitHumanHandler from './stages/await_human.mjs';
 import {
-  archiveSpecDraft, cleanupTaskArtifacts, humanRecordPath, revParseOrNull, specDraftPath,
+  archiveSpecDraft, cleanupTaskArtifacts, humanRecordPath, readRouterState, revParseOrNull, reviewStateFor, specDraftPath,
   taskBranchName, taskCfg, writeRouterState,
 } from './stages/router-kernel.mjs';
 
@@ -43,11 +57,18 @@ export function resolveRoot() {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 }
 
-/** 四角色的默认模型（spec §角色、工具、hook、模型：默认沿用现配置，四角色均 claude-opus-5）。 */
+/** 判断与执行角色的默认模型。 */
 export const DEFAULT_ROLE_MODEL = 'claude-opus-5';
 
-/** 新状态机认识的模型键；其余（setup / feasibility / specVerifier / verifier / committer）是遗留键。 */
-export const ROLE_MODEL_KEYS = Object.freeze(['router', 'spec', 'maker', 'reviewer']);
+/**
+ * 摘要角色的默认模型：快速模型。摘要是「压缩 + 索引」的机械活，产物由内核逐条机械校验、
+ * 不合格会退回重做，不需要也不应该用最贵的模型。可在 conductor.config.json 的 models.digest 改；
+ * 配了一个不可用的 id，run 启动时的模型探测会当场报出来，不会拖到任务中途。
+ */
+export const DEFAULT_DIGEST_MODEL = 'claude-haiku-4-5-20251001';
+
+/** 状态机认识的模型键；其余（setup / feasibility / specVerifier / verifier / committer）是遗留键。 */
+export const ROLE_MODEL_KEYS = Object.freeze(['router', 'spec', 'maker', 'reviewer', 'digest', 'worker']);
 
 /**
  * spec §config 的删除清单（AC-027）：这些键已随旧状态机一并消失，读到只警告不生效。
@@ -93,7 +114,9 @@ export function normalizeMaxTurns(configured) {
 export function normalizeModels(defaults, userModels) {
   const models = { ...defaults, ...(userModels ?? {}) };
   for (const key of ROLE_MODEL_KEYS) {
-    if (typeof models[key] !== 'string' || models[key].trim() === '') models[key] = DEFAULT_ROLE_MODEL;
+    if (typeof models[key] !== 'string' || models[key].trim() === '') {
+      models[key] = key === 'digest' ? DEFAULT_DIGEST_MODEL : DEFAULT_ROLE_MODEL;
+    }
   }
   for (const key of LEGACY_MODEL_KEYS) {
     if (Object.hasOwn(userModels ?? {}, key)) warnLegacyKey(`models.${key}`);
@@ -121,13 +144,25 @@ export function loadCfg(root = resolveRoot()) {
     precommitStepTimeoutMs: null, // precommit 单步墙钟上限；null = 取 greenGateTimeoutMs（spec §config）
     precommitLockTimeoutMs: 1800000, // 等 state/.precommit.lock 的上限，超时记 lock_timeout（AC-050）
     lockHeartbeatMs: 60000,
-    maxStepsPerTask: 20,
+    maxStepsPerTask: 20, // 单个调度批次里每个任务最多推进几步；批次耗尽只是让出执行机会（见 run --continuous）
+    maxRoundsPerTask: 300, // 整个任务的轮次硬上限（router / worker / digest / 自动续接都占轮次）；达到即收箱 round_cap
+    maxParallelAssignments: 3, // 一次 dispatch 里同时在跑的 worker 数上限（超出的排队）
+    maxConcurrentSpawns: 6, // 全进程同时在飞的 agent 会话数上限（多任务 × 多 worker 共用）
+    maxAutoContinues: 2, // worker 撞会话上限且有可核实进展时，内核不经 router 自动续会话的次数上限
+    routerRecordWindow: 14, // router prompt 里带 summary 全文的记录条数；更早的只给索引行
+    digestEnabled: true, // spec 摘要；关掉后 router 直接读原文
+    digestMaxAttempts: 3, // 每个 spec 版本最多生成几次摘要；用尽即显式降级
+    workerWebAccess: true, // worker 的 WebFetch / WebSearch 免审批（核实外部事实用）；false 则不放行
+    workerSandbox: { enabled: false, allowWrite: [], allowedDomains: [], denyRead: [] }, // 宿主 OS 沙盒（见 AGENTS.md「执行边界」）
+    watchPollMs: 5000, // run --watch 空闲时轮询新工作的间隔
+    recoveryKillGraceMs: 10000, // 恢复时收割残留 agent 进程组的宽限期
+    fuseStallRounds: 8, // 停滞保险丝：连续 N 个 ROUTING 轮没有任何硬进展即收箱；0=关
     fuseStreak: 3, // 保险丝（AC-024）：同一 (role, package) 连续 N 条记录签名相同即收箱；0=关
     maxParallelPackages: 2, // 一个任务同轮最多并行几个工作包（P2b 才用得上）
     maxPackages: 12, // 一份方案最多几个包（validatePackages 的上限）
     packagesEnabled: false, // 阶段闸：P2b 前恒关——plan 动作被拒、spec prompt 无工作包段、router 的 packages 字段即非法
     runBudgetUsd: null,
-    models: { router: null, spec: null, maker: null, reviewer: null },
+    models: { router: null, spec: null, maker: null, reviewer: null, digest: null, worker: null },
   };
   let user = {};
   try {
@@ -209,9 +244,16 @@ function warnLegacyTasks(cfg) {
  * 模型可用性探测（AC-052）。全部可用（或没有可探的 id）→ true；否则打印原因并令本次 run
  * 在处理任何任务前终止，任务状态零变化。缓存命中不再探测（键 = 模型 id + claude 二进制版本）。
  */
+/** 本次运行真会用到的模型：摘要关掉时不探它的模型（探测本身是一次会话，不该为用不到的角色花）。 */
+function activeModels(cfg) {
+  const models = { ...(cfg.models ?? {}) };
+  if (cfg.digestEnabled === false) delete models.digest;
+  return models;
+}
+
 async function ensureModelsAvailable(cfg) {
-  if (collectModelIds(cfg.models).length === 0) return true;
-  const probe = await probeModels({ cfg });
+  if (collectModelIds(activeModels(cfg)).length === 0) return true;
+  const probe = await probeModels({ cfg, models: activeModels(cfg) });
   if (probe.ok) return true;
   if (probe.rateLimited) {
     const resets = probe.rateLimited.resets_at;
@@ -230,7 +272,78 @@ async function ensureModelsAvailable(cfg) {
   return false;
 }
 
-async function cmdRun(cfg) {
+/** queue 里此刻还能被推进的任务数（ROUTING、未暂停、非遗留）：持续运行据此判断「还有没有活」。 */
+function countRunnable(cfg) {
+  return state.listTaskStates(cfg.queueDir, 'queue')
+    .filter((ts) => !ts.error && ts.runtime.stage === 'ROUTING' && !isLegacyTask(ts.runtime) && !isPaused(ts))
+    .length;
+}
+
+export function isPaused(ts) {
+  return fs.existsSync(path.join(ts.dir, 'PAUSED'));
+}
+
+/**
+ * 启动巡检的恢复部分：对 queue 里每个任务跑一遍恢复（不只 ROUTING——停在人闸上的任务也可能留着
+ * 上一个 runner 的残留 agent），并补完「已合并、未归档」的 merge。此刻持有全局 run 锁，逐任务再拿写锁。
+ */
+async function recoverAll(cfg, { dryRun = false } = {}) {
+  const report = [];
+  for (const ts0 of state.listTaskStates(cfg.queueDir, 'queue')) {
+    if (ts0.error || isLegacyTask(ts0.runtime)) continue;
+    const pendingSpawns = unfinishedSpawns(cfg, ts0.id);
+    const openDispatch = listLedgers(cfg, ts0.id).filter((l) => l.closed !== true);
+    const merged = mergedButNotArchived(cfg, ts0.id, taskCfg(ts0, cfg).targetRepo, ts0.task.baseBranch);
+    if (pendingSpawns.length === 0 && openDispatch.length === 0 && !merged) continue;
+    const item = {
+      id: ts0.id,
+      unfinished_spawns: pendingSpawns.map((p) => ({
+        name: `${p.base}-r${p.round}`,
+        process: p.record.pid != null ? processState({ pid: Number(p.record.pid), pid_started: p.record.pid_started ?? null }) : 'dead',
+      })),
+      open_dispatch_rounds: openDispatch.map((l) => l.round),
+      merged_not_archived: Boolean(merged),
+      actions: [],
+    };
+    if (!dryRun) {
+      await withTaskLock(cfg, ts0.id, async () => {
+        const ts = findTask(cfg, ts0.id);
+        if (!ts || ts.error) return;
+        if (merged) {
+          finishMergedTask(cfg, ts, merged, '恢复：merge 已完成但归档未完成，补完归档');
+          item.actions.push({ kind: 'merge_archived' });
+          return;
+        }
+        item.actions = await recoverTask(ts, cfg, recoveryDeps(cfg));
+      }, { retries: 3, retryDelayMs: 200 });
+    }
+    report.push(item);
+  }
+  return report;
+}
+
+function printRecoveryReport(report, { dryRun }) {
+  if (report.length === 0) { console.error('[conductor] 恢复巡检：没有需要恢复的残留。'); return; }
+  for (const r of report) {
+    console.error(`[${r.id}] 恢复巡检${dryRun ? '（dry-run，未做任何改动）' : ''}：`
+      + `未收尾的 spawn=${r.unfinished_spawns.map((u) => `${u.name}(${u.process})`).join(', ') || '无'}；`
+      + `未关账的 dispatch=${r.open_dispatch_rounds.map((n) => `r${n}`).join(', ') || '无'}`
+      + `${r.merged_not_archived ? '；merge 已完成但未归档' : ''}`);
+    for (const a of r.actions) console.error(`  - ${a.kind}${a.base ? ` ${a.base} r${a.round} 进程=${a.process}` : ''}${a.states ? ` ${a.states.join(' ')}` : ''}`);
+  }
+}
+
+/**
+ * run：推进 queue 里的任务。
+ *   （默认）      跑一个调度批次就退出——批次耗尽（maxStepsPerTask）只是让出执行机会；
+ *   --continuous  批次接批次地跑，直到没有可执行的工作（全部在等人 / 已收箱 / 已完成）或必须停下；
+ *   --watch       同上，但空闲时不退出：轮询新工作（人批准了 spec、retry 了任务、建了新任务）接着跑。
+ * 不管哪种方式，运行额度（runBudgetUsd）与各任务预算都跨批次累计，新批次不是新授权；
+ * 上一次运行若没正常收尾（崩溃），这一次接管它的账本从已花金额接着算。
+ * 必须停下的条件：停止请求（SIGINT / SIGTERM / `conductor stop`）、运行额度用尽、平台限额。
+ */
+async function cmdRun(cfg, opts = {}) {
+  const mode = opts.watch ? 'watch' : (opts.continuous ? 'continuous' : 'once');
   const lock = acquireLock(cfg.stateDir, {
     onSelfHeal: (info) => {
       console.error(`[conductor] 检测到锁 pid=${info?.pid ?? '?'} 已不存活，已自动清除残锁并重新获锁。`);
@@ -250,6 +363,13 @@ async function cmdRun(cfg) {
     return;
   }
   let stopHeartbeat = null;
+  let stopWatcher = null;
+  let endReason = 'batch_done';
+  const onSignal = (sig) => {
+    if (!cfg.__stop) console.error(`[conductor] 收到 ${sig}：不再发起新的 agent，收割在飞的会话并保存现场后退出。`);
+    cfg.__stop = { reason: sig, now: true };
+    killAllActive('stopped');
+  };
   try {
     stopHeartbeat = startLockHeartbeat(cfg.stateDir, cfg.lockHeartbeatMs);
     if (cfg.deprecatedMaxDrainStepsConfigured) {
@@ -259,20 +379,81 @@ async function cmdRun(cfg) {
       console.error(`[conductor] 警告：maxConcurrentTasks=${cfg.maxConcurrentTasks} 非法，按 1 处理。`);
     }
     // AC-052：处理任何任务之前先确认配置的模型 id 都能起会话。id 打错/没权限/被下线时，
-    // 代价是 run 启动即停，而不是四个角色各 spawn 失败、各烧一遍退避阶梯、把任务推错分支。
-    if (!(await ensureModelsAvailable(cfg))) return;
-    warnLegacyTasks(cfg);
-    const repaired = state.patrolBoxStageConsistency(cfg);
-    for (const r of repaired) {
-      console.error(`[${r.id}] box/stage 巡检自愈：${r.from} → ${r.to}（stage=${r.stage}）`);
+    // 代价是 run 启动即停，而不是各个角色各 spawn 失败、各烧一遍退避阶梯、把任务推错分支。
+    if (!(await ensureModelsAvailable(cfg))) { endReason = 'models_unavailable'; return; }
+
+    clearStopRequest(cfg); // 上一次遗留的停止请求针对的是当时的 runner
+    const { session, adopted } = openRunSession(cfg, { mode });
+    if (adopted) {
+      console.error(`[conductor] 上一次运行没有正常收尾，接管它的运行账本：已花 $${Number(session.spent_usd).toFixed(3)}`
+        + `${session.limit_usd != null ? ` / 额度 $${session.limit_usd}` : ''}（额度不因重启清零）。`);
     }
-    initRunBudget(cfg);
-    await runScheduler(cfg, STAGE_HANDLERS);
+    if (session.ledger_corrupt) {
+      console.error('[conductor] 警告：运行账本 state/.run-session.json 的已花金额读不出来，按「额度已用尽」处理（不会当成 0）。'
+        + '确认无误后删除该文件再 run，即一次新的授权。');
+    }
+    process.on('SIGINT', onSignal);
+    process.on('SIGTERM', onSignal);
+    const watcher = setInterval(() => {
+      if (!stopRequested(cfg)) return;
+      if ((cfg.__stop?.now ?? readStopRequest(cfg)?.now) === true) killAllActive('stopped');
+    }, 1000);
+    watcher.unref?.();
+    stopWatcher = () => clearInterval(watcher);
+
+    warnLegacyTasks(cfg);
+    printRecoveryReport(await recoverAll(cfg), { dryRun: false });
+
+    for (;;) {
+      const repaired = state.patrolBoxStageConsistency(cfg);
+      for (const r of repaired) {
+        console.error(`[${r.id}] box/stage 巡检自愈：${r.from} → ${r.to}（stage=${r.stage}）`);
+      }
+      const result = await runScheduler(cfg, STAGE_HANDLERS);
+      noteBatch(cfg);
+      if (stopRequested(cfg)) { endReason = 'stop_requested'; break; }
+      if (mode === 'once') break;
+      const budget = cfg.__runBudget;
+      if (budget?.limit != null && budget.spent >= budget.limit) { endReason = 'run_budget_exhausted'; break; }
+      if (runRateLimited(cfg)) { endReason = 'rate_limited'; break; }
+      const runnable = countRunnable(cfg);
+      if (runnable > 0 && (result.changed || result.capped.length > 0)) continue; // 还有活：下一批接着跑，不用人再敲一次 run
+      if (mode === 'continuous') { endReason = runnable > 0 ? 'no_progress_in_batch' : 'idle'; break; }
+      await new Promise((resolve) => setTimeout(resolve, Number(cfg.watchPollMs) > 0 ? Number(cfg.watchPollMs) : 5000));
+    }
+    const human = {
+      batch_done: '本批次结束（单批模式）；还有可推进的任务时再次 run，或用 run --continuous / --watch',
+      idle: '没有可执行的工作了（都在等人、已收箱或已完成）',
+      no_progress_in_batch: '还有 ROUTING 任务但这一批没有任何推进（可能都被闸门拦住或已暂停），退出以免空转',
+      stop_requested: '收到停止请求：未再发起新的 agent，现场已保存，`conductor run` 可从原处继续',
+      run_budget_exhausted: `本次运行额度 runBudgetUsd=$${cfg.__runBudget?.limit} 已用尽：任务状态原样保留；再次 run 是一次新的授权`,
+      rate_limited: '平台限额：命中的任务已收箱，其余任务原样保留；到重置时刻后 `conductor retry --rate-limited` 再 run',
+    }[endReason];
+    if (mode !== 'once' || endReason !== 'batch_done') console.error(`[conductor] 运行结束（${endReason}）：${human}`);
   } finally {
+    process.off('SIGINT', onSignal);
+    process.off('SIGTERM', onSignal);
+    if (stopWatcher) stopWatcher();
+    closeRunSession(cfg, endReason);
+    if (endReason === 'stop_requested') clearStopRequest(cfg);
     if (stopHeartbeat) stopHeartbeat();
     releaseLock(cfg.stateDir);
   }
   cmdStatus(cfg);
+}
+
+/** `conductor stop [--now]`：请求正在运行的 runner 停下。不带 --now 只是不再派新活；--now 连在飞的 agent 一起收割。 */
+function cmdStop(cfg, opts = {}) {
+  const info = state.readJsonIf(path.join(lockDirPath(cfg.stateDir), 'info.json'));
+  const alive = info?.pid != null && ['alive', 'unknown'].includes(processState({ pid: Number(info.pid), pid_started: info.pid_started ?? null }));
+  if (!alive) {
+    console.log('当前没有正在运行的 conductor run，无需停止。');
+    return;
+  }
+  requestStop(cfg, { reason: 'conductor stop', now: opts.now === true });
+  console.log(`已请求 runner（pid=${info.pid}）停止：${opts.now === true
+    ? '在飞的 agent 会被收割（已落盘的工作保留并提交），随后退出'
+    : '不再发起新的 agent，等在飞的会话自然结束后退出（要立刻停加 --now）'}。之后 \`conductor run\` 从原处继续。`);
 }
 
 // ---- new ----
@@ -418,7 +599,7 @@ async function withCliTaskMutation(cfg, id, fn) {
  * 把人的裁决合并进本轮的 human-r<n>.json（内核写的产物，可续写；agent 的 log 才是只增不改）。
  * 合成后它就是记录列表里的一条 `role: "human"`，router 在「已裁决事项」里逐字读到 notes。
  */
-function recordHumanDecision(cfg, ts, { decision, notes = null, noPackages = false }) {
+function recordHumanDecision(cfg, ts, { decision, notes = null, noPackages = false, extra = {} }) {
   const round = ts.runtime.awaiting?.round ?? ts.runtime.current_round ?? 0;
   const p = humanRecordPath(cfg, ts.id, round);
   const existing = state.readJsonIf(p) ?? { schema_version: 1, kind: ts.runtime.awaiting?.kind ?? null, requested_by: 'kernel', summary: '', refs: [] };
@@ -428,6 +609,7 @@ function recordHumanDecision(cfg, ts, { decision, notes = null, noPackages = fal
     notes: typeof notes === 'string' && notes !== '' ? notes : null,
     no_packages: noPackages === true,
     decided_at: new Date().toISOString(),
+    ...extra,
   };
   state.writeJson(p, merged);
   state.appendEventAlways(cfg, ts.id, 'human_decision', {
@@ -462,11 +644,23 @@ function approveSpecGate(cfg, ts, opts) {
   if (opts['no-packages'] && cfg.packagesEnabled !== true) {
     console.log('提示：packagesEnabled=false，--no-packages 本阶段无意义，已忽略');
   }
+  // 版本身份 = 内容哈希。批准的就是这一刻草稿里的字节（人在闸上改过的也算进去）：冻结稿、
+  // runtime.spec_sha256、人闸裁决记录三处记同一个哈希。之后摘要、reviewer 判决、委派都按它绑定版本；
+  // 冻结稿再被动过，内核每轮的复核会发现并停下（stages/routing.mjs::guardApprovedSpec）。
+  const specSha = sha256Of(body);
+  const previousSha = ts.runtime.spec_sha256 ?? null;
   state.writeFileEnsured(state.dossierPath(cfg, id, 'spec.md'), body);
   archiveSpecDraft(cfg, id, 'approved');
-  recordHumanDecision(cfg, ts, { decision: 'approved', notes: opts.notes === true ? null : opts.notes });
-  backToRouting(cfg, ts, 'spec 批准', { spec_approved: true });
-  console.log(`${id} spec 已冻结（dossier/${id}/spec.md，AC×${check.acs.length}）→ ROUTING`);
+  recordHumanDecision(cfg, ts, { decision: 'approved', notes: opts.notes === true ? null : opts.notes, extra: { spec_sha256: specSha } });
+  backToRouting(cfg, ts, 'spec 批准', { spec_approved: true, spec_sha256: specSha });
+  console.log(`${id} spec 已冻结（dossier/${id}/spec.md，AC×${check.acs.length}，版本 ${shortSha(specSha)}）→ ROUTING`);
+  if (previousSha && previousSha !== specSha) {
+    console.log(`提示：获批 spec 的版本变了（${shortSha(previousSha)} → ${shortSha(specSha)}）：旧版本上的整体 review 判决与摘要不再适用，会按新版本重做。`);
+  }
+  const digest = cfg.digestEnabled !== false ? digestStateFor(cfg, id, { sha256: specSha, text: body }) : null;
+  if (digest && digest.state !== 'valid') {
+    console.log(`提示：这一版 spec 还没有可用摘要（${digest.state}）；下次 conductor run 会先自动补齐，再让 router 决策。`);
+  }
 }
 
 /**
@@ -483,11 +677,31 @@ function approveMergeGate(cfg, ts, opts) {
   const base = revParseOrNull(repo, ts.task.baseBranch);
   const records = composeRecords(cfg, id, { planActive: ts.runtime.plan_active === true });
 
+  // 崩溃恢复：上一次 approve 已经把分支合进 base，只是没来得及归档。认出这个事实并补完归档——
+  // 既不再合一次，也不因为「base 变了」把已经合并的任务误判回 ROUTING。
+  const already = mergedButNotArchived(cfg, id, repo, ts.task.baseBranch);
+  if (already) {
+    finishMergedTask(cfg, ts, already, 'merge 批准（上一次已完成合并，本次补完归档）');
+    console.log(`${id} 上一次批准时分支已合入 ${ts.task.baseBranch}，本次只补完归档（state/done/）。未 push。`);
+    return;
+  }
+
   const gateRound = ts.runtime.awaiting?.round ?? ts.runtime.current_round ?? null;
-  if (needReview(records, head)) {
+  // 获批 spec 在批准 merge 的这一刻也必须原样：验收依据被动过，任何判决都不算数。
+  const specCheck = verifyApprovedSpec(cfg, ts);
+  if (!specCheck.ok) {
+    state.appendEventAlways(cfg, id, 'spec_tampered', { reason: specCheck.reason, expected: specCheck.expected, actual: specCheck.actual });
+    backToRouting(cfg, ts, 'merge 批准被拒绝：获批 spec 的冻结稿与批准时不一致');
+    console.error(`${id} merge 拒绝：dossier/${id}/spec.md 与批准时的版本不一致（${specCheck.reason}）→ 回 ROUTING（内核会开 help 闸说明如何恢复）`);
+    process.exitCode = 1;
+    return;
+  }
+  const review = reviewStateFor(ts, cfg, records, head);
+  if (needReview(records, head, { coverage: review.coverage })) {
     state.appendEventAlways(cfg, id, 'stale_review', { round: gateRound, head_sha: head, base_sha: base });
     backToRouting(cfg, ts, 'merge 批准被版本规则拒绝：当前 HEAD 没有通过的整体 review');
-    console.error(`${id} merge 拒绝：任务分支 HEAD 已变，当前版本没有通过的整体 review（need_review=true）→ 回 ROUTING`);
+    console.error(`${id} merge 拒绝：当前版本（HEAD 与获批 spec）没有判全且全 pass 的整体 review（need_review=true`
+      + `${review.coverage ? `；${renderCoverage(review.coverage, review.acIds.length)}` : ''}）→ 回 ROUTING`);
     process.exitCode = 1;
     return;
   }
@@ -508,20 +722,34 @@ function approveMergeGate(cfg, ts, opts) {
   const message = typeof opts.message === 'string' && opts.message !== ''
     ? opts.message
     : `task ${id}: ${ts.task.title ?? id}`;
+  // 预写意图：合并是不可重复的副作用。崩在「已合并、未归档」之间时，下次靠它认出已经合过了。
+  writeMergeIntent(cfg, id, { head_sha: head, base_sha: base, branch, message, notes: opts.notes === true ? null : (opts.notes ?? null) });
   try {
     mergeBranch(repo, branch, message); // 本地 merge，绝不 push
   } catch (err) {
+    clearMergeIntent(cfg, id);
     console.error(`${id} merge 失败（任务保持原状）：${err.message}`);
     state.appendTimeline(cfg, id, `merge 失败：${err.message}`);
     process.exitCode = 1;
     return;
   }
-  state.appendEventAlways(cfg, id, 'merged', { branch, message, head_sha: head, base_sha: base });
-  state.appendTimeline(cfg, id, `merged ${branch} → ${ts.task.baseBranch}（${message}）`);
-  recordHumanDecision(cfg, ts, { decision: 'approved', notes: opts.notes === true ? null : opts.notes });
-  cleanupTaskArtifacts(ts, cfg, { deleteTaskBranch: true });
-  state.transitionState(ts, cfg, 'DONE', 'merge 批准', { awaiting: null });
+  finishMergedTask(cfg, ts, { head_sha: head, base_sha: base, branch, message, notes: opts.notes === true ? null : (opts.notes ?? null) }, 'merge 批准');
   console.log(`${id} 已 merge 并归档（state/done/），worktree 与任务分支已清理。未 push。`);
+}
+
+/** 合并之后的收尾（事件 → 裁决记录 → 清产物 → DONE → 清意图）。正常路径与崩溃恢复共用，逐步幂等。 */
+function finishMergedTask(cfg, ts, intent, note) {
+  const id = ts.id;
+  let events = '';
+  try { events = fs.readFileSync(state.dossierPath(cfg, id, 'events.jsonl'), 'utf8'); } catch { /* 还没有事件流 */ }
+  if (!/"type":"merged"/.test(events)) {
+    state.appendEventAlways(cfg, id, 'merged', { branch: intent.branch, message: intent.message, head_sha: intent.head_sha, base_sha: intent.base_sha });
+    state.appendTimeline(cfg, id, `merged ${intent.branch} → ${ts.task.baseBranch}（${intent.message}）`);
+  }
+  if (ts.runtime.awaiting?.kind === 'merge') recordHumanDecision(cfg, ts, { decision: 'approved', notes: intent.notes ?? null });
+  cleanupTaskArtifacts(ts, cfg, { deleteTaskBranch: true });
+  state.transitionState(ts, cfg, 'DONE', note, { awaiting: null });
+  clearMergeIntent(cfg, id);
 }
 
 /** router 纪元认识的 stage；其余（P3 之前的遗留 stage 名）一律只读。 */
@@ -667,6 +895,12 @@ function cmdStatus(cfg) {
         continue;
       }
       const stage = ts.runtime.stage ?? '?';
+      // 阶段（运行中 / 等待结果 / 可恢复中断 / 等待资源 / 等待人 / 已终止）只对本状态机的任务算；
+      // 算不出来（案卷残缺）不该让整张表打不出来。
+      let phase = '-';
+      if (!isLegacyTask(ts.runtime)) {
+        try { phase = buildTaskPhase(cfg, ts).label; } catch { phase = '?'; }
+      }
       rows.push({
         id: ts.task.id ?? ts.id,
         // 遗留 stage 名照常打出来（旧任务只读，但要看得见），只是这台机器不再推进它们。
@@ -674,12 +908,13 @@ function cmdStatus(cfg) {
         awaiting: ts.runtime.awaiting?.kind ?? ts.runtime.last_failure_type ?? '-',
         spent: `$${(ts.runtime.spent_usd ?? 0).toFixed(3)}`,
         box,
+        phase,
       });
     }
   }
   const cols = [
     ['id', 'ID', 22], ['stage', 'STAGE', 21], ['awaiting', 'AWAITING/FAILURE', 26],
-    ['spent', 'SPENT', 10], ['box', 'BOX', 7],
+    ['spent', 'SPENT', 10], ['box', 'BOX', 7], ['phase', 'PHASE', 0],
   ];
   console.log(cols.map(([, h, w]) => h.padEnd(w)).join(''));
   if (rows.length === 0) {
@@ -698,7 +933,7 @@ function latestActiveSpawn(cfg, id) {
   const active = [];
   for (const n of names) {
     // 新旧两套角色名都要认（AC：status / spy 兼容新旧任务）。
-    const m = n.match(/^(setup|feasibility-agent|spec-agent|spec-verifier|verifier|router|spec-plan|spec|maker(?:-P-\d{3})?|reviewer)-r(\d+)\.json$/);
+    const m = n.match(/^(setup|feasibility-agent|spec-agent|spec-verifier|verifier|router|spec-plan|spec|digest|maker(?:-P-\d{3})?|reviewer|worker-[a-z][a-z0-9]*(?:-[a-z0-9]+)*)-r(\d+)\.json$/);
     if (!m) continue;
     const p = path.join(dir, n);
     const rec = state.readJsonIf(p);
@@ -746,6 +981,113 @@ function cmdSpy(cfg) {
     return;
   }
   for (const r of rows) console.log(cols.map(([k, , w]) => String(r[k]).padEnd(w)).join(''));
+}
+
+// ---- show / pause / unpause / digest / recover ----
+
+/** `conductor show <id> [--json]`：一个任务的完整现状——不用翻 JSON 就知道卡在哪、还能不能继续。 */
+function cmdShow(cfg, id, opts = {}) {
+  const ts = findTask(cfg, id);
+  if (!ts) { console.error(`找不到任务 ${id ?? ''}`); process.exitCode = 1; return; }
+  if (ts.error) { console.error(`${id} 任务目录损坏：${ts.error}`); process.exitCode = 1; return; }
+  const view = buildTaskView(cfg, ts);
+  console.log(opts.json === true ? JSON.stringify(view, null, 2) : renderTaskView(view));
+}
+
+/**
+ * 暂停 / 恢复单个任务。标记是任务目录里的 PAUSED 文件而不是 runtime 字段：runner 正持着任务锁跑一个
+ * 很长的 dispatch 时人也能暂停（不用等锁），从下一步开头生效；在飞的 agent 不受影响，要立刻停用
+ * `conductor stop --now`。暂停不改 stage、不动案卷、不花钱。
+ */
+function cmdPause(cfg, id, opts = {}, paused = true) {
+  const ts = findTask(cfg, id);
+  if (!ts) { console.error(`找不到任务 ${id ?? ''}`); process.exitCode = 1; return; }
+  if (ts.error) { console.error(`${id} 任务目录损坏：${ts.error}`); process.exitCode = 1; return; }
+  if (refuseLegacyTask(ts)) return;
+  if (ts.box !== 'queue') { console.error(`${paused ? 'pause' : 'unpause'} 仅适用于 queue 中的任务（当前 box=${ts.box}）`); process.exitCode = 1; return; }
+  const marker = path.join(ts.dir, 'PAUSED');
+  if (paused) {
+    const notes = opts.notes === true ? null : (opts.notes ?? null);
+    fs.writeFileSync(marker, `${JSON.stringify({ paused_at: new Date().toISOString(), notes })}\n`);
+    state.appendTimeline(cfg, id, `human pause${notes ? `：${notes}` : ''}`);
+    state.appendEventAlways(cfg, id, 'paused', { notes });
+    console.log(`${id} 已暂停：从下一步起不再派工（在飞的 agent 会跑完；要立刻停用 conductor stop --now）。conductor unpause ${id} 继续。`);
+  } else {
+    if (!fs.existsSync(marker)) { console.log(`${id} 本来就没有暂停`); return; }
+    fs.rmSync(marker, { force: true });
+    state.appendTimeline(cfg, id, 'human unpause');
+    state.appendEventAlways(cfg, id, 'unpaused', {});
+    console.log(`${id} 已恢复；conductor run 继续推进`);
+  }
+}
+
+/**
+ * `conductor digest <id> [--force]`：为当前适用版本的 spec（草稿或冻结稿）补齐摘要。
+ * --force：归档旧摘要、尝试计数清零后重做（降级之后想再试、或怀疑摘要有误时用）。
+ * 它会起一个 agent 会话，所以和 run 互斥（拿同一把全局锁）；正常情况下不需要手动跑——
+ * run 每轮开头会自动补齐。
+ */
+async function cmdDigest(cfg, id, opts = {}) {
+  const lock = acquireLock(cfg.stateDir);
+  if (!lock.acquired) {
+    console.error(`[conductor] 有 conductor run 正在运行（pid=${lock.info?.pid ?? '?'}）：它每轮开头会自动补齐摘要，无需手动执行。`);
+    process.exitCode = 1;
+    return;
+  }
+  try {
+    await withCliTaskMutation(cfg, id, async () => {
+      const ts = findTask(cfg, id);
+      if (!ts) { console.error(`找不到任务 ${id}`); process.exitCode = 1; return; }
+      if (ts.error) { console.error(`${id} 任务目录损坏：${ts.error}`); process.exitCode = 1; return; }
+      if (refuseLegacyTask(ts)) return;
+      if (ts.box !== 'queue') { console.error(`digest 仅适用于 queue 中的任务（当前 box=${ts.box}）`); process.exitCode = 1; return; }
+      const spec = currentSpec(cfg, ts);
+      if (!spec) { console.error(`${id} 当前没有可用的 spec（草稿或冻结稿），无可摘要`); process.exitCode = 1; return; }
+      if (opts.force === true) {
+        resetDigest(cfg, id, spec.sha256);
+        state.appendTimeline(cfg, id, `human 要求重做摘要（spec ${shortSha(spec.sha256)}）`);
+      }
+      if (!(await ensureModelsAvailable({ ...cfg, models: { digest: cfg.models.digest } }))) return;
+      openRunSession(cfg, { mode: 'digest' });
+      let last = digestStateFor(cfg, id, spec);
+      // 有界：每次 ensureDigest 最多一次尝试，尝试总数受 digestMaxAttempts 约束。
+      while (last.state === 'missing' || last.state === 'invalid') {
+        const r = await ensureDigest(ts, cfg, spec, { boxOnFailure: false });
+        if (!r.spawned) break;
+        last = digestStateFor(cfg, id, spec);
+      }
+      closeRunSession(cfg, 'digest_done');
+      const view = buildTaskView(cfg, findTask(cfg, id)).digest;
+      console.log(`${id} 摘要状态：${last.state}（spec ${spec.status} 版本 ${shortSha(spec.sha256)}，尝试 ${last.attempts} 次，花费 $${view?.cost_usd?.toFixed(3) ?? '?'}）`);
+      if (last.state === 'valid') console.log(`  摘要：${view.path}\n  原文快照：${view.source_snapshot}`);
+      else {
+        for (const e of last.errors.slice(0, 5)) console.error(`  - ${e}`);
+        if (last.state === 'exhausted') console.error('  已降级：router 会直接读原文。--force 可清零重试。');
+        process.exitCode = 1;
+      }
+    });
+  } finally {
+    releaseLock(cfg.stateDir);
+  }
+}
+
+/** `conductor recover [--dry-run]`：只做恢复巡检，不推进任何任务。run 启动时会自动做同一件事。 */
+async function cmdRecover(cfg, opts = {}) {
+  const dryRun = opts['dry-run'] === true;
+  if (dryRun) { printRecoveryReport(await recoverAll(cfg, { dryRun: true }), { dryRun: true }); return; }
+  const lock = acquireLock(cfg.stateDir);
+  if (!lock.acquired) {
+    console.error(`[conductor] 有 conductor run 正在运行（pid=${lock.info?.pid ?? '?'}）：活着的 runner 不需要恢复；要停它用 conductor stop。`);
+    process.exitCode = 1;
+    return;
+  }
+  try {
+    openRunSession(cfg, { mode: 'recover' });
+    printRecoveryReport(await recoverAll(cfg), { dryRun: false });
+    closeRunSession(cfg, 'recover_done');
+  } finally {
+    releaseLock(cfg.stateDir);
+  }
 }
 
 // ---- retry ----
@@ -809,7 +1151,7 @@ function applyRateLimitRetry(cfg, ts, { force = false } = {}) {
 }
 
 /** 新状态机的可恢复失败类型（限额另有 applyRateLimitRetry 走 resume_stage）。 */
-const ROUTER_RETRY_TYPES = new Set(['fuse_no_progress', 'budget_exhausted', 'abandoned']);
+const ROUTER_RETRY_TYPES = new Set(['fuse_no_progress', 'budget_exhausted', 'round_cap', 'abandoned']);
 
 /**
  * 新状态机的 retry：回 ROUTING，不归档任何轮次产物（案卷是 router 的记忆，动了它等于失忆），
@@ -823,6 +1165,7 @@ function applyRouterRetry(cfg, ts) {
     failures: [],
     last_action_rejected: null,
     fuse_reset_round: resetRound,
+    progress: null, // 停滞保险丝也从零重新数
   });
   state.transitionState(
     ts, cfg, 'ROUTING',
@@ -835,6 +1178,12 @@ function applyRouterRetry(cfg, ts) {
     console.error(
       `警告：spent_usd=$${ts.runtime.spent_usd} 仍 >= budgetUsd=$${cfg.budgetUsd}，`
       + '下次 run 会再次进 FAILED_BOX。请上调 conductor.config.json 的 budgetUsd。',
+    );
+  }
+  if (Number.isInteger(cfg.maxRoundsPerTask) && (ts.runtime.current_round ?? 0) >= cfg.maxRoundsPerTask) {
+    console.error(
+      `警告：current_round=${ts.runtime.current_round} 仍 >= maxRoundsPerTask=${cfg.maxRoundsPerTask}，`
+      + '下次 run 会再次进 FAILED_BOX。请上调 conductor.config.json 的 maxRoundsPerTask。',
     );
   }
 }
@@ -903,8 +1252,14 @@ function parseArgs(argv) {
 }
 
 const USAGE = `用法：conductor <command>
-  run                                  drain 一轮：推进所有任务直到无状态变化
-                                       （启动先探一次 models 可用性；探不通就地终止，任务零变化）
+  run [--continuous | --watch]         推进所有任务。默认跑一个调度批次；--continuous 批次接批次跑到没有
+                                       可执行的工作为止；--watch 空闲时也不退出，轮询新工作接着跑。
+                                       启动先探 models 可用性（探不通就地终止，任务零变化），再恢复上一个
+                                       runner 没收尾的事（残留 agent / 未关账的 dispatch / 未归档的 merge）。
+                                       runBudgetUsd 与各任务预算跨批次、跨重启累计，新批次不是新授权
+  stop [--now]                         请求正在运行的 runner 停下：不再派新活（--now 连在飞的 agent 一起收割，
+                                       已落盘的工作保留）；之后 run 从原处继续
+  recover [--dry-run]                  只做恢复巡检，不推进任务（run 启动时自动执行同一件事）
   new --title "…" --brief <file> [--repo <path>] [--base-branch <b>]
                                        新建任务（stage=ROUTING，由 router 逐轮决定下一步）；
                                        目标仓必须已配好 setup-profile.json 的 precommit 段
@@ -914,11 +1269,17 @@ const USAGE = `用法：conductor <command>
   reject <id> --notes "…"              spec / merge 闸打回 → ROUTING，notes 进「已裁决事项」
   resume <id> [--notes "…"]            help 闸恢复 → ROUTING（notes 只进记录，不豁免版本规则）
   abandon <id>                         放弃任务 → FAILED_BOX(abandoned)，清 worktree 与任务分支
-  retry <id> [--force]                 FAILED_BOX(rate_limited|fuse_no_progress|budget_exhausted|abandoned)
+  retry <id> [--force]                 FAILED_BOX(rate_limited|fuse_no_progress|budget_exhausted|round_cap|abandoned)
                                        → ROUTING（案卷不动，保险丝连击复位）；限额收箱的任务必须等到
                                        重置时刻之后（--force 可越过，会再次撞限额）
   retry --rate-limited [--force]       批量恢复 failed 箱里全部限额收箱的任务
-  status                               打印任务表（queue / failed / done）
+  pause <id> [--notes "…"]             暂停单个任务（从下一步起不派工；不改状态、不花钱）
+  unpause <id>                         取消暂停
+  digest <id> [--force]                为当前适用版本的 spec 补齐摘要（--force：归档旧摘要、清零重试）
+  show <id> [--json]                   任务现状：阶段与停止原因、目标与计划、活动 agent、委派台账、
+                                       spec / 摘要版本、验收门、花费与剩余额度、怎么继续
+  status                               打印任务表（queue / failed / done；PHASE 列区分运行中 / 等待结果 /
+                                       可恢复中断 / 等待资源 / 等待人 / 已终止）
   spy                                  只读查看 queue 任务的运行中角色与最近活动
 
 P3 之前建的遗留任务只保留可读性（dashboard / dossier-stats 照常渲染），任何动词都会拒绝操作它们。`;
@@ -939,7 +1300,13 @@ export async function main(argv = process.argv.slice(2)) {
   const cfg = loadCfg();
   ensureDirs(cfg);
   switch (cmd) {
-    case 'run': await cmdRun(cfg); break;
+    case 'run': await cmdRun(cfg, opts); break;
+    case 'stop': cmdStop(cfg, opts); break;
+    case 'recover': await cmdRecover(cfg, opts); break;
+    case 'show': cmdShow(cfg, opts._[0], opts); break;
+    case 'pause': cmdPause(cfg, opts._[0], opts, true); break;
+    case 'unpause': cmdPause(cfg, opts._[0], opts, false); break;
+    case 'digest': await cmdDigest(cfg, opts._[0], opts); break;
     case 'new': cmdNew(cfg, opts); break;
     case 'approve': await cmdApprove(cfg, opts._[0], opts); break;
     case 'reject': await cmdReject(cfg, opts._[0], opts.notes); break;

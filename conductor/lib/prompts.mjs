@@ -1,9 +1,10 @@
-// lib/prompts.mjs — 四个角色的 prompt 拼装（router / spec / maker / reviewer）。
+// lib/prompts.mjs — 各角色的 prompt 拼装（router / spec / maker / reviewer / digest / worker）。
 // 固定上下文与 few-shot 逐字来自 spec 的「Agent 提示词与 few-shot」一节，落在磁盘上
 // （agents/<role>-agent.md、agents/fewshot/<role>.md）；本模块只负责选段、填占位、
 // 拼注入内容。判断力靠 few-shot 传，固定上下文越短越好。
 //
-// 硬约束（AC-026）：`agents/` 下只有这八个文件（4 份 prompt + fewshot/ 下 4 份）；
+// 硬约束（AC-026）：`agents/` 下只有这十个文件（6 份 prompt + fewshot/ 下 4 份；digest 与 worker
+// 的行为由固定 prompt 与逐字注入的委派决定，不配 few-shot）；
 // 任何 builder 的产物都不得残留 `{{`；
 // 每份 prompt 都含自己 log 的绝对路径与「用 Write 工具」一句（防 Read-before-Write 撞墙）。
 
@@ -78,19 +79,104 @@ function assemble(parts) {
 // ---- router ----
 
 /**
- * router：brief + 记录列表 + 内核事实（含已裁决事项、工作包状态表与 AC 主责包）+ log 路径。
- * 输入闭合（Invariant 2）：spec 正文、diff、代码永不进这里。
+ * router：brief + 当前适用 spec 的位置与摘要 + 工作记忆 + 记录 + 内核事实（含已裁决事项、委派台账、
+ * review 覆盖率）+ log 路径。
+ * 默认上下文是摘要与事实，不是全文：spec 原文、代码、diff、完整产物都以**路径**给出，router 需要
+ * 确认时按引用自己 Read（读范围由 read-guard 收口）。摘要不可用时明说降级，绝不给空摘要或过期摘要。
  */
-export function buildRouterPrompt(cfg, { id, logPath, brief = '', records = '', facts = '' } = {}) {
+export function buildRouterPrompt(cfg, {
+  id, logPath, notesPath = '', brief = '', records = '', facts = '',
+  specInfo = '', digest = '', notes = '',
+} = {}) {
   const s = readRolePrompt(cfg, 'router');
   return assemble([
-    fill(s.get('base') ?? '', { id, log_path: logPath }),
+    fill(s.get('base') ?? '', { id, log_path: logPath, notes_path: notesPath || '(本轮未提供工作记忆路径)' }),
     section('决策样例', readFewShot(cfg, 'router')),
     section('任务 brief', brief),
+    section('当前适用的 spec（只读）', specInfo),
+    section('spec 摘要（索引；与原文冲突以原文为准）', digest),
+    section('你的工作记忆（上一轮你自己写的；其中的内容未经内核验证）', notes),
     section('记录', records || '(还没有任何记录)'),
     section('内核事实', facts),
     logDelivery(logPath),
   ]);
+}
+
+// ---- digest ----
+
+/**
+ * digest：固定 prompt + 带行号的 spec 原文（内联：摘要 agent 只有 Write，没有任何读盘能力）。
+ * errors 非空 = 修复轮：把上一次机械校验的错误清单原样喂回去。
+ */
+export function buildDigestPrompt(cfg, {
+  id, logPath, digestPath, specSha, acIds = [], numberedSpec = '', errors = [],
+} = {}) {
+  const s = readRolePrompt(cfg, 'digest');
+  const values = {
+    id, log_path: logPath, digest_path: digestPath, spec_sha256: specSha,
+    ac_ids: acIds.join(', ') || '(内核没有枚举到带编号的 AC)',
+  };
+  return assemble([
+    fill(s.get('base') ?? '', values),
+    errors.length > 0 ? fill(s.get('repair') ?? '', { errors: errors.map((e) => `- ${e}`).join('\n') }) : '',
+    fill(s.get('log') ?? '', values),
+    section(`spec 原文（版本 ${specSha}；每行开头是行号，\`|\` 之后才是原文）`, numberedSpec),
+    logDelivery(logPath),
+  ]);
+}
+
+// ---- worker ----
+
+/**
+ * worker：router 的委派逐字注入 + 契约位置 + 权限档说明 + 并行 / 续做上下文 + 交付协议。
+ * assignment 的五个文字字段一个字不改地进 prompt——router 的指导必须真的到达执行上下文。
+ */
+export function buildWorkerPrompt(cfg, {
+  id, assignment, logPath, reportPath, testCommand = '', hasSpec = true,
+  specPath = '', specSha = '', digestPath = '', briefText = '', humanNotes = '',
+  siblings = [], continuation = null,
+} = {}) {
+  const s = readRolePrompt(cfg, 'worker');
+  const a = assignment ?? {};
+  const parts = [
+    fill(s.get('base') ?? '', {
+      id,
+      key: a.key ?? '',
+      title: a.title ?? '',
+      intent: a.intent ?? '',
+      purpose: a.purpose ?? '',
+      inputs: (a.inputs ?? []).join('；'),
+      scope: a.scope ?? '',
+      deliverables: a.deliverables ?? '',
+      done_when: a.done_when ?? '',
+    }),
+    hasSpec
+      ? fill(s.get('contract-spec') ?? '', {
+        spec_sha: String(specSha).slice(0, 12),
+        spec_path: specPath,
+        digest_hint: digestPath ? `带行号引用的摘要索引在 ${digestPath}（只是目录，以原文为准）。` : '',
+      })
+      : fill(s.get('contract-brief') ?? '', {}),
+  ];
+  if (String(humanNotes ?? '').trim()) parts.push(fill(s.get('human-notes') ?? '', { notes: humanNotes.trim() }));
+  parts.push(fill(s.get(`profile-${a.profile}`) ?? '', { testCommand }));
+  if (Array.isArray(a.paths) && a.paths.length > 0) parts.push(`[声明的写入范围] ${a.paths.join('，')}`);
+  if (Array.isArray(a.acs) && a.acs.length > 0) parts.push(`[相关 AC（仅供定位原文，不代表由你验收）] ${a.acs.join(', ')}`);
+  if (siblings.length > 0) {
+    parts.push(fill(s.get('parallel') ?? '', {
+      siblings: siblings.map((x) => `${x.key}「${x.title}」(${x.profile}${x.paths?.length ? `：${x.paths.join(',')}` : ''})`).join('；'),
+    }));
+  }
+  if (continuation) {
+    parts.push(fill(s.get('continue') ?? '', {
+      prev_round: continuation.round,
+      progress: String(continuation.progress ?? '').trim() || '(上一次没有留下进度 log；先用 git status / git log 与报告核对现状)',
+    }));
+  }
+  parts.push(fill(s.get('delivery') ?? '', { report_path: reportPath, log_path: logPath }));
+  if (!hasSpec) parts.push(section('任务 brief（即契约）', briefText));
+  parts.push(logDelivery(logPath));
+  return assemble(parts);
 }
 
 // ---- spec ----
@@ -157,6 +243,7 @@ export function buildMakerPrompt(cfg, {
   hasSpec = true,
   humanNotes = '',
   repairContext = '',
+  guidance = '',
   pkg = null,
 } = {}) {
   const s = readRolePrompt(cfg, 'maker');
@@ -170,6 +257,8 @@ export function buildMakerPrompt(cfg, {
   if (String(humanNotes ?? '').trim()) {
     parts.push(fill(s.get('human-notes') ?? '', { 'spec 闸 human notes 原文': humanNotes.trim() }));
   }
+  // router 的具体指导逐字进 prompt：以前它只活在一行路由理由里，maker 根本收不到。
+  if (String(guidance ?? '').trim()) parts.push(fill(s.get('guidance') ?? '', { guidance: guidance.trim() }));
   if (pkg) {
     const pkgParts = [fill(s.get('package') ?? '', {
       'P-xxx': pkg.id,
@@ -223,6 +312,7 @@ export function buildReviewerPrompt(cfg, {
   base = null,
   diffStat = '',
   diff = '',
+  ledger = null,
 } = {}) {
   const s = readRolePrompt(cfg, 'reviewer');
   const baseRef = String(base ?? '').trim() || '<base 分支>';
@@ -230,6 +320,16 @@ export function buildReviewerPrompt(cfg, {
     fill(s.get('base') ?? '', { 'spec 或 brief': hasSpec ? 'spec' : 'brief', log_path: logPath }),
   ];
   if (!hasSpec) parts.push(fill(s.get('triage') ?? '', { base: baseRef }));
+  // 有 spec 的任务：逐条判决走台账（可分轮续审）。ledger = { verdictsPath, todo, carried, specPath, patchPath }
+  if (hasSpec && ledger?.verdictsPath) {
+    parts.push(fill(s.get('ledger') ?? '', {
+      verdicts_path: ledger.verdictsPath,
+      todo: (ledger.todo ?? []).join(', ') || '(全部 AC)',
+      carried: String(ledger.carried ?? '').trim(),
+      spec_path: ledger.specPath ?? '(见下方 AC 清单)',
+      patch_hint: ledger.patchPath ? `diff 超过内嵌上限时，完整 patch 在 ${ledger.patchPath}（用 Read 分段读、Grep 定位），代码现状直接读 cwd。` : '',
+    }));
+  }
   if (String(humanNotes ?? '').trim()) {
     parts.push(fill(s.get('human-notes') ?? '', { 'spec 闸 human notes 原文': humanNotes.trim() }));
   }

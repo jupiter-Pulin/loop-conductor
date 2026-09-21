@@ -64,7 +64,7 @@ export function makeEnv(t, {
   config = {},
   // 缺省把「默认模型 + 本测试配置里出现的每个模型 id」都预填成可用：否则 run 启动的探测会
   // 多消费一个剧本步骤，把整条剧本错位。要测探测本身的测试显式传 seedModels 指定预填集合。
-  seedModels = ['claude-opus-5', ...Object.values(config.models ?? {}).filter((m) => typeof m === 'string' && m.trim() !== '')],
+  seedModels = ['claude-opus-5', 'claude-haiku-4-5-20251001', ...Object.values(config.models ?? {}).filter((m) => typeof m === 'string' && m.trim() !== '')],
 } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'conductor-it-'));
   for (const d of ['state/queue', 'state/done', 'state/failed', 'specs', 'dossier', 'worktrees', 'agents', 'target-profiles']) {
@@ -79,6 +79,9 @@ export function makeEnv(t, {
     testCommand: 'node --test',
     targetRepo: './target',
     baseBranch: 'main',
+    // 摘要默认关：绝大多数用例盯的是别的行为，多一次 digest spawn 会把它们的剧本整体错位。
+    // 摘要自己的用例（digest-*.test.mjs、dispatch 全流程）显式打开。生产默认是开的。
+    digestEnabled: false,
     ...config,
   };
   fs.writeFileSync(
@@ -88,6 +91,7 @@ export function makeEnv(t, {
   initTargetRepo(path.join(root, 'target'));
 
   const scenarioPath = path.join(root, 'fake-claude.scenario.json');
+  const keyedPath = path.join(root, 'fake-claude.keyed.json');
   const logPath = path.join(root, 'fake-claude.log');
 
   const queueDir = path.join(root, 'state', 'queue');
@@ -115,6 +119,19 @@ export function makeEnv(t, {
     },
 
     /**
+     * keyed 剧本：{ '<log 基名>': [step…] }。并行 worker 的调用先后不确定，按 log 基名
+     * （如 `worker-api`）各走各的队列；没有对应 key 的调用仍按调用序消费 setScenario 的剧本。
+     * merge=true 时并入既有表（同名 key 的队列在尾部追加，计数器不动）。
+     */
+    setKeyed(map, { merge = false } = {}) {
+      let cur = {};
+      if (merge && fs.existsSync(keyedPath)) cur = JSON.parse(fs.readFileSync(keyedPath, 'utf8'));
+      else for (const n of fs.readdirSync(root)) if (n.startsWith('fake-claude.keyed.json.')) fs.rmSync(path.join(root, n), { force: true });
+      for (const [k, steps] of Object.entries(map)) cur[k] = [...(cur[k] ?? []), ...steps];
+      fs.writeFileSync(keyedPath, JSON.stringify(cur, null, 2));
+    },
+
+    /**
      * 往剧本尾部追加步骤（不动调用计数）。多轮驱动的测试用它，别用 setScenario(..., {reset:false})：
      * 后者会把已消费的前缀一起覆盖掉，导致下一次调用落在数组外、fake-claude exit 2。
      */
@@ -128,6 +145,21 @@ export function makeEnv(t, {
       return api.runWithEnv({}, ...args);
     },
 
+    /** 子进程环境（给需要自己 spawn conductor 的用例：崩溃恢复要对 runner 发 SIGKILL）。 */
+    childEnv(overrides = {}) {
+      const env = {
+        ...process.env,
+        CONDUCTOR_ROOT: root,
+        CLAUDE_BIN: FAKE_CLAUDE,
+        FAKE_CLAUDE_SCRIPT: scenarioPath,
+        FAKE_CLAUDE_KEYED: keyedPath,
+        FAKE_CLAUDE_LOG: logPath,
+        ...overrides,
+      };
+      delete env.NODE_TEST_CONTEXT;
+      return env;
+    },
+
     /** 同 run，但可覆盖子进程环境变量（如 CLAUDE_BIN 指向坏二进制，模拟 spawn 层故障）。 */
     runWithEnv(overrides, ...args) {
       const env = {
@@ -135,6 +167,7 @@ export function makeEnv(t, {
         CONDUCTOR_ROOT: root,
         CLAUDE_BIN: FAKE_CLAUDE,
         FAKE_CLAUDE_SCRIPT: scenarioPath,
+        FAKE_CLAUDE_KEYED: keyedPath,
         FAKE_CLAUDE_LOG: logPath,
         ...overrides,
       };

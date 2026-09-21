@@ -11,9 +11,13 @@ import { writeNewTask } from '../../conductor/lib/state.mjs';
 import {
   LANE_ORDER, laneForStage, isValidTaskId,
   COLUMN_ORDER, columnForStage, isRouterTask, extractPendingQuestions, readEvents,
-  buildBoard, buildTaskDetail, parseTimeline,
+  buildBoard, buildTaskDetail, buildTaskDigest, parseTimeline,
+  PHASE_LABELS, phaseLabel,
   SYNC_ACTIONS, buildSyncActionArgv, formatCliMessage, parseNewTaskId, buildNewTaskArgv,
 } from '../../conductor/dashboard/model.mjs';
+import { validateDigest } from '../../conductor/lib/digest-contract.mjs';
+import { sha256Of, shortSha } from '../../conductor/lib/spec-version.mjs';
+import { enumerateAcceptanceCriteria } from '../../conductor/lib/state.mjs';
 // parseArgs / view.mjs 用动态 import（每条测试内按需加载），避免这两个本期新增的
 // export/文件在改动前基线上不存在时，令整个测试文件顶层加载失败、殃及无关的既有用例。
 
@@ -27,6 +31,7 @@ function mkroot(prefix = 'dashboard-model-test-') {
 function baseCfg(root) {
   return {
     root,
+    stateDir: path.join(root, 'state'),
     queueDir: path.join(root, 'state', 'queue'),
     doneDir: path.join(root, 'state', 'done'),
     failedDir: path.join(root, 'state', 'failed'),
@@ -36,6 +41,9 @@ function baseCfg(root) {
     targetRepo: path.join(root, 'target'),
     baseBranch: 'main',
     testCommand: 'node --test',
+    budgetUsd: 5,
+    maxRoundsPerTask: 40,
+    models: { digest: 'claude-haiku-4-5-20251001' },
   };
 }
 
@@ -183,11 +191,13 @@ test('buildBoard：needsHuman 仅人审 stage 为 true，working 仅非人审推
   assert.equal(board.failed[0].needsHuman, false);
   assert.equal(board.failed[0].working, false);
 
-  // 契约字段齐全（AC-005 + 新状态机的列/闸别/遗留标记）
+  // 契约字段齐全（AC-005 + 新状态机的列/闸别/遗留标记 + 阶段）
   assert.deepEqual(
     Object.keys(spec).sort(),
-    ['awaitingKind', 'box', 'column', 'id', 'kind', 'lane', 'lastFailureType', 'legacy', 'needsHuman', 'rateLimit', 'spentUsd', 'stage', 'title', 'working'].sort(),
+    ['awaitingKind', 'box', 'column', 'id', 'kind', 'lane', 'lastFailureType', 'legacy', 'needsHuman', 'phase', 'rateLimit', 'spentUsd', 'stage', 'title', 'working'].sort(),
   );
+  // 遗留任务没有阶段口径：卡片不出这一行，而不是编一个「运行中」。
+  assert.equal(spec.phase, null);
 });
 
 // ---- 详情抽屉误显示 working 回归守卫：GET /api/task/<id> 载荷与看板同口径 ----
@@ -395,8 +405,9 @@ test('isValidTaskId：仅接受 task-YYYYMMDD-NNN，拒绝路径穿越等非法�
 // ---- CLI 结果 → 用户提示转换（AC-013/AC-017 纯函数支撑） ----
 
 test('SYNC_ACTIONS：同步动作与 CLI 子命令名逐字一致，retry 已 job 化不再属同步动作集合（P4-AC-014④）', () => {
-  // 新状态机的人闸动词就这四个，一个不多一个不少；旧动词随旧状态机一起删了。
-  assert.deepEqual(SYNC_ACTIONS, ['approve', 'reject', 'resume', 'abandon']);
+  // 新状态机的人闸动词就这三个 + abandon 人工收箱，一个不多一个不少；旧动词随旧状态机一起删了。
+  // pause / unpause 是瞬时 CLI 动词（只写 PAUSED 标记），同样走同步路径。
+  assert.deepEqual(SYNC_ACTIONS, ['approve', 'reject', 'resume', 'abandon', 'pause', 'unpause']);
   assert.equal(SYNC_ACTIONS.includes('retry'), false);
   for (const gone of ['approve-setup', 'approve-feasibility', 'reject-feasibility', 'approve-scope', 'reject-scope', 'merge', 'close']) {
     assert.equal(SYNC_ACTIONS.includes(gone), false, `${gone} 应已删除`);
@@ -1504,6 +1515,456 @@ test('readEvents：events.jsonl 缺失返回空数组，不抛错', (t) => {
   const cfg = baseCfg(root);
   ensureDirs(cfg);
   assert.deepEqual(readEvents(cfg, 'task-20260910-999'), []);
+});
+
+// ---- 并行纪元：任务视图（阶段 / 委派 / 验收门 / 预算）进看板与详情 ----
+//
+// 口径只有一处：lib/task-view.mjs::buildTaskView。这里钉住三件事——
+// ①dashboard 只做「中文 label → 英文 label」这一步映射，reason/next 原样透传；
+// ②遗留任务与坏目录恒 view:null，不抛错、不编一个假阶段；
+// ③ROUTING 一列里的不同处境（等结果 / 可恢复中断 / 等人 / 已终止）在卡片上是不同的阶段。
+
+function writeRunnerLock(cfg, { pid = process.pid } = {}) {
+  const dir = path.join(cfg.stateDir, '.lock');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'info.json'), JSON.stringify({ pid, started_at: '2026-09-20T00:00:00.000Z' }));
+}
+
+test('phaseLabel / PHASE_LABELS：七个 phase.code 各有英文标签，未知 code 原样回显', () => {
+  assert.deepEqual(
+    Object.keys(PHASE_LABELS).sort(),
+    ['interrupted_recoverable', 'ready', 'running', 'terminated', 'waiting_human', 'waiting_resource', 'waiting_result'],
+  );
+  for (const [code, label] of Object.entries(PHASE_LABELS)) {
+    assert.equal(phaseLabel(code), label);
+    assert.match(label, /^[\x20-\x7E]+$/, `${code} 的标签必须是英文界面文案`);
+  }
+  assert.equal(phaseLabel('some_future_code'), 'some_future_code', '内核新增阶段不该被吞成别的阶段');
+  assert.equal(phaseLabel(undefined), 'Unknown');
+});
+
+test('buildBoard：新纪元卡片带 phase{code,label}，遗留任务恒 null；ROUTING 一列里不同处境不是同一个阶段', (t) => {
+  const root = mkroot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cfg = baseCfg(root);
+  ensureDirs(cfg);
+
+  // ①可以推进但没人在跑
+  writeNewTask(cfg.queueDir, routerTask('task-20260920-001'), routerRuntime('ROUTING'));
+  writeDossier(cfg, 'task-20260920-001', { 'router-r1.json': { role: 'router', round: 1, cost_usd: 0.02 } });
+
+  // ②上一个 runner 退出时还有 worker 没收尾（记录有 started 没 done）→ 可恢复中断
+  writeNewTask(cfg.queueDir, routerTask('task-20260920-002'), routerRuntime('ROUTING'));
+  writeDossier(cfg, 'task-20260920-002', {
+    'router-r1.json': { role: 'router', round: 1, cost_usd: 0.02 },
+    'worker-api-layer-r2.json': { role: 'worker', round: 2, key: 'api-layer', started: '2026-09-20T01:00:00.000Z' },
+  });
+
+  // ③人闸上等人
+  writeNewTask(cfg.queueDir, routerTask('task-20260920-003'), routerRuntime('AWAIT_HUMAN', { awaiting: { kind: 'spec', round: 1 } }));
+  writeDossier(cfg, 'task-20260920-003', { 'router-r1.json': { role: 'router', round: 1, cost_usd: 0.02 } });
+
+  // ④轮次上限收箱 → 已终止；⑤限额收箱 → 等资源
+  writeNewTask(cfg.failedDir, routerTask('task-20260920-004'), routerRuntime('FAILED_BOX', { last_failure_type: 'round_cap' }));
+  writeDossier(cfg, 'task-20260920-004', { 'router-r1.json': { role: 'router', round: 1, cost_usd: 0.02 } });
+  writeNewTask(cfg.failedDir, routerTask('task-20260920-005'), routerRuntime('FAILED_BOX', {
+    last_failure_type: 'rate_limited', rate_limit: { type: 'five_hour', resets_at: 1_800_000_000 },
+  }));
+  writeDossier(cfg, 'task-20260920-005', { 'router-r1.json': { role: 'router', round: 1, cost_usd: 0.02 } });
+
+  // ⑥遗留任务：没有这个口径
+  writeNewTask(cfg.queueDir, baseTask('task-20260705-050'), baseRuntime('READY'));
+
+  const board = buildBoard(cfg);
+  const all = [...board.columns.flatMap((c) => c.tasks), ...board.legacy];
+  const phaseOf = (id) => all.find((e) => e.id === id).phase;
+
+  assert.deepEqual(phaseOf('task-20260920-001'), { code: 'ready', label: 'Ready to run' });
+  assert.deepEqual(phaseOf('task-20260920-002'), { code: 'interrupted_recoverable', label: 'Recoverable interruption' });
+  assert.deepEqual(phaseOf('task-20260920-003'), { code: 'waiting_human', label: 'Waiting for you' });
+  assert.deepEqual(phaseOf('task-20260920-004'), { code: 'terminated', label: 'Terminated' });
+  assert.deepEqual(phaseOf('task-20260920-005'), { code: 'waiting_resource', label: 'Waiting for a resource' });
+  assert.equal(phaseOf('task-20260705-050'), null, '遗留任务没有阶段口径');
+});
+
+test('buildBoard / buildTaskDetail：runner 在跑且执行者在飞 → waiting_result（不是一个长期不变的 working）', (t) => {
+  const root = mkroot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cfg = baseCfg(root);
+  ensureDirs(cfg);
+  const id = 'task-20260920-010';
+  writeNewTask(cfg.queueDir, routerTask(id), routerRuntime('ROUTING', { current_round: 2 }));
+  writeDossier(cfg, id, {
+    'router-r1.json': { role: 'router', round: 1, cost_usd: 0.02 },
+    // 本测试进程自己的 pid：一定活着，判据因此确定
+    'worker-api-layer-r2.json': {
+      role: 'worker', round: 2, key: 'api-layer', title: '实现 API 层', profile: 'write',
+      started: '2026-09-20T01:00:00.000Z', pid: process.pid,
+    },
+  });
+  writeRunnerLock(cfg);
+
+  const entry = buildBoard(cfg).columns.find((c) => c.column === 'ROUTING').tasks[0];
+  assert.deepEqual(entry.phase, { code: 'waiting_result', label: 'Waiting for results' });
+
+  const detail = buildTaskDetail(cfg, id);
+  assert.deepEqual(detail.phase, { code: 'waiting_result', label: 'Waiting for results' });
+  assert.equal(detail.view.phase.code, 'waiting_result');
+  assert.equal(detail.view.active.length, 1);
+  assert.equal(detail.view.active[0].key, 'api-layer');
+  assert.equal(detail.view.active[0].profile, 'write');
+});
+
+test('buildTaskDetail：新纪元任务带完整 view（阶段/目标/委派/验收门/预算）；遗留任务 view 恒 null', (t) => {
+  const root = mkroot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cfg = baseCfg(root);
+  ensureDirs(cfg);
+  const id = 'task-20260920-020';
+  writeNewTask(cfg.queueDir, routerTask(id), routerRuntime('ROUTING', { current_round: 3, spent_usd: 2.5 }));
+  writeDossier(cfg, id, {
+    'router-r1.json': { role: 'router', round: 1, cost_usd: 0.02 },
+    'router-r1.log.json': { role: 'router', outcome: 'ok', action: 'maker', summary: '直接实现' },
+    'router-notes.json': {
+      objective: '让 median 在偶数长度上正确',
+      plan: [{ key: 'api-layer', title: '改实现', status: 'doing' }],
+      questions: [{ text: '要不要同时改 mode？', status: 'open' }],
+      changelog: [{ round: 3, why: 'reviewer 指出 AC-002 没覆盖，先补测试' }],
+    },
+    'dispatch-r2.json': {
+      schema_version: 1, round: 2, base_head: 'a'.repeat(40), spec_sha: null,
+      created_at: '2026-09-20T01:00:00.000Z', closed: true, closed_at: '2026-09-20T02:00:00.000Z', recovered: false,
+      assignments: [
+        {
+          key: 'api-layer', title: '实现 API 层', profile: 'write', intent: 'implement', state: 'integrated',
+          spawns: [{ round: 2, outcome: 'ok', truncated: false, interrupted: false, session_id: 's-1' }],
+          conflict_files: [], integrated_sha: 'b'.repeat(40), note: null,
+        },
+        {
+          key: 'docs', title: '更新文档', profile: 'write', intent: 'document', state: 'conflict',
+          spawns: [{ round: 2, outcome: 'partial', truncated: true, interrupted: false, session_id: 's-2' }],
+          conflict_files: ['README.md'], note: '与 api-layer 撞同一段',
+        },
+      ],
+    },
+  });
+
+  const detail = buildTaskDetail(cfg, id);
+  assert.equal(detail.viewError, null);
+  assert.ok(detail.view, 'router 纪元任务必须带 view');
+  assert.equal(detail.view.id, id);
+  assert.equal(detail.view.phase.code, 'ready');
+  assert.ok(detail.view.phase.next, 'stopped 的阶段必须说清怎么继续');
+  assert.equal(detail.view.objective, '让 median 在偶数长度上正确');
+  assert.equal(detail.view.last_plan_change.round, 3);
+  assert.deepEqual(detail.view.open_questions.map((q) => q.status), ['open']);
+
+  const byKey = Object.fromEntries(detail.view.assignments.map((a) => [a.key, a]));
+  assert.deepEqual(Object.keys(byKey).sort(), ['api-layer', 'docs']);
+  assert.equal(byKey['api-layer'].state, 'integrated');
+  assert.equal(byKey['api-layer'].outcome, 'ok');
+  assert.equal(byKey.docs.truncated, true);
+  assert.equal(byKey.docs.resumable_round, 2, 'truncated + session_id → 可续接');
+  assert.deepEqual(byKey.docs.conflict_files, ['README.md']);
+
+  assert.equal(detail.view.review.need_review, true, '没有任务分支时版本规则恒 need_review');
+  assert.equal(detail.view.budget.spent_usd, 2.5);
+  assert.equal(detail.view.budget.budget_usd, 5);
+  assert.equal(detail.view.budget.remaining_usd, 2.5);
+  assert.equal(detail.view.budget.rounds_used, 3);
+  assert.equal(detail.view.budget.max_rounds, 40);
+  assert.equal(detail.paused, false);
+
+  // 遗留任务：不合成 view，也不报错
+  const legacyId = 'task-20260705-051';
+  writeNewTask(cfg.doneDir, baseTask(legacyId), baseRuntime('DONE'));
+  writeDossier(cfg, legacyId, { 'maker-r1.json': { role: 'maker', round: 1, ok: true, cost_usd: 1 } });
+  const legacy = buildTaskDetail(cfg, legacyId);
+  assert.equal(legacy.isRouterTask, false);
+  assert.equal(legacy.view, null);
+  assert.equal(legacy.viewError, null);
+  assert.equal(legacy.phase, null);
+});
+
+test('buildTaskDetail：PAUSED 标记 → paused:true 且阶段是「等人」；坏任务目录 view 为 null 且不抛错', (t) => {
+  const root = mkroot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cfg = baseCfg(root);
+  ensureDirs(cfg);
+  const id = 'task-20260920-030';
+  const dir = writeNewTask(cfg.queueDir, routerTask(id), routerRuntime('ROUTING'));
+  writeDossier(cfg, id, { 'router-r1.json': { role: 'router', round: 1, cost_usd: 0.02 } });
+  fs.writeFileSync(path.join(dir, 'PAUSED'), JSON.stringify({ paused_at: '2026-09-20T03:00:00.000Z', notes: null }));
+
+  const detail = buildTaskDetail(cfg, id);
+  assert.equal(detail.paused, true);
+  assert.equal(detail.phase.code, 'waiting_human');
+  assert.match(detail.view.phase.next, /unpause/, '暂停中的任务要说清怎么继续');
+
+  // 坏目录：详情仍要开得出来
+  const brokenId = 'task-20260920-031';
+  const brokenDir = path.join(cfg.queueDir, brokenId);
+  fs.mkdirSync(brokenDir, { recursive: true });
+  fs.writeFileSync(path.join(brokenDir, 'task.json'), '{ 不是 JSON');
+  fs.writeFileSync(path.join(brokenDir, 'runtime.json'), '{}');
+  const broken = buildTaskDetail(cfg, brokenId);
+  assert.equal(broken.review.kind, 'broken');
+  assert.equal(broken.view, null);
+  assert.equal(broken.phase, null);
+  assert.equal(broken.paused, false);
+});
+
+// ---- spec 摘要：只读端点的载荷 ----
+
+const DIGEST_SPEC_LINES = [
+  '# median 偶数分支返回错误',
+  '',
+  '## 目标',
+  '',
+  'median 对偶数长度的输入返回中间两数的平均值。',
+  '',
+  '## 硬约束',
+  '',
+  '- 不得改动 mode 的现有行为。',
+  '',
+  '## 验收标准',
+  '',
+  '- AC-001: median 偶数长度取中间两数平均',
+  '- AC-002: median 对空数组抛出明确错误',
+  '',
+  '## 涉及模块',
+  '',
+  '- lib/stats.mjs：median 的实现在这个文件里。',
+  '',
+  '## 待决问题',
+  '',
+  '- 是否同时修正 mode 的偶数分支？safe default：不改。',
+  '',
+];
+const DIGEST_SPEC_MD = DIGEST_SPEC_LINES.join('\n');
+
+/** 一份**真的能过机械校验**的摘要：行号现算，quote 逐字取自原文（校验在测试里当场复核）。 */
+function digestFixture(specMd) {
+  const lines = specMd.split('\n');
+  const lineOf = (needle) => {
+    const idx = lines.findIndex((l) => l.includes(needle));
+    assert.notEqual(idx, -1, `夹具原文里找不到 ${needle}`);
+    return idx + 1;
+  };
+  const ref = (needle) => ({ lines: [lineOf(needle), lineOf(needle)], quote: needle });
+  return {
+    schema: 'spec-digest/v1',
+    source_sha256: sha256Of(specMd),
+    goal: [{ text: '偶数长度返回中间两数平均', refs: [ref('返回中间两数的平均值')] }],
+    constraints: [{ text: '不改 mode', kind: 'must_not', refs: [ref('不得改动 mode 的现有行为')] }],
+    acs: [
+      { id: 'AC-001', gist: '偶数长度取中间两数平均', group: null, refs: [ref('AC-001')] },
+      { id: 'AC-002', gist: '空数组抛出明确错误', group: null, refs: [ref('AC-002')] },
+    ],
+    modules: [{ name: 'lib/stats.mjs', text: 'median 的实现在这里', refs: [ref('median 的实现在这个文件里')] }],
+    open_questions: [{
+      text: '是否同时修正 mode', safe_default: '不改', status: 'unresolved',
+      refs: [ref('是否同时修正 mode 的偶数分支')],
+    }],
+    proposed_packages: [{
+      id: 'P-001', title: '修 median', acs: ['AC-001', 'AC-002'], depends_on: [], status: 'proposal',
+      refs: [ref('AC-001')],
+    }],
+  };
+}
+
+function writeDigestTask(cfg, id, { digest = null, meta = null, snapshot = true, specMd = DIGEST_SPEC_MD } = {}) {
+  writeNewTask(cfg.queueDir, routerTask(id), routerRuntime('ROUTING'));
+  fs.writeFileSync(path.join(cfg.specsDir, `${id}.md`), specMd);
+  writeDossier(cfg, id, { 'router-r1.json': { role: 'router', round: 1, cost_usd: 0.02 } });
+  const sha = sha256Of(specMd);
+  const dir = path.join(cfg.dossierDir, id, 'digest');
+  fs.mkdirSync(dir, { recursive: true });
+  if (snapshot) fs.writeFileSync(path.join(dir, `${shortSha(sha)}.source.md`), specMd);
+  if (digest) fs.writeFileSync(path.join(dir, `${shortSha(sha)}.json`), JSON.stringify(digest, null, 2));
+  if (meta) fs.writeFileSync(path.join(dir, `${shortSha(sha)}.meta.json`), JSON.stringify(meta, null, 2));
+  return sha;
+}
+
+test('digestFixture：夹具本身能过内核的机械校验（否则这一组测试测的是假东西）', () => {
+  const acIds = enumerateAcceptanceCriteria(DIGEST_SPEC_MD).map((a) => a.ac_id);
+  assert.deepEqual(acIds, ['AC-001', 'AC-002']);
+  const check = validateDigest(digestFixture(DIGEST_SPEC_MD), {
+    specText: DIGEST_SPEC_MD, specSha: sha256Of(DIGEST_SPEC_MD), acIds,
+  });
+  assert.deepEqual(check.errors, []);
+  assert.equal(check.ok, true);
+});
+
+test('buildTaskDigest：合格摘要 → state=valid，带摘要本体、spec 版本、模型、尝试次数、成本与可回溯原文', (t) => {
+  const root = mkroot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cfg = baseCfg(root);
+  ensureDirs(cfg);
+  const id = 'task-20260920-100';
+  const sha = writeDigestTask(cfg, id, {
+    digest: digestFixture(DIGEST_SPEC_MD),
+    meta: { schema_version: 1, spec_sha256: sha256Of(DIGEST_SPEC_MD), attempts: [{ n: 1, valid: true }], valid: true, model: 'claude-haiku-4-5-20251001' },
+  });
+  // 摘要会话的成本从记录里来（与 lib/task-view.mjs 同一口径）
+  writeDossier(cfg, id, {
+    'digest-r1.json': { role: 'digest', round: 1, cost_usd: 0.012, done: '2026-09-20T00:05:00.000Z' },
+    'digest-r1.log.json': { role: 'digest', outcome: 'ok', summary: '摘要已写' },
+  });
+
+  const payload = buildTaskDigest(cfg, id);
+  assert.equal(payload.state, 'valid');
+  assert.equal(payload.spec.status, 'draft');
+  assert.equal(payload.spec.sha, sha);
+  assert.equal(payload.spec.short, shortSha(sha));
+  assert.equal(payload.spec.path, path.join('specs', `${id}.md`));
+  assert.equal(payload.model, 'claude-haiku-4-5-20251001');
+  assert.equal(payload.attempts, 1);
+  assert.equal(payload.maxAttempts, 3, '上限与 digestStateFor 判 exhausted 用的是同一个口径');
+  assert.equal(payload.costUsd, 0.012);
+  assert.deepEqual(payload.errors, []);
+  assert.equal(payload.digest.schema, 'spec-digest/v1');
+  assert.deepEqual(payload.digest.acs.map((a) => a.id), ['AC-001', 'AC-002']);
+  assert.deepEqual(payload.stats, { goal: 1, constraints: 1, acs: 2, modules: 1, open_questions: 1, proposed_packages: 1 });
+  // 引用能回到原文：快照在，且 sha 复核通过
+  assert.equal(payload.sourceFrom, 'snapshot');
+  assert.equal(payload.source, DIGEST_SPEC_MD);
+  assert.match(payload.path, /digest/);
+});
+
+test('buildTaskDigest：缺失 / 不合格 / 尝试用尽三种状态都带原因，且摘要本体恒 null（空摘要不得当成没事）', (t) => {
+  const root = mkroot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cfg = baseCfg(root);
+  ensureDirs(cfg);
+
+  // ①这一版还没有摘要
+  writeDigestTask(cfg, 'task-20260920-101', {});
+  const missing = buildTaskDigest(cfg, 'task-20260920-101');
+  assert.equal(missing.state, 'missing');
+  assert.equal(missing.digest, null);
+  assert.equal(missing.attempts, 0);
+
+  // ②摘要在盘上但对当前原文不合格（source_sha256 是别的版本）
+  const stale = digestFixture(DIGEST_SPEC_MD);
+  stale.source_sha256 = 'f'.repeat(64);
+  writeDigestTask(cfg, 'task-20260920-102', { digest: stale });
+  const invalid = buildTaskDigest(cfg, 'task-20260920-102');
+  assert.equal(invalid.state, 'invalid');
+  assert.equal(invalid.digest, null, '不合格的摘要绝不交给前端当有效摘要渲染');
+  assert.ok(invalid.errors.length > 0);
+  assert.match(invalid.errors.join('\n'), /source_sha256/);
+
+  // ③尝试次数用完仍没有摘要 → 显式降级
+  writeDigestTask(cfg, 'task-20260920-103', {
+    meta: { schema_version: 1, attempts: [{ n: 1 }, { n: 2 }, { n: 3 }], valid: false },
+  });
+  const exhausted = buildTaskDigest(cfg, 'task-20260920-103');
+  assert.equal(exhausted.state, 'exhausted');
+  assert.equal(exhausted.attempts, 3);
+  assert.equal(exhausted.digest, null);
+
+  // ④快照缺失时退回当前原文，并标明来源（引用行号可能已经对不上）
+  writeDigestTask(cfg, 'task-20260920-104', { digest: digestFixture(DIGEST_SPEC_MD), snapshot: false });
+  const noSnapshot = buildTaskDigest(cfg, 'task-20260920-104');
+  assert.equal(noSnapshot.state, 'valid');
+  assert.equal(noSnapshot.sourceFrom, 'current');
+  assert.equal(noSnapshot.source, DIGEST_SPEC_MD);
+});
+
+test('buildTaskDigest：没有 spec 的任务给 state=none（brief 即契约，无摘要可看）；任务不存在返回 null', (t) => {
+  const root = mkroot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cfg = baseCfg(root);
+  ensureDirs(cfg);
+  const id = 'task-20260920-110';
+  writeNewTask(cfg.queueDir, routerTask(id), routerRuntime('ROUTING'));
+  const payload = buildTaskDigest(cfg, id);
+  assert.equal(payload.state, 'none');
+  assert.equal(payload.spec, null);
+  assert.equal(payload.digest, null);
+  assert.equal(payload.source, null);
+  assert.equal(buildTaskDigest(cfg, 'task-20260920-999'), null, '任务不存在交给 server 出 404');
+});
+
+// ---- view.mjs：摘要引用回原文 + 状态说明（浏览器安全纯函数） ----
+
+test('refLabel / refSourceText：`L<a>-<b>` 标签与带行号的被引用行；越界夹紧、缺原文不抛错（摘要面板）', async () => {
+  const { refLabel, refSourceText } = await import('../../conductor/dashboard/static/view.mjs');
+  assert.equal(refLabel({ lines: [13, 13] }), 'L13');
+  assert.equal(refLabel({ lines: [13, 18] }), 'L13-18');
+  assert.equal(refLabel({}), 'L?');
+  assert.equal(refLabel(null), 'L?');
+
+  const source = 'a\nb\nc\nd\n';
+  assert.equal(refSourceText(source, { lines: [2, 3] }), '2| b\n3| c');
+  assert.equal(refSourceText(source, { lines: [1, 1] }), '1| a');
+  // 快照缺失退回当前原文时引用可能越界：夹到文档范围内，绝不抛错、绝不造行
+  assert.equal(refSourceText(source, { lines: [3, 99] }), '3| c\n4| d');
+  assert.equal(refSourceText('', { lines: [1, 2] }), '');
+  assert.equal(refSourceText(null, { lines: [1, 2] }), '');
+  assert.equal(refSourceText(source, null), '');
+  // 行号右对齐：两位数与一位数在同一段里列宽一致
+  const wide = Array.from({ length: 12 }, (_, i) => `line ${i + 1}`).join('\n');
+  assert.equal(refSourceText(wide, { lines: [9, 10] }), ' 9| line 9\n10| line 10');
+});
+
+test('digestStateInfo：五种状态各有 chip 与人话说明；valid 之外一律说清 router 实际在读什么', async () => {
+  const { digestStateInfo } = await import('../../conductor/dashboard/static/view.mjs');
+  assert.deepEqual(digestStateInfo('valid'), { className: 'chip-pass', label: 'valid', note: null });
+  for (const state of ['missing', 'invalid', 'exhausted', 'none']) {
+    const info = digestStateInfo(state);
+    assert.equal(info.label, state === 'none' ? 'no spec' : state);
+    assert.ok(info.note && info.note.length > 0, `${state} 必须有说明文案`);
+  }
+  assert.equal(digestStateInfo('exhausted').className, 'chip-fail');
+  assert.match(digestStateInfo('exhausted').note, /reads the spec source directly/);
+  assert.equal(digestStateInfo('whatever').label, 'whatever');
+});
+
+// ---- 前端接线静态守卫：进度面板在记录之前、摘要面板走同一条数据管线、pause 走 SYNC_ACTIONS ----
+
+test('app.mjs：抽屉与审查页都在记录之前挂进度面板，并渲染摘要面板', () => {
+  const src = fs.readFileSync(path.join(STATIC_DIR, 'app.mjs'), 'utf8');
+  for (const fn of ['renderDrawerPeek', 'renderTaskPage']) {
+    const start = src.indexOf(`function ${fn}(`);
+    assert.notEqual(start, -1, `${fn} 不存在`);
+    const body = src.slice(start, start + 4000);
+    const progressAt = body.indexOf('buildProgressPanelNode');
+    const recordsAt = body.indexOf('buildRecordsSectionNode');
+    assert.ok(progressAt > -1, `${fn} 未挂进度面板`);
+    assert.ok(recordsAt > -1, `${fn} 未挂记录列表`);
+    assert.ok(progressAt < recordsAt, `${fn} 的进度面板必须在记录之前`);
+    assert.ok(body.includes('buildDigestPanelNode'), `${fn} 未渲染摘要面板`);
+  }
+  // 摘要走独立只读端点，与 diff / stream-tail 同一套失效重取管线
+  assert.match(src, /\/digest`\)/);
+  assert.match(src, /lastDigest = /);
+});
+
+test('app.mjs：pause / unpause 按钮走同步动作端点，且只对 queue 里的新纪元任务出现', () => {
+  const src = fs.readFileSync(path.join(STATIC_DIR, 'app.mjs'), 'utf8');
+  const start = src.indexOf('function buildPauseControl(');
+  assert.notEqual(start, -1, 'buildPauseControl 不存在');
+  const body = src.slice(start, src.indexOf('\n}\n', start));
+  assert.match(body, /detail\.isRouterTask/);
+  assert.match(body, /detail\.box !== 'queue'/);
+  assert.match(body, /detail\.paused/);
+  assert.match(body, /submitAction\(id, 'unpause'/);
+  assert.match(body, /submitAction\(id, 'pause'/);
+  for (const action of ['pause', 'unpause']) {
+    assert.ok(SYNC_ACTIONS.includes(action), `${action} 必须在同步动作集合里`);
+  }
+  // 抽屉与审查页都给得出这个开关（暂停中的任务在哪一面都能解除）
+  assert.ok(src.split('buildPauseControl(id, detail)').length - 1 >= 2);
+});
+
+test('app.mjs：卡片按 entry.phase 渲染阶段徽标，阶段进卡片指纹（阶段变了要重渲染）', () => {
+  const src = fs.readFileSync(path.join(STATIC_DIR, 'app.mjs'), 'utf8');
+  const card = src.slice(src.indexOf('function buildColumnCardNode'), src.indexOf('function buildCardNode'));
+  assert.match(card, /entry\.phase/);
+  assert.match(card, /buildPhaseNode\(entry\.phase\)/);
+  assert.match(src, /entry\.phase\?\.code/, '卡片指纹要认得阶段');
 });
 
 test('summarizeBoard：queue 口径 = ROUTING + AWAIT_HUMAN 两列 + legacy 分组（新载荷）', async () => {

@@ -351,6 +351,74 @@ summary:hover { background: var(--surface-hover); }
 .event-list { display: flex; flex-direction: column; gap: 2px; }
 .event-row { font: var(--t-caption) var(--font-data); color: var(--ink-2); }
 .event-type { color: var(--ink-1); font-weight: 700; }
+.record-title { color: var(--ink); }
+.record-artifacts {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; margin-top: 4px;
+  font: var(--t-caption) var(--font-data); color: var(--ink-2);
+}
+
+/* ---- 进度面板（阶段 / 目标 / 委派 / 验收门 / 预算，读 lib/task-view.mjs 的任务视图） ---- */
+.progress-panel { margin-bottom: 16px; }
+.phase-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 8px; }
+.phase-line { display: flex; gap: 6px; align-items: center; margin-top: 8px; }
+/* 阶段徽标：颜色之外必带文字，含义不只靠颜色传达（§7 可达性） */
+.phase-badge {
+  display: inline-flex; align-items: center; border-radius: 10px; padding: 2px 8px;
+  font: var(--t-caption) var(--font-ui); font-weight: 700;
+  color: var(--ink-2); background: var(--surface-hover);
+}
+.phase-running, .phase-waiting_result { color: var(--live); background: var(--live-bg); }
+.phase-waiting_human, .phase-waiting_resource { color: var(--attn); background: var(--attn-bg); }
+.phase-interrupted_recoverable { color: var(--unknown); background: var(--unknown-bg); }
+.phase-terminated { color: var(--ink-3); background: var(--surface-hover); }
+.phase-stage { color: var(--ink-3); font: var(--t-caption) var(--font-data); }
+.progress-line { display: flex; gap: 8px; align-items: baseline; margin-top: 4px; }
+.progress-label {
+  flex: 0 0 auto; min-width: 116px; color: var(--ink-3);
+  font: var(--t-caption) var(--font-ui); text-transform: uppercase; letter-spacing: .04em;
+}
+.progress-value { color: var(--ink); font: var(--t-caption) var(--font-ui); word-break: break-word; }
+.progress-block { margin-top: 12px; }
+.progress-block-title { color: var(--ink-2); font: var(--t-h2) var(--font-ui); margin-bottom: 4px; }
+.progress-agent {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline;
+  font: var(--t-caption) var(--font-data); color: var(--ink-2);
+}
+/* 抽屉只有 min(480px,92vw) 宽，八列放不下：横向滚动而不是把 key 拆成三行（与 .diff-patch 同一策略） */
+.assign-scroll { overflow-x: auto; scrollbar-width: none; }
+.assign-scroll::-webkit-scrollbar { display: none; }
+.assign-table { width: 100%; border-collapse: collapse; font: var(--t-caption) var(--font-data); }
+.assign-table th {
+  text-align: left; color: var(--ink-3); font-weight: 400; text-transform: uppercase; letter-spacing: .04em;
+  border-bottom: 1px solid var(--line); padding: 4px 10px 4px 0; white-space: nowrap;
+}
+.assign-table td {
+  color: var(--ink-2); border-bottom: 1px solid var(--line); padding: 4px 10px 4px 0;
+  vertical-align: top; white-space: nowrap;
+}
+/* 标题与冲突文件是唯一可能很长的两列：它们换行，其余列保持一行可读 */
+.assign-table td.assign-wrap { white-space: normal; min-width: 120px; word-break: break-word; }
+
+/* ---- spec 摘要面板：状态 + 逐条索引 + 每条引用可展开回原文 ---- */
+.digest-panel { margin-top: 16px; }
+.digest-meta { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; font: var(--t-caption) var(--font-data); color: var(--ink-2); }
+.digest-path { color: var(--ink-3); }
+.digest-note { margin-top: 8px; color: var(--ink-2); font: var(--t-caption) var(--font-ui); }
+.digest-section { margin-top: 10px; }
+.digest-section > summary { cursor: pointer; color: var(--ink-2); font: var(--t-caption) var(--font-ui); transition: background-color .18s ease; }
+.digest-item { border-left: 2px solid var(--line-heavy); padding: 4px 0 4px 10px; margin-top: 8px; }
+.digest-text { color: var(--ink); font: var(--t-body) var(--font-ui); word-break: break-word; }
+.digest-refs { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+.digest-ref > summary {
+  cursor: pointer; color: var(--ink-3); font: var(--t-caption) var(--font-data);
+  border: 1px solid var(--line-heavy); border-radius: 10px; padding: 1px 6px; list-style: none;
+  /* 展开后 pre 会把 details 撑宽，chip 不该跟着拉成一条横杠 */
+  display: inline-block; width: fit-content;
+  transition: background-color .18s ease, color .18s ease;
+}
+.digest-ref > summary::-webkit-details-marker { display: none; }
+.digest-ref[open] > summary { color: var(--live); border-color: var(--live); }
+.digest-ref > pre.readonly { margin-top: 6px; }
 
 /* ---- 裁决 chip（pass/fail/unknown，颜色 + 符号 + 文字，§7 可达性） ---- */
 .chip {
